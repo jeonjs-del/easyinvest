@@ -26,10 +26,17 @@ _NEW = (
     "f.Streamlit.setComponentValue({time:t.time,prices:i})}})),"
     # ① 보이는 범위가 바뀔 때마다 window._slwc_r 에 저장
     "c.timeScale().subscribeVisibleLogicalRangeChange((function(r){r&&(window._slwc_r=r)})),"
-    # ② 저장된 범위가 있으면 복원, 없으면 fitContent (첫 렌더)
+    # ② 저장된 범위 있으면 복원, 없으면 최근 1년 표시 (실패 시 fitContent 폴백)
     "(window._slwc_r"
     "?c.timeScale().setVisibleLogicalRange(window._slwc_r)"
-    ":c.timeScale().fitContent()),"
+    ":(function(){"
+    "var _t=new Date(),"
+    "_f=new Date(_t.getFullYear()-1,_t.getMonth(),_t.getDate()),"
+    "_p=function(n){return String(n).padStart(2,'0')},"
+    "_s=function(d){return d.getFullYear()+'-'+_p(d.getMonth()+1)+'-'+_p(d.getDate())};"
+    "try{c.timeScale().setVisibleRange({from:_s(_f),to:_s(_t)})"
+    "}catch(e){c.timeScale().fitContent()}"
+    "})()),"
     # ③ 컨테이너에 dblclick 리스너 1회 등록 (_slwc_dbl 플래그로 중복 방지)
     "(function(){"
     'var _el=document.getElementById("lightweight-charts-0");'
@@ -45,7 +52,7 @@ def _sentinel_tag():
         ver = importlib.metadata.version("streamlit-lightweight-charts-ntf")
     except Exception:
         ver = "unknown"
-    return f"patched-v1-{ver}"
+    return f"patched-v2-{ver}"
 
 
 def _needs_rebuild():

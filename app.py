@@ -600,7 +600,7 @@ with tab1:
         # renderLightweightCharts returns {time, prices} on click, else None
         _click = renderLightweightCharts(
             [{"chart": chart_opts, "series": series_list}],
-            key=f"lwc_{ticker}_{period}",
+            key=f"lwc_{ticker}",
         )
 
         # 클릭 이벤트 처리 (중복 방지 가드: _click_ts_seen)
