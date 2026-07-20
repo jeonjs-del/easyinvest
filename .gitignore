@@ -1,0 +1,23 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Streamlit
+_lwc_build/
+streamlit_out.txt
+streamlit_out.log
+streamlit_err.txt
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Claude Code memory (project-local)
+.claude/
