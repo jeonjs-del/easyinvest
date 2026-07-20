@@ -350,7 +350,14 @@ def _ace_gold_history():
 
 
 # ============================================================================
-names, search_options = get_krx_listings()
+_names_raw, _stock_options = get_krx_listings()
+# 지수 항목을 names dict에 병합 (캐시 결과를 직접 변경하지 않기 위해 복사)
+names = dict(_names_raw)
+for _idx_name, _idx_sym in DEFAULT_INDICES.items():
+    names.setdefault(_idx_sym, _idx_name)
+# 검색 옵션: 지수를 앞에 배치 후 종목·ETF 목록 이어붙임
+_index_options = sorted([f"{n} ({s})" for n, s in DEFAULT_INDICES.items()])
+search_options = _index_options + _stock_options
 
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = load_watchlist()
@@ -452,9 +459,26 @@ with tab1:
         last = float(full["Close"].iloc[-1])
         prev = float(full["Close"].iloc[-2]) if len(full) > 1 else last
         chg = last - prev
-        st.markdown(f"### {name_of(ticker, names)}  ·  {last:,.2f}  "
-                    f"<span style='color:{'#e03131' if chg>=0 else '#1971c2'}'>"
-                    f"{chg:+,.2f} ({chg/prev:+.2%})</span>", unsafe_allow_html=True)
+        _hcol, _scol = st.columns([10, 1])
+        _hcol.markdown(
+            f"### {name_of(ticker, names)}  ·  {last:,.2f}  "
+            f"<span style='color:{'#e03131' if chg>=0 else '#1971c2'}'>"
+            f"{chg:+,.2f} ({chg/prev:+.2%})</span>",
+            unsafe_allow_html=True,
+        )
+        _in_wl = ticker in st.session_state.watchlist
+        if _scol.button(
+            "⭐" if _in_wl else "☆",
+            key="star_btn",
+            help="관심목록에서 제거" if _in_wl else "관심목록에 추가",
+            use_container_width=True,
+        ):
+            if _in_wl:
+                st.session_state.watchlist.remove(ticker)
+            else:
+                st.session_state.watchlist.append(ticker)
+            save_watchlist(st.session_state.watchlist)
+            st.rerun()
 
         df = full[~full.index.duplicated(keep="last")].sort_index()
         ohlc_ok = df[["Open", "High", "Low", "Close"]].notna().all(axis=1)
