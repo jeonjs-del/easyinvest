@@ -39,7 +39,6 @@ DEFAULT_INDICES = {
     "다우": "DJI", "러셀2000": "RUT", "닛케이225": "N225", "상해종합": "SSEC",
     "항셍": "HSI", "대만가권": "TWII", "독일DAX": "DAX", "프랑스CAC40": "CAC40",
 }
-_FREETEXT = "── 직접 입력 (미국 티커 등) ──"
 
 
 def normalize(sym):
@@ -374,61 +373,42 @@ if "click_pts" not in st.session_state:
 st.title("📈 나의 투자 대시보드")
 st.caption("차트 · 관심목록 · 동적자산배분 — 탭 전환. 데이터: FinanceDataReader")
 
-with st.sidebar:
-    st.header("관심목록 관리")
-    new_code = st.text_input("종목 추가 (예: 069500, AAPL)")
-    a, b = st.columns(2)
-    if a.button("추가", use_container_width=True) and new_code:
-        code = normalize(new_code)
-        if code not in st.session_state.watchlist:
-            st.session_state.watchlist.append(code)
-            save_watchlist(st.session_state.watchlist)
-            st.rerun()
-    if st.session_state.watchlist:
-        rm = st.selectbox("삭제할 종목", st.session_state.watchlist,
-                          format_func=lambda c: f"{name_of(c, names)} ({c})")
-        if b.button("삭제", use_container_width=True):
-            st.session_state.watchlist.remove(rm)
-            save_watchlist(st.session_state.watchlist)
-            st.rerun()
-
 watchlist = st.session_state.watchlist
 
 tab1, tab2, tab3, tab4 = st.tabs(["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄"])
 
 # =====================  차트  ==============================================
 with tab1:
-    # [3] 검색 UI: selectbox(KRX+ETF 자동완성) + 자유 입력(미국 티커)
-    sc1, sc2 = st.columns([4, 1])
+    # 검색 UI: 자동완성 드롭다운(선택 즉시 조회) + 직접 입력 폼(Enter 조회)
+    sc1, sc2 = st.columns([3, 2])
     with sc1:
         sel_option = st.selectbox(
-            "종목 검색",
-            [_FREETEXT] + search_options,
-            index=0,
+            "검색",
+            options=search_options,
+            index=None,
+            placeholder="종목·지수 선택 (한글명·코드 검색)",
             label_visibility="collapsed",
             key="krx_select",
         )
+        if sel_option is not None:
+            _sel_code = normalize(sel_option.rsplit("(", 1)[-1].rstrip(")"))
+            if _sel_code != st.session_state.chart_ticker:
+                st.session_state.chart_ticker = _sel_code
+                st.session_state.click_pts = []
+                st.rerun()
     with sc2:
-        do_lookup = st.button("조회", use_container_width=True, key="chart_lookup")
-
-    if sel_option == _FREETEXT:
-        fi1, _ = st.columns([3, 1])
-        with fi1:
-            free_input = st.text_input(
-                "직접 입력",
-                value=st.session_state.chart_ticker,
+        with st.form("_fs", clear_on_submit=True, border=False):
+            _fc, _bc = st.columns([4, 1])
+            _ft = _fc.text_input(
+                "입력",
+                placeholder="종목명·티커·지수 검색",
                 label_visibility="collapsed",
-                placeholder="미국 티커 · 종목코드 (예: AAPL, SPY, 005930)",
             )
-        if do_lookup:
-            st.session_state.chart_ticker = normalize(free_input)
+            _sub = _bc.form_submit_button("조회", use_container_width=True)
+        if _sub and _ft.strip():
+            st.session_state.chart_ticker = normalize(_ft.strip())
             st.session_state.click_pts = []
-            st.rerun()
-    else:
-        if do_lookup:
-            extracted = sel_option.rsplit("(", 1)[-1].rstrip(")")
-            st.session_state.chart_ticker = normalize(extracted)
-            st.session_state.click_pts = []
+            st.session_state.pop("krx_select", None)
             st.rerun()
 
     if watchlist:
@@ -437,6 +417,7 @@ with tab1:
             if chips[i].button(name_of(c, names), key=f"chip_{c}", use_container_width=True):
                 st.session_state.chart_ticker = c
                 st.session_state.click_pts = []
+                st.session_state.pop("krx_select", None)
                 st.rerun()
 
     ticker = normalize(st.session_state.chart_ticker)
@@ -669,7 +650,21 @@ with tab2:
         ret_period = st.radio("기간", RETURN_PERIODS, index=4,
                               horizontal=True, label_visibility="collapsed")
 
-    universe = ([(name_of(c, names), c) for c in watchlist]
+    # 내 관심목록 모드: 종목별 ✕ 제거 버튼
+    if mode == "내 관심목록" and st.session_state.watchlist:
+        _wl = st.session_state.watchlist
+        _rm_cols = st.columns(min(len(_wl), 8))
+        for _i, _wc in enumerate(_wl[:8]):
+            if _rm_cols[_i].button(
+                f"{name_of(_wc, names)} ✕",
+                key=f"wl_rm_{_wc}",
+                use_container_width=True,
+            ):
+                st.session_state.watchlist.remove(_wc)
+                save_watchlist(st.session_state.watchlist)
+                st.rerun()
+
+    universe = ([(name_of(c, names), c) for c in st.session_state.watchlist]
                 if mode == "내 관심목록" else list(DEFAULT_INDICES.items()))
     start_hist = (datetime.today() - timedelta(days=420)).strftime("%Y-%m-%d")
 
