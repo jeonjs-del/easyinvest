@@ -724,9 +724,12 @@ with tab3:
         if not ue_ok:
             st.caption("⚠️ FRED 실업률 미조회 → LAA/RAA는 시장신호만으로 계산되었습니다.")
 
+        _KR_ETF_LABEL = {"069500": "KODEX200(069500)"}
+
         def pos_str(w):
             return " / ".join(
-                f"{k} {v*100:.0f}%" for k, v in sorted(w.items(), key=lambda x: -x[1])
+                f"{_KR_ETF_LABEL.get(k, k)} {v*100:.0f}%"
+                for k, v in sorted(w.items(), key=lambda x: -x[1])
             )
 
         table = [

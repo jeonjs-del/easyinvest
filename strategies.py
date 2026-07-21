@@ -8,7 +8,7 @@ import pandas as pd
 
 TAA_TICKERS = ["SPY", "IEFA", "IEMG", "AGG", "BND", "QQQ", "IWM", "VGK", "EWJ",
                "VNQ", "PDBC", "GLD", "TLT", "HYG", "LQD", "IEF", "TIP", "BIL",
-               "SHY", "VTV", "VBR", "SCZ", "REM", "EMB", "BWX"]
+               "SHY", "VTV", "VBR", "SCZ", "REM", "EMB", "BWX", "069500"]
 
 # ---- 모멘텀 유틸 ----------------------------------------------------------
 def ret(mp, sym, t, k):
@@ -293,9 +293,29 @@ def strat_novell(mp, t, ctx):
     return w
 
 
+def strat_kr_mod_dm(mp, t, ctx):
+    spy6 = ret(mp, "SPY", t, 6)
+    if spy6 is None:
+        return None
+    if spy6 > 0:
+        k200 = ret(mp, "069500", t, 6)
+        if k200 is None:
+            return {"SPY": 1.0}
+        return {"SPY": 1.0} if spy6 >= k200 else {"069500": 1.0}
+    sc = {s: ret(mp, s, t, 6) for s in MODDM_DEF}
+    if len([v for v in sc.values() if v is not None]) < 3:
+        return None
+    w = {}
+    for s in top_keys(sc, 3):
+        tgt = s if sc[s] >= 0 else "BIL"
+        w[tgt] = w.get(tgt, 0.0) + 1.0 / 3
+    return w
+
+
 STRATEGIES = {
     "BAA 공격형": strat_baa_agg,
     "변형 듀얼모멘텀": strat_mod_dm,
+    "한국형 변형 듀얼모멘텀": strat_kr_mod_dm,
     "VAA": strat_vaa,
     "가속 듀얼모멘텀": strat_adm,
     "HAA": strat_haa,
