@@ -19,5 +19,8 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Secrets
+.streamlit/secrets.toml
+
 # Claude Code memory (project-local)
 .claude/

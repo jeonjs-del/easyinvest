@@ -23,6 +23,7 @@ from strategies import STRATEGIES, TAA_TICKERS
 st.set_page_config(page_title="나의 투자 대시보드", layout="wide")
 
 WATCHLIST_FILE = "watchlist.json"
+GIST_FILENAME = "watchlist.json"
 DEFAULT_WATCHLIST = ["069500", "133690", "114260", "005930"]
 SMA_PERIODS = [5, 10, 20, 50, 60, 120, 200]
 EMA_PERIODS = [9, 21, 65]
@@ -50,7 +51,7 @@ def normalize(sym):
     return s
 
 
-def load_watchlist():
+def _load_watchlist_local():
     if os.path.exists(WATCHLIST_FILE):
         try:
             with open(WATCHLIST_FILE, encoding="utf-8") as f:
@@ -62,12 +63,77 @@ def load_watchlist():
     return DEFAULT_WATCHLIST.copy()
 
 
-def save_watchlist(codes):
+def _save_watchlist_local(codes):
     try:
         with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
             json.dump(codes, f, ensure_ascii=False, indent=2)
     except Exception:
         pass  # Cloud filesystem은 재시작 시 초기화 — 저장 실패는 무시
+
+
+def _gist_configured():
+    try:
+        g = st.secrets.get("gist")
+        return bool(g and g.get("token") and g.get("id"))
+    except Exception:
+        return False
+
+
+def _gist_headers(token):
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+
+@st.cache_data(ttl=300)
+def _gist_fetch_content(token, gist_id):
+    """Gist의 watchlist.json raw 내용을 반환. 파일이 없거나 비어있으면 빈 문자열."""
+    r = requests.get(f"https://api.github.com/gists/{gist_id}",
+                      headers=_gist_headers(token), timeout=10)
+    r.raise_for_status()
+    files = r.json().get("files", {})
+    f = files.get(GIST_FILENAME)
+    return f.get("content", "") if f else ""
+
+
+def load_watchlist():
+    """(관심목록, storage_mode) 반환. storage_mode: 'gist' 또는 'local'."""
+    if _gist_configured():
+        token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
+        try:
+            content = _gist_fetch_content(token, gist_id)
+        except Exception:
+            # API 호출 실패 → 로컬 파일 방식으로 폴백
+            return _load_watchlist_local(), "local"
+        if content and content.strip():
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    # 저장된 값이 빈 배열이어도 그대로 유지 (사용자가 전부 삭제한 상태)
+                    return [normalize(str(c)) for c in data], "gist"
+            except Exception:
+                pass
+        # Gist는 연결됐지만 파일이 비어있음/저장된 적 없음 → 디폴트 사용
+        return DEFAULT_WATCHLIST.copy(), "gist"
+    return _load_watchlist_local(), "local"
+
+
+def save_watchlist(codes, mode):
+    if mode == "gist":
+        try:
+            token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
+            r = requests.patch(
+                f"https://api.github.com/gists/{gist_id}",
+                headers=_gist_headers(token),
+                json={"files": {GIST_FILENAME: {
+                    "content": json.dumps(codes, ensure_ascii=False, indent=2)
+                }}},
+                timeout=10,
+            )
+            r.raise_for_status()
+            _gist_fetch_content.clear()  # 캐시 무효화 → 다음 로드 시 최신값 반영
+        except Exception:
+            pass  # 저장 실패는 무시 (다음 rerun에서 재시도 가능)
+        return
+    _save_watchlist_local(codes)
 
 
 @st.cache_data(ttl=60 * 60 * 24)
@@ -232,8 +298,15 @@ def backtest(fn, mp, ctx):
     cagr = equity.iloc[-1] ** (1 / yrs) - 1 if yrs > 0 else np.nan
     mdd = (equity / equity.cummax() - 1).min()
     sharpe = (mr.mean() * 12) / (mr.std() * np.sqrt(12)) if mr.std() > 0 else np.nan
+    recent_positions = []
+    for i in range(3):
+        idx = n - 1 - i
+        if idx < 0:
+            break
+        recent_positions.append((mp.index[idx], fn(mp, idx, ctx) or {}))
     return {"equity": equity, "mret": mr, "cagr": cagr, "mdd": mdd,
-            "sharpe": sharpe, "current": fn(mp, n - 1, ctx) or {}}
+            "sharpe": sharpe, "current": fn(mp, n - 1, ctx) or {},
+            "recent_positions": recent_positions}
 
 
 @st.cache_data(ttl=60 * 60 * 4)
@@ -359,7 +432,7 @@ _index_options = sorted([f"{n} ({s})" for n, s in DEFAULT_INDICES.items()])
 search_options = _index_options + _stock_options
 
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist()
+    st.session_state.watchlist, st.session_state.storage_mode = load_watchlist()
 if "chart_ticker" not in st.session_state:
     st.session_state.chart_ticker = (
         st.session_state.watchlist[0] if st.session_state.watchlist else "005930"
@@ -372,6 +445,8 @@ if "click_pts" not in st.session_state:
 
 st.title("📈 나의 투자 대시보드")
 st.caption("차트 · 관심목록 · 동적자산배분 — 탭 전환. 데이터: FinanceDataReader")
+if st.session_state.storage_mode == "local":
+    st.caption("💾 로컬 저장 모드 — Gist 미설정 또는 연결 실패로, 이 기기에만 저장됩니다.")
 
 watchlist = st.session_state.watchlist
 
@@ -458,7 +533,7 @@ with tab1:
                 st.session_state.watchlist.remove(ticker)
             else:
                 st.session_state.watchlist.append(ticker)
-            save_watchlist(st.session_state.watchlist)
+            save_watchlist(st.session_state.watchlist, st.session_state.storage_mode)
             st.rerun()
 
         df = full[~full.index.duplicated(keep="last")].sort_index()
@@ -661,7 +736,7 @@ with tab2:
                 use_container_width=True,
             ):
                 st.session_state.watchlist.remove(_wc)
-                save_watchlist(st.session_state.watchlist)
+                save_watchlist(st.session_state.watchlist, st.session_state.storage_mode)
                 st.rerun()
 
     universe = ([(name_of(c, names), c) for c in st.session_state.watchlist]
@@ -732,8 +807,13 @@ with tab3:
                 for k, v in sorted(w.items(), key=lambda x: -x[1])
             )
 
+        def _prev_pos_str(r):
+            rp = r.get("recent_positions", [])
+            return pos_str(rp[1][1]) if len(rp) > 1 else "—"
+
         table = [
             {"전략명": nm, "현재 포지션": pos_str(r["current"]),
+             "직전월 포지션": _prev_pos_str(r),
              "CAGR": r["cagr"], "MDD": r["mdd"], "Sharpe": r["sharpe"]}
             for nm, r in results.items() if r
         ]
@@ -760,6 +840,13 @@ with tab3:
         m2.metric("MDD",  f"{r['mdd']:.1%}")
         m3.metric("Sharpe", f"{r['sharpe']:.2f}")
         m4.metric("현재 포지션", pos_str(r["current"]))
+
+        recent_rows = [
+            {"기준월": d.strftime("%Y-%m"), "포지션": pos_str(w)}
+            for d, w in r["recent_positions"]
+        ]
+        st.markdown("##### 최근 3개월 포지션")
+        st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
 
         spy_eq = (1 + mp["SPY"].pct_change().reindex(r["equity"].index).fillna(0)).cumprod()
         cfig = go.Figure()
