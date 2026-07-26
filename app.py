@@ -771,7 +771,6 @@ with tab2:
         return {
             "종목": f"{disp} ({sym})",
             "현재가": float(df["Close"].iloc[-1]),
-            "1일": period_return(df, "1일"),
             ret_period: period_return(df, ret_period),
         }
 
@@ -787,10 +786,10 @@ with tab2:
                    .reset_index(drop=True))
         rank_df.insert(0, "순위", rank_df.index + 1)
         styled_rank = rank_df.style.format(
-            {"현재가": "{:,.2f}", "1일": "{:+.2%}", ret_period: "{:+.2%}"},
+            {"현재가": "{:,.2f}", ret_period: "{:+.2%}"},
             na_rep="—",
         )
-        color_cols = list(dict.fromkeys(c for c in ("1일", ret_period) if c in rank_df.columns))
+        color_cols = [ret_period] if ret_period in rank_df.columns else []
         for _col in color_cols:
             _cap = _abs_cap(rank_df[_col], RET_COLOR_CAP)
             styled_rank = _apply_bg(
