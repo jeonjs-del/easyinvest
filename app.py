@@ -309,13 +309,23 @@ def backtest(fn, mp, ctx):
             "recent_positions": recent_positions}
 
 
+# 결과 딕셔너리 구조(backtest()의 반환 키)가 바뀌면 이 값을 올려서
+# st.cache_data에 남아있는 구버전 캐시를 무효화한다.
+TAA_RESULTS_VERSION = 2
+
+
 @st.cache_data(ttl=60 * 60 * 4)
-def run_all_strategies():
+def run_all_strategies(_version=TAA_RESULTS_VERSION):
     mp = load_monthly_panel()
     if mp.empty:
         return {}, pd.DataFrame(), True
     ctx = build_ctx(list(mp.index))
-    res = {name: backtest(fn, mp, ctx) for name, fn in STRATEGIES.items()}
+    res = {}
+    for name, fn in STRATEGIES.items():
+        try:
+            res[name] = backtest(fn, mp, ctx)
+        except Exception:
+            res[name] = None  # 전략 하나가 실패해도 나머지는 계속 계산
     return res, mp, ctx["ue_ok"]
 
 
@@ -808,79 +818,100 @@ with tab3:
             )
 
         def _prev_pos_str(r):
-            rp = r.get("recent_positions", [])
+            rp = r.get("recent_positions") or []
             return pos_str(rp[1][1]) if len(rp) > 1 else "—"
 
-        table = [
-            {"전략명": nm, "현재 포지션": pos_str(r["current"]),
-             "직전월 포지션": _prev_pos_str(r),
-             "CAGR": r["cagr"], "MDD": r["mdd"], "Sharpe": r["sharpe"]}
-            for nm, r in results.items() if r
-        ]
-        tdf = (pd.DataFrame(table)
-               .sort_values("CAGR", ascending=False)
-               .reset_index(drop=True))
-        tdf.insert(0, "순위", tdf.index + 1)
+        table, failed_strats = [], []
+        for nm, r in results.items():
+            if not r:
+                failed_strats.append(nm)
+                continue
+            table.append({
+                "전략명": nm, "현재 포지션": pos_str(r.get("current") or {}),
+                "직전월 포지션": _prev_pos_str(r),
+                "CAGR": r.get("cagr"), "MDD": r.get("mdd"), "Sharpe": r.get("sharpe"),
+            })
 
-        sel = st.dataframe(
-            tdf.style.format({"CAGR": "{:+.1%}", "MDD": "{:.1%}", "Sharpe": "{:.2f}"},
-                             na_rep="—"),
-            use_container_width=True, hide_index=True,
-            height=min(60 + 35 * len(tdf), 600),
-            on_select="rerun", selection_mode="single-row", key="strat_table",
-        )
-        sel_rows = sel.selection.rows if sel and hasattr(sel, "selection") else []
-        pick_idx = sel_rows[0] if sel_rows else 0
-        pick = tdf.iloc[pick_idx]["전략명"]
+        if failed_strats:
+            st.caption(f"⚠️ 계산 실패로 제외된 전략: {', '.join(failed_strats)}")
 
-        r = results[pick]
-        st.markdown(f"#### 전략 상세 — {pick}")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("CAGR", f"{r['cagr']:+.1%}")
-        m2.metric("MDD",  f"{r['mdd']:.1%}")
-        m3.metric("Sharpe", f"{r['sharpe']:.2f}")
-        m4.metric("현재 포지션", pos_str(r["current"]))
+        if not table:
+            st.warning("표시할 전략이 없습니다.")
+        else:
+            tdf = (pd.DataFrame(table)
+                   .sort_values("CAGR", ascending=False)
+                   .reset_index(drop=True))
+            tdf.insert(0, "순위", tdf.index + 1)
 
-        recent_rows = [
-            {"기준월": d.strftime("%Y-%m"), "포지션": pos_str(w)}
-            for d, w in r["recent_positions"]
-        ]
-        st.markdown("##### 최근 3개월 포지션")
-        st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
+            sel = st.dataframe(
+                tdf.style.format({"CAGR": "{:+.1%}", "MDD": "{:.1%}", "Sharpe": "{:.2f}"},
+                                 na_rep="—"),
+                use_container_width=True, hide_index=True,
+                height=min(60 + 35 * len(tdf), 600),
+                on_select="rerun", selection_mode="single-row", key="strat_table",
+            )
+            sel_rows = sel.selection.rows if sel and hasattr(sel, "selection") else []
+            pick_idx = sel_rows[0] if sel_rows else 0
+            pick = tdf.iloc[pick_idx]["전략명"]
 
-        spy_eq = (1 + mp["SPY"].pct_change().reindex(r["equity"].index).fillna(0)).cumprod()
-        cfig = go.Figure()
-        cfig.add_trace(go.Scatter(x=r["equity"].index, y=r["equity"],
-                                  name="내 전략", line=dict(color="#e03131")))
-        cfig.add_trace(go.Scatter(x=spy_eq.index, y=spy_eq,
-                                  name="SPY", line=dict(color="#1971c2", dash="dot")))
-        cfig.update_layout(
-            height=340, margin=dict(l=0, r=0, t=10, b=0), yaxis_type="log",
-            legend=dict(orientation="h", y=1.02, x=0),
-            title="누적 수익률 (로그 스케일)",
-        )
-        cfig.update_xaxes(fixedrange=True)
-        cfig.update_yaxes(fixedrange=True)
-        st.plotly_chart(cfig, use_container_width=True,
-                        config={"scrollZoom": False, "displayModeBar": False})
+            r = results.get(pick)
+            if not r:
+                st.warning(f"'{pick}' 전략 데이터를 불러오지 못했습니다.")
+            else:
+                try:
+                    st.markdown(f"#### 전략 상세 — {pick}")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("CAGR", f"{r['cagr']:+.1%}")
+                    m2.metric("MDD",  f"{r['mdd']:.1%}")
+                    m3.metric("Sharpe", f"{r['sharpe']:.2f}")
+                    m4.metric("현재 포지션", pos_str(r.get("current") or {}))
 
-        mr = r["mret"]
-        heat = mr.groupby([mr.index.year, mr.index.month]).first().unstack() * 100
-        heat.columns = [f"{m}월" for m in heat.columns]
-        annual = (
-            mr.groupby(mr.index.year)
-              .apply(lambda x: (1 + x).prod() - 1) * 100
-        ).rename("연간")
-        heat_full = heat.join(annual)
-        st.markdown("##### 연월별 수익률 (%)")
-        fn_h = lambda v: _color_scale(v, -10, 10)
-        styled_heat = _apply_bg(heat_full.style.format("{:+.1f}", na_rep="—"), fn_h)
-        st.markdown(
-            f'<div style="overflow-x:auto;font-size:0.85rem">'
-            f'{styled_heat.to_html()}'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+                    recent_positions = r.get("recent_positions") or []
+                    recent_rows = [
+                        {"기준월": d.strftime("%Y-%m"), "포지션": pos_str(w)}
+                        for d, w in recent_positions
+                    ]
+                    st.markdown("##### 최근 3개월 포지션")
+                    if recent_rows:
+                        st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("표시할 포지션 이력이 없습니다.")
+
+                    spy_eq = (1 + mp["SPY"].pct_change().reindex(r["equity"].index).fillna(0)).cumprod()
+                    cfig = go.Figure()
+                    cfig.add_trace(go.Scatter(x=r["equity"].index, y=r["equity"],
+                                              name="내 전략", line=dict(color="#e03131")))
+                    cfig.add_trace(go.Scatter(x=spy_eq.index, y=spy_eq,
+                                              name="SPY", line=dict(color="#1971c2", dash="dot")))
+                    cfig.update_layout(
+                        height=340, margin=dict(l=0, r=0, t=10, b=0), yaxis_type="log",
+                        legend=dict(orientation="h", y=1.02, x=0),
+                        title="누적 수익률 (로그 스케일)",
+                    )
+                    cfig.update_xaxes(fixedrange=True)
+                    cfig.update_yaxes(fixedrange=True)
+                    st.plotly_chart(cfig, use_container_width=True,
+                                    config={"scrollZoom": False, "displayModeBar": False})
+
+                    mr = r["mret"]
+                    heat = mr.groupby([mr.index.year, mr.index.month]).first().unstack() * 100
+                    heat.columns = [f"{m}월" for m in heat.columns]
+                    annual = (
+                        mr.groupby(mr.index.year)
+                          .apply(lambda x: (1 + x).prod() - 1) * 100
+                    ).rename("연간")
+                    heat_full = heat.join(annual)
+                    st.markdown("##### 연월별 수익률 (%)")
+                    fn_h = lambda v: _color_scale(v, -10, 10)
+                    styled_heat = _apply_bg(heat_full.style.format("{:+.1f}", na_rep="—"), fn_h)
+                    st.markdown(
+                        f'<div style="overflow-x:auto;font-size:0.85rem">'
+                        f'{styled_heat.to_html()}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                except Exception as _de:
+                    st.error(f"'{pick}' 전략 상세 표시 중 오류가 발생했습니다: {_de}")
 
 # =====================  프리미엄  ==========================================
 with tab4:
