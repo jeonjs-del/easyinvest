@@ -35,6 +35,7 @@ MA_COLORS = {
     9: "#9467bd", 21: "#17becf", 65: "#aec7e8",
 }
 RETURN_PERIODS = ["1일", "5일", "1개월", "3개월", "6개월", "1년"]
+RET_COLOR_CAP = 0.30  # 수익률 색상 진하기의 절대값 상한 (±30%, 이상은 최대 진하기로 클립)
 DEFAULT_INDICES = {
     "코스피": "KS11", "코스닥": "KQ11", "S&P500": "US500", "나스닥종합": "IXIC",
     "다우": "DJI", "러셀2000": "RUT", "닛케이225": "N225", "상해종합": "SSEC",
@@ -194,27 +195,36 @@ def period_return(df, key):
     return month_return(df, {"1개월": 1, "3개월": 3, "6개월": 6, "1년": 12}[key])
 
 
-def _color_scale(val, vmin, vmax):
-    """빨강→흰색→초록 배경색 CSS 반환."""
+def _color_scale_zero(val, cap):
+    """0 기준 대칭 배경색 CSS 반환: 양수=초록, 음수=빨강, 0=무채색(무색).
+    |val|/cap 비율로 진하기를 정하고, cap을 넘는 값은 최대 진하기로 클립."""
     try:
         v = float(val)
     except (TypeError, ValueError):
         return ""
-    if pd.isna(v):
+    if pd.isna(v) or cap <= 0 or v == 0:
         return ""
-    span = float(vmax) - float(vmin)
-    t = 0.5 if span == 0 else max(0.0, min(1.0, (v - float(vmin)) / span))
-    if t < 0.5:
-        ratio = t * 2
-        r = int(215 + (255 - 215) * ratio)
-        g = int(25  + (255 - 25)  * ratio)
-        b = int(28  + (255 - 28)  * ratio)
+    intensity = min(abs(v) / cap, 1.0)
+    if v > 0:
+        r = int(255 + (26  - 255) * intensity)
+        g = int(255 + (152 - 255) * intensity)
+        b = int(255 + (80  - 255) * intensity)
     else:
-        ratio = (t - 0.5) * 2
-        r = int(255 + (26  - 255) * ratio)
-        g = int(255 + (152 - 255) * ratio)
-        b = int(255 + (80  - 255) * ratio)
-    return f"background-color: rgb({r},{g},{b})"
+        r = int(255 + (215 - 255) * intensity)
+        g = int(255 + (25  - 255) * intensity)
+        b = int(255 + (28  - 255) * intensity)
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    text = " color: #ffffff;" if luminance < 140 else ""
+    return f"background-color: rgb({r},{g},{b});{text}"
+
+
+def _abs_cap(values, hard_cap):
+    """values의 절대값 최대치를 정규화 상한으로 쓰되, hard_cap을 넘지 않게 클립.
+    한 종목의 극단값 때문에 나머지 색이 전부 옅어지는 것을 방지."""
+    m = pd.Series(values, dtype="float64").abs().max()
+    if pd.isna(m) or m <= 0:
+        return hard_cap
+    return min(float(m), hard_cap)
 
 
 def _apply_bg(styler, fn, subset=None):
@@ -776,17 +786,18 @@ with tab2:
                    .sort_values(ret_period, ascending=False, na_position="last")
                    .reset_index(drop=True))
         rank_df.insert(0, "순위", rank_df.index + 1)
-        col_vals = rank_df[ret_period].dropna()
-        vmin_w = float(col_vals.min()) if not col_vals.empty else -0.1
-        vmax_w = float(col_vals.max()) if not col_vals.empty else  0.1
-        fn_w = lambda v, lo=vmin_w, hi=vmax_w: _color_scale(v, lo, hi)
-        styled_rank = _apply_bg(
-            rank_df.style.format(
-                {"현재가": "{:,.2f}", "1일": "{:+.2%}", ret_period: "{:+.2%}"},
-                na_rep="—",
-            ),
-            fn_w, subset=[ret_period],
+        styled_rank = rank_df.style.format(
+            {"현재가": "{:,.2f}", "1일": "{:+.2%}", ret_period: "{:+.2%}"},
+            na_rep="—",
         )
+        color_cols = list(dict.fromkeys(c for c in ("1일", ret_period) if c in rank_df.columns))
+        for _col in color_cols:
+            _cap = _abs_cap(rank_df[_col], RET_COLOR_CAP)
+            styled_rank = _apply_bg(
+                styled_rank,
+                lambda v, cap=_cap: _color_scale_zero(v, cap),
+                subset=[_col],
+            )
         st.dataframe(styled_rank, use_container_width=True, hide_index=True,
                      height=min(60 + 35 * len(rank_df), 520))
     else:
@@ -902,7 +913,7 @@ with tab3:
                     ).rename("연간")
                     heat_full = heat.join(annual)
                     st.markdown("##### 연월별 수익률 (%)")
-                    fn_h = lambda v: _color_scale(v, -10, 10)
+                    fn_h = lambda v: _color_scale_zero(v, 10)
                     styled_heat = _apply_bg(heat_full.style.format("{:+.1f}", na_rep="—"), fn_h)
                     st.markdown(
                         f'<div style="overflow-x:auto;font-size:0.85rem">'
