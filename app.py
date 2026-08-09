@@ -18,7 +18,7 @@ import yfinance as yf
 # 로컬 패치 래퍼: 줌 상태 복원 + dblclick 지원
 from lwc_local import renderLightweightCharts
 
-from strategies import STRATEGIES, TAA_TICKERS
+from strategies import STRATEGIES, TAA_TICKERS, augment_panel
 
 st.set_page_config(page_title="나의 투자 대시보드", layout="wide")
 
@@ -250,7 +250,10 @@ def load_monthly_panel():
         results = list(exe.map(_fetch, TAA_TICKERS))
 
     cols = {tk: s for tk, s in results if s is not None}
-    return pd.DataFrame(cols).dropna(how="all") if cols else pd.DataFrame()
+    if not cols:
+        return pd.DataFrame()
+    df = pd.DataFrame(cols).dropna(how="all")
+    return augment_panel(df)
 
 
 @st.cache_data(ttl=60 * 60 * 4)
@@ -321,7 +324,7 @@ def backtest(fn, mp, ctx):
 
 # 결과 딕셔너리 구조(backtest()의 반환 키)가 바뀌면 이 값을 올려서
 # st.cache_data에 남아있는 구버전 캐시를 무효화한다.
-TAA_RESULTS_VERSION = 2
+TAA_RESULTS_VERSION = 3
 
 
 @st.cache_data(ttl=60 * 60 * 4)
@@ -819,7 +822,18 @@ with tab3:
         if not ue_ok:
             st.caption("⚠️ FRED 실업률 미조회 → LAA/RAA는 시장신호만으로 계산되었습니다.")
 
-        _KR_ETF_LABEL = {"069500": "KODEX200(069500)"}
+        _KR_ETF_LABEL = {
+            "069500": "KODEX200(069500)",
+            "278530": "KODEX200TR(278530)",
+            "363580": "KODEX200IT TR(363580)",
+            "114260": "국고채3년(114260)",
+            "148070": "국고채10년(148070)",
+            "439870": "국고채30년(439870)",
+            "US_BOND_SHORT_KRW": "미국단기국채환노출(SHY합성)",
+            "US_BOND_MID_KRW": "미국10년국채환노출(IEF합성)",
+            "US_BOND_LONG_KRW": "미국장기국채환노출(TLT합성)",
+            "CASH": "현금",
+        }
 
         def pos_str(w):
             return " / ".join(
