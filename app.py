@@ -514,6 +514,43 @@ def load_trend():
 
 
 # ============================================================================
+#  매수 탭 · 매매계획 (순수 계산기, 스캐너 불필요)
+# ============================================================================
+def _position_sizing_plan(price, asset, max_loss_pct, stop_pct, tp_mult):
+    """매수가 P, 총자산 A, 최대손실률 L, 손절폭 S, 익절배수 M으로 포지션 사이징 계산.
+    손절가=P*(1-S), 주수=floor(A*L / (P-손절가)), 익절1차=P*(1+S*M)."""
+    stop_price = price * (1 - stop_pct)
+    risk_per_share = price - stop_price
+    if risk_per_share <= 0:
+        return None
+    max_loss_amount = asset * max_loss_pct
+    shares = int(max_loss_amount // risk_per_share)
+    buy_amount = price * shares
+    worst_loss = risk_per_share * shares
+    worst_loss_pct = (worst_loss / asset) if asset else 0.0
+    tp1_price = price * (1 + stop_pct * tp_mult)
+    return {
+        "stop_price": stop_price, "shares": shares, "buy_amount": buy_amount,
+        "worst_loss": worst_loss, "worst_loss_pct": worst_loss_pct, "tp1_price": tp1_price,
+    }
+
+
+def _krw_abbrev(x):
+    """1,412만원 스타일 축약 표기 (원 단위 미만은 버림)."""
+    x = int(round(x))
+    eok, rem = divmod(x, 100_000_000)
+    man = rem // 10_000
+    parts = []
+    if eok:
+        parts.append(f"{eok}억")
+    if man:
+        parts.append(f"{man:,}만")
+    if not parts:
+        parts.append("0")
+    return "".join(parts) + "원"
+
+
+# ============================================================================
 _names_raw, _stock_options = get_krx_listings()
 # 지수 항목을 names dict에 병합 (캐시 결과를 직접 변경하지 않기 위해 복사)
 names = dict(_names_raw)
@@ -1222,7 +1259,137 @@ with tab5:
                         )
 
     with sub_plan:
-        st.info("준비 중입니다.")
+        if "plan_ticker" not in st.session_state:
+            st.session_state.plan_ticker = st.session_state.chart_ticker
+
+        pc1, pc2 = st.columns([3, 2])
+        with pc1:
+            _psel = st.selectbox(
+                "종목 검색",
+                options=search_options, index=None,
+                placeholder="종목명·코드 검색 (한국 상장 종목/ETF)",
+                label_visibility="collapsed", key="plan_krx_select",
+            )
+            if _psel is not None:
+                _psel_code = normalize(_psel.rsplit("(", 1)[-1].rstrip(")"))
+                if _psel_code != st.session_state.plan_ticker:
+                    st.session_state.plan_ticker = _psel_code
+                    st.session_state.pop("plan_computed", None)
+                    st.rerun()
+        with pc2:
+            with st.form("_plan_fs", clear_on_submit=True, border=False):
+                _pfc, _pbc = st.columns([4, 1])
+                _pft = _pfc.text_input(
+                    "직접 입력", placeholder="티커 직접 입력 (예: AAPL)",
+                    label_visibility="collapsed",
+                )
+                _psub = _pbc.form_submit_button("조회", use_container_width=True)
+            if _psub and _pft.strip():
+                st.session_state.plan_ticker = normalize(_pft.strip())
+                st.session_state.pop("plan_krx_select", None)
+                st.session_state.pop("plan_computed", None)
+                st.rerun()
+
+        p_ticker = normalize(st.session_state.plan_ticker)
+        p_is_krw = p_ticker.isdigit()
+        p_start = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+        p_df = get_price(p_ticker, p_start)
+
+        if p_df.empty:
+            st.warning(f"'{p_ticker}' 가격 데이터를 불러오지 못했습니다.")
+        else:
+            p_close = p_df["Close"].dropna()
+            latest_price = float(p_close.iloc[-1])
+            latest_date = p_close.index[-1]
+            ma20 = float(p_close.iloc[-20:].mean()) if len(p_close) >= 20 else None
+            cur_label = f"{name_of(p_ticker, names)} ({p_ticker})"
+
+            st.markdown(f"**{cur_label}**")
+            if p_is_krw:
+                st.caption(f"현재가 {latest_price:,.0f}원 ({latest_date:%Y-%m-%d} 종가)")
+            else:
+                st.caption(f"현재가 ${latest_price:,.2f} ({latest_date:%Y-%m-%d} 종가)")
+
+            buy_price = st.number_input(
+                "매수가", min_value=0.0,
+                value=round(latest_price, 0) if p_is_krw else round(latest_price, 2),
+                step=(100.0 if p_is_krw else 0.5), key=f"plan_price_{p_ticker}",
+            )
+
+            mode = st.radio("방식", ["디폴트", "직접 입력"], horizontal=True, key="plan_mode")
+            default_asset = 100_000_000.0 if p_is_krw else 100_000.0
+            # 미국(달러) 종목은 원화 기본값(1억원)을 그대로 쓸 수 없어, 자산 기준통화도
+            # 종목 통화에 맞춰 별도 기본값($100,000)을 둔다 — "직접 입력"에서 조정 가능.
+            if mode == "직접 입력":
+                q1, q2, q3, q4 = st.columns(4)
+                asset = q1.number_input(
+                    "투자자산", min_value=0.0, value=default_asset,
+                    step=(1_000_000.0 if p_is_krw else 1_000.0), key="plan_asset")
+                loss_pct = q2.number_input(
+                    "최대손실(%)", min_value=0.1, value=1.0, step=0.1, key="plan_loss") / 100
+                stop_pct = q3.number_input(
+                    "손절폭(%)", min_value=0.1, value=7.0, step=0.5, key="plan_stop") / 100
+                tp_mult = q4.number_input(
+                    "익절배수", min_value=0.1, value=3.0, step=0.5, key="plan_mult")
+            else:
+                asset, loss_pct, stop_pct, tp_mult = default_asset, 0.01, 0.07, 3.0
+
+            # 불타기(분할 추가매수): 원 사이트의 정확한 규칙이 확인되지 않아, 우선
+            # 총 매수금액을 1차 60% / 2차 40%로 나누는 임시 규칙으로 구현했다.
+            # 규칙이 확인되면 아래 pyramiding 분기만 교체하면 된다.
+            pyramiding = st.radio("불타기", ["안 함", "함"], horizontal=True, key="plan_pyramid")
+
+            if st.button("계획 보기", type="primary"):
+                st.session_state.plan_computed = True
+
+            if st.session_state.get("plan_computed"):
+                plan = _position_sizing_plan(buy_price, asset, loss_pct, stop_pct, tp_mult)
+                if plan is None or plan["shares"] <= 0:
+                    st.warning("손절폭·매수가 조합상 매수 가능 주식 수가 0입니다. 파라미터를 확인해주세요.")
+                else:
+                    if p_is_krw:
+                        header_price = f"{buy_price:,.0f}원"
+                        amt_str = f"{plan['buy_amount']:,.0f}원 ({_krw_abbrev(plan['buy_amount'])})"
+                        loss_str = f"{plan['worst_loss']:,.0f}원"
+                        stop_str = f"{plan['stop_price']:,.0f}원"
+                        tp1_str = f"{plan['tp1_price']:,.0f}원"
+                        ma_str = f"{ma20:,.0f}원" if ma20 is not None else "—"
+                    else:
+                        header_price = f"${buy_price:,.2f}"
+                        amt_str = f"${plan['buy_amount']:,.2f}"
+                        loss_str = f"${plan['worst_loss']:,.2f}"
+                        stop_str = f"${plan['stop_price']:,.2f}"
+                        tp1_str = f"${plan['tp1_price']:,.2f}"
+                        ma_str = f"${ma20:,.2f}" if ma20 is not None else "—"
+
+                    st.markdown(f"##### {name_of(p_ticker, names)} · 매수가 {header_price} 기준 계획입니다")
+
+                    st.markdown(f"**① 매수 {amt_str} · {plan['shares']}주**")
+                    st.caption(f"최악의 경우 손실 {loss_str} (자산의 {plan['worst_loss_pct']:.1%})")
+
+                    if pyramiding == "함":
+                        shares_1 = int(plan["shares"] * 0.6)
+                        shares_2 = plan["shares"] - shares_1
+                        amt_1, amt_2 = buy_price * shares_1, buy_price * shares_2
+                        if p_is_krw:
+                            st.caption(
+                                f"불타기(임시 규칙): 1차 {amt_1:,.0f}원({shares_1}주, 60%) · "
+                                f"2차 {amt_2:,.0f}원({shares_2}주, 40%)")
+                        else:
+                            st.caption(
+                                f"불타기(임시 규칙): 1차 ${amt_1:,.2f}({shares_1}주, 60%) · "
+                                f"2차 ${amt_2:,.2f}({shares_2}주, 40%)")
+
+                    st.markdown(f"**② 손절 (-{stop_pct:.0%}) {stop_str}**")
+                    st.caption("여기 오면 무조건 전량 매도")
+
+                    st.markdown(f"**③ 익절 1차 (+{stop_pct * tp_mult:.0%}) {tp1_str}**")
+                    st.caption("여기 오면 절반 매도")
+
+                    st.markdown("**④ 익절 2차: 20일 이평 이탈 시 나머지 전량 매도**")
+                    st.caption(f"오늘 기준 20일 이평 {ma_str} · ⚠️ 이 값은 매일 변합니다")
+
+                    st.caption("주식 수는 소수점을 버립니다. 세금·수수료는 반영하지 않은 숫자입니다.")
 
     with sub_season:
         sdf, smeta = load_seasonality()
