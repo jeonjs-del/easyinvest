@@ -52,6 +52,12 @@ MARKET_CAP_BUCKETS = {
     "전체": 0, "≥$1B": 1e9, "≥$10B": 1e10, "≥$100B": 1e11,
 }
 
+# 매수 탭 · 추세추종: scanner/trend_scan.py가 만든 결과 파일만 읽는다(앱은 재계산 안 함)
+TREND_PARQUET = "data/trend.parquet"
+TREND_META = "data/trend_meta.json"
+TREND_STALE_DAYS = 30
+TREND_CAP_BUCKETS = {"전체": 0, "≥$1B": 1e9, "≥$10B": 1e10}
+
 
 def normalize(sym):
     s = sym.strip().upper()
@@ -484,11 +490,27 @@ def _nearest_occurrence(month, tdom, today_ts):
     return min(candidates, key=lambda d: abs((d - today_ts).days))
 
 
-def _market_cap_bucket_mask(series, bucket):
-    floor = MARKET_CAP_BUCKETS[bucket]
+def _market_cap_bucket_mask(series, bucket, buckets=MARKET_CAP_BUCKETS):
+    floor = buckets[bucket]
     if floor <= 0:
         return pd.Series(True, index=series.index)
     return series >= floor
+
+
+# ============================================================================
+#  매수 탭 · 추세추종 (scanner/trend_scan.py 결과 파일 읽기 전용)
+# ============================================================================
+@st.cache_data(ttl=60 * 30)
+def load_trend():
+    if not (os.path.exists(TREND_PARQUET) and os.path.exists(TREND_META)):
+        return pd.DataFrame(), {}
+    try:
+        df = pd.read_parquet(TREND_PARQUET)
+        with open(TREND_META, encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        return pd.DataFrame(), {}
+    return df, meta
 
 
 # ============================================================================
@@ -1103,7 +1125,101 @@ with tab5:
     sub_season, sub_trend, sub_plan = st.tabs(["🌱 계절성", "📈 추세추종", "🗓 매매계획"])
 
     with sub_trend:
-        st.info("준비 중입니다.")
+        tdf, tmeta = load_trend()
+        if tdf.empty:
+            st.warning(
+                "추세추종 데이터가 없습니다. 로컬에서 `python scanner/trend_scan.py`를 "
+                "먼저 실행해 `data/trend.parquet`를 생성해주세요."
+            )
+        else:
+            as_of = pd.Timestamp(tmeta.get("as_of"))
+            today_ts = pd.Timestamp(datetime.today().date())
+            days_old = (today_ts - as_of).days
+            stale = days_old > TREND_STALE_DAYS
+            status = f"신호 기준일 {as_of:%Y-%m-%d} ({days_old}일 경과)"
+            if stale:
+                st.warning(f"⚠️ {status} — 갱신이 오래되어 재실행을 권장합니다.")
+            else:
+                st.caption(status)
+
+            rep = tdf[tdf["is_representative"]].copy()
+
+            f1, f2, f3, f4, f5 = st.columns(5)
+            countries = ["전체"] + sorted(rep["country"].dropna().unique().tolist())
+            f_country = f1.selectbox("국가", countries, key="trend_country")
+            classes = ["전체"] + sorted(rep["asset_class"].dropna().unique().tolist())
+            f_class = f2.selectbox("자산", classes, key="trend_class")
+            signals = ["전체"] + sorted(rep["signal_type"].dropna().unique().tolist())
+            f_signal = f3.selectbox("신호", signals, key="trend_signal")
+            f_cap = f4.selectbox("시총", list(TREND_CAP_BUCKETS.keys()), key="trend_cap")
+            sort_label = f5.selectbox("정렬", ["별 우선", "RS순", "승률순"], key="trend_sort")
+
+            if f_country != "전체":
+                rep = rep[rep["country"] == f_country]
+            if f_class != "전체":
+                rep = rep[rep["asset_class"] == f_class]
+            if f_signal != "전체":
+                rep = rep[rep["signal_type"] == f_signal]
+            if f_cap != "전체":
+                rep = rep[_market_cap_bucket_mask(rep["market_cap_usd"], f_cap, TREND_CAP_BUCKETS)]
+
+            if sort_label == "별 우선":
+                rep = rep.sort_values(["star_rating", "profit_factor"], ascending=[False, False])
+            elif sort_label == "RS순":
+                rep = rep.sort_values("rs_total", ascending=False)
+            else:
+                rep = rep.sort_values("win_rate", ascending=False)
+            rep = rep.reset_index(drop=True)
+
+            st.caption(f"{len(rep)}종목 · {sort_label}")
+
+            if rep.empty:
+                st.info("조건에 맞는 후보가 없습니다.")
+            else:
+                for i, r in rep.iterrows():
+                    stars = "★" * int(r["star_rating"]) + "☆" * (3 - int(r["star_rating"]))
+                    risk_badge = " 🔺위험형" if r["risk_flag"] else ""
+                    label = (
+                        f"{i + 1}. {stars} {r['name']}({r['ticker']}) · [{r['signal_type']}] "
+                        f"{r['variant_label']} · {int(r['hold_days'])}일 보유{risk_badge}"
+                    )
+                    with st.expander(label):
+                        b1, b2, b3 = st.columns(3)
+                        sector_label = r["sector"] or "미분류"
+                        b1.metric("종합 RS", int(r["rs_total"]) if pd.notna(r["rs_total"]) else "—")
+                        b2.metric(f"{sector_label} RS",
+                                  int(r["rs_sector"]) if pd.notna(r["rs_sector"]) else "—")
+                        b3.metric("추세 구분", r["trend_term"])
+
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("매수구간", f"{r['buy_zone_low']:,.2f}~{r['buy_zone_high']:,.2f}")
+                        c2.metric("현재가", f"{r['close_price']:,.2f}")
+                        c3.metric("가격 위치", r["price_status"])
+
+                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1.metric("승률", f"{r['win_rate']:.0%}")
+                        m2.metric("평균이익", f"{r['avg_win']:+.1%}")
+                        m3.metric("평균손실", f"{r['avg_loss']:+.1%}")
+                        m4.metric("손익비", f"{r['profit_factor']:.2f}")
+                        m5.metric(r["sample_label"], f"{int(r['n_samples'])}")
+
+                        st.markdown("##### 보유기간별 성적표 (★ = 대표 보유기간)")
+                        sub = (tdf[(tdf["ticker"] == r["ticker"]) & (tdf["variant_key"] == r["variant_key"])]
+                               .sort_values("hold_days"))
+                        tbl = pd.DataFrame({
+                            "보유일": sub["hold_days"].astype(int),
+                            "승률": sub["win_rate"],
+                            "평균이익": sub["avg_win"],
+                            "평균손실": sub["avg_loss"],
+                            "손익비": sub["profit_factor"],
+                            r["sample_label"]: sub["n_samples"].astype(int),
+                            "대표": sub["is_representative"].map(lambda v: "★" if v else ""),
+                        })
+                        st.dataframe(
+                            tbl.style.format({"승률": "{:.0%}", "평균이익": "{:+.1%}",
+                                              "평균손실": "{:+.1%}", "손익비": "{:.2f}"}),
+                            use_container_width=True, hide_index=True,
+                        )
 
     with sub_plan:
         st.info("준비 중입니다.")

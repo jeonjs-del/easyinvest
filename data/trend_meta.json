@@ -1,0 +1,45 @@
+{
+  "as_of": "2026-08-15",
+  "lookback_years": 10,
+  "hold_periods": [
+    2,
+    3,
+    5,
+    10,
+    20,
+    63,
+    126,
+    252
+  ],
+  "min_sample": 20,
+  "signal_types": [
+    "이평눌림목",
+    "박스돌파",
+    "신고가돌파"
+  ],
+  "universe_size": 703,
+  "scanned_tickers": 689,
+  "failed_tickers": [
+    "0126Z0",
+    "279570",
+    "439260",
+    "BRKB",
+    "BFB",
+    "AON",
+    "FDXF",
+    "ERIE",
+    "GNRC",
+    "HON",
+    "HONA",
+    "Q",
+    "TSLA",
+    "VTRS"
+  ],
+  "result_rows": 3296,
+  "candidate_counts": {
+    "박스돌파": 22,
+    "신고가돌파": 125,
+    "이평눌림목": 129
+  },
+  "elapsed_sec": 303.2
+}
