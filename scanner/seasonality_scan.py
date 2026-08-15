@@ -97,9 +97,12 @@ def _scan_one(meta, price, hold_periods):
 def run():
     t0 = time.time()
     universe = build_universe()
-    n_kr = sum(1 for u in universe if u["country"] == "한국")
-    n_us = sum(1 for u in universe if u["country"] == "미국")
+    n_kr = sum(1 for u in universe if u["market"] == "KR")
+    n_us = sum(1 for u in universe if u["market"] == "US")
     print(f"유니버스 {len(universe)}종목 (한국 {n_kr} / 미국 {n_us})")
+    kr_unclassified = sum(1 for u in universe if u["market"] == "KR" and not u.get("sector"))
+    us_unclassified = sum(1 for u in universe if u["market"] == "US" and not u.get("sector"))
+    print(f"섹터 미분류: 한국 {kr_unclassified}/{n_kr} · 미국 {us_unclassified}/{n_us}")
 
     start_date = (pd.Timestamp.today() - pd.DateOffset(years=LOOKBACK_YEARS)).strftime("%Y-%m-%d")
 
@@ -110,7 +113,6 @@ def run():
         for fut in as_completed(futs):
             tk = futs[fut]
             s = fut.result()
-            (prices if s is not None else {})
             if s is not None:
                 prices[tk] = s
             else:
@@ -120,7 +122,7 @@ def run():
         head = ", ".join(failed[:30])
         print(f"  실패 종목: {head}{' ...' if len(failed) > 30 else ''}")
 
-    us_tickers = [u["ticker"] for u in universe if u["country"] == "미국" and u["ticker"] in prices]
+    us_tickers = [u["ticker"] for u in universe if u["market"] == "US" and u["ticker"] in prices]
     print(f"미국 종목 시가총액(USD) 조회 중... ({len(us_tickers)}개)")
     caps = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
@@ -142,9 +144,9 @@ def run():
         if tk not in prices:
             continue
         meta = {k: v for k, v in u.items() if not k.startswith("_")}
-        if meta["country"] == "미국":
+        if meta["market"] == "US":
             meta["market_cap_usd"] = caps.get(tk)
-        elif meta["country"] == "한국" and u.get("_market_cap_krw") and usdkrw:
+        elif meta["market"] == "KR" and u.get("_market_cap_krw") and usdkrw:
             meta["market_cap_usd"] = u["_market_cap_krw"] / usdkrw
         stats = _scan_one(meta, prices[tk], HOLD_PERIODS)
         if not stats.empty:

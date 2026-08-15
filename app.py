@@ -1154,9 +1154,6 @@ with tab5:
             classes = ["전체"] + sorted(work["asset_class"].dropna().unique().tolist())
             f_class = f2.selectbox("자산군", classes, key="season_class")
             f_cap = f3.selectbox("시총", list(MARKET_CAP_BUCKETS.keys()), key="season_cap")
-            sectors = ["전체"] + sorted(work["sector"].dropna().unique().tolist())
-            f_sector = f4.selectbox("섹터", sectors, key="season_sector",
-                                     disabled=(len(sectors) == 1))
 
             if f_country != "전체":
                 work = work[work["country"] == f_country]
@@ -1164,8 +1161,24 @@ with tab5:
                 work = work[work["asset_class"] == f_class]
             if f_cap != "전체":
                 work = work[_market_cap_bucket_mask(work["market_cap_usd"], f_cap)]
+
+            # 섹터는 국가별로 서로 다른 원 체계를 그대로 쓴다(한국 KSIC 업종 / 미국 GICS).
+            # "전체" 국가에서는 두 체계가 섞이므로 "[국가] 섹터명"으로 구분해 보여준다.
+            sec_df = work.dropna(subset=["sector"])
+            if f_country == "전체":
+                sector_options = ["전체"] + sorted(
+                    f"[{c}] {s}" for c, s in
+                    sec_df[["country", "sector"]].drop_duplicates().itertuples(index=False))
+            else:
+                sector_options = ["전체"] + sorted(sec_df["sector"].dropna().unique().tolist())
+            f_sector = f4.selectbox("섹터", sector_options, key="season_sector",
+                                     disabled=(len(sector_options) == 1))
             if f_sector != "전체":
-                work = work[work["sector"] == f_sector]
+                if f_country == "전체":
+                    sel_country, sel_sector = f_sector[1:].split("] ", 1)
+                    work = work[(work["country"] == sel_country) & (work["sector"] == sel_sector)]
+                else:
+                    work = work[work["sector"] == f_sector]
 
             sort_label = st.selectbox(
                 "정렬", ["승률 높은순", "평균수익률 높은순", "진입 임박순"], key="season_sort")
@@ -1189,7 +1202,7 @@ with tab5:
                         "순위": i + 1,
                         "종목": f"{r['name']} ({r['ticker']})",
                         "국가": r["country"],
-                        "섹터": r["sector"] or "—",
+                        "섹터": r["sector"] or "미분류",
                         "매수 시기": (
                             f"{r['entry_date']:%m/%d}~{r['exit_date']:%m/%d} "
                             f"({int(r['hold_days'])}일 보유)"

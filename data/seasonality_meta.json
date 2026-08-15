@@ -11,23 +11,16 @@
   "win_rate_threshold": 0.9,
   "min_sample_years": 7,
   "universe_size": 703,
-  "scanned_tickers": 689,
+  "scanned_tickers": 696,
   "failed_tickers": [
     "0126Z0",
     "279570",
-    "BFB",
     "BRKB",
+    "BFB",
     "FDXF",
     "HONA",
-    "FISV",
-    "KHC",
-    "LVS",
-    "LH",
-    "KEY",
-    "Q",
-    "UAL",
-    "LRCX"
+    "Q"
   ],
-  "result_rows": 21563,
-  "elapsed_sec": 385.1
+  "result_rows": 21835,
+  "elapsed_sec": 297.4
 }
