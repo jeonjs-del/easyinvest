@@ -42,6 +42,16 @@ DEFAULT_INDICES = {
     "항셍": "HSI", "대만가권": "TWII", "독일DAX": "DAX", "프랑스CAC40": "CAC40",
 }
 
+# 매수 탭 · 계절성: scanner/seasonality_scan.py가 만든 결과 파일만 읽는다(앱은 재계산 안 함)
+SEASONALITY_PARQUET = "data/seasonality.parquet"
+SEASONALITY_META = "data/seasonality_meta.json"
+SEASONALITY_STALE_DAYS = 30   # 기준일이 이보다 오래되면 경고 표시
+BUY_WINDOW_BEFORE = 2         # 진입일 -2일부터
+BUY_WINDOW_AFTER = 5          # 진입일 +5일까지 매수창 유지
+MARKET_CAP_BUCKETS = {
+    "전체": 0, "≥$1B": 1e9, "≥$10B": 1e10, "≥$100B": 1e11,
+}
+
 
 def normalize(sym):
     s = sym.strip().upper()
@@ -445,6 +455,43 @@ def _ace_gold_history():
 
 
 # ============================================================================
+#  매수 탭 · 계절성 (scanner/seasonality_scan.py 결과 파일 읽기 전용)
+# ============================================================================
+@st.cache_data(ttl=60 * 30)
+def load_seasonality():
+    if not (os.path.exists(SEASONALITY_PARQUET) and os.path.exists(SEASONALITY_META)):
+        return pd.DataFrame(), {}
+    try:
+        df = pd.read_parquet(SEASONALITY_PARQUET)
+        with open(SEASONALITY_META, encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        return pd.DataFrame(), {}
+    return df, meta
+
+
+def _nearest_occurrence(month, tdom, today_ts):
+    """(월, 월중n번째영업일)이 today_ts에 가장 가까이 실현되는 실제 날짜를 근사
+    (공휴일은 무시하고 주말만 제외 — 매수창이 ±수일 폭이라 오차는 허용 범위)."""
+    candidates = []
+    for y in (today_ts.year - 1, today_ts.year, today_ts.year + 1):
+        bdays = pd.bdate_range(f"{y}-{int(month):02d}-01", periods=40)
+        bdays = bdays[bdays.month == int(month)]
+        if len(bdays) >= tdom:
+            candidates.append(bdays[int(tdom) - 1])
+    if not candidates:
+        return pd.NaT
+    return min(candidates, key=lambda d: abs((d - today_ts).days))
+
+
+def _market_cap_bucket_mask(series, bucket):
+    floor = MARKET_CAP_BUCKETS[bucket]
+    if floor <= 0:
+        return pd.Series(True, index=series.index)
+    return series >= floor
+
+
+# ============================================================================
 _names_raw, _stock_options = get_krx_listings()
 # 지수 항목을 names dict에 병합 (캐시 결과를 직접 변경하지 않기 위해 복사)
 names = dict(_names_raw)
@@ -473,7 +520,8 @@ if st.session_state.storage_mode == "local":
 
 watchlist = st.session_state.watchlist
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수"])
 
 # =====================  차트  ==============================================
 with tab1:
@@ -1049,6 +1097,113 @@ with tab4:
             st.info("금치프리미엄 히스토리 데이터 조회 실패")
     except Exception as _ge:
         st.error(f"금치프리미엄 오류: {_ge}")
+
+# =====================  매수  ==============================================
+with tab5:
+    sub_season, sub_trend, sub_plan = st.tabs(["🌱 계절성", "📈 추세추종", "🗓 매매계획"])
+
+    with sub_trend:
+        st.info("준비 중입니다.")
+
+    with sub_plan:
+        st.info("준비 중입니다.")
+
+    with sub_season:
+        sdf, smeta = load_seasonality()
+        if sdf.empty:
+            st.warning(
+                "계절성 데이터가 없습니다. 로컬에서 `python scanner/seasonality_scan.py`를 "
+                "먼저 실행해 `data/seasonality.parquet`를 생성해주세요."
+            )
+        else:
+            as_of = pd.Timestamp(smeta.get("as_of"))
+            today_ts = pd.Timestamp(datetime.today().date())
+            days_old = (today_ts - as_of).days
+            stale = days_old > SEASONALITY_STALE_DAYS
+            win_thr = smeta.get("win_rate_threshold", 0.9)
+            date_label = f"{as_of:%Y-%m-%d} ({days_old}일 경과)"
+            status = (
+                f"계절성 데이터 기준일 {date_label} · 월간 갱신 · "
+                f"오늘 기준 매수창(-{BUY_WINDOW_BEFORE}~+{BUY_WINDOW_AFTER}일) · 승률≥{win_thr:.0%}"
+            )
+            if stale:
+                st.warning(f"⚠️ {status} — 갱신이 오래되어 재실행을 권장합니다.")
+            else:
+                st.caption(status)
+
+            work = sdf.copy()
+            # (월, 월중n번째영업일) 조합 수는 최대 12*23=276개로 한정되므로
+            # 조합별로 한 번만 계산해 매핑한다(행 단위 apply보다 훨씬 빠름).
+            pairs = work[["month", "tdom"]].drop_duplicates()
+            occ_map = {
+                (m, d): _nearest_occurrence(m, d, today_ts)
+                for m, d in pairs.itertuples(index=False)
+            }
+            work["entry_date"] = [occ_map[(m, d)] for m, d in zip(work["month"], work["tdom"])]
+            work = work.dropna(subset=["entry_date"])
+            window_start = work["entry_date"] - pd.Timedelta(days=BUY_WINDOW_BEFORE)
+            window_end = work["entry_date"] + pd.Timedelta(days=BUY_WINDOW_AFTER)
+            work = work[(today_ts >= window_start) & (today_ts <= window_end)].copy()
+            work["exit_date"] = work.apply(
+                lambda r: r["entry_date"] + pd.tseries.offsets.BDay(int(r["hold_days"])), axis=1)
+
+            # 필터 옵션은 실제 존재하는 값만 구성 (데이터 없는 필터는 만들지 않음)
+            f1, f2, f3, f4 = st.columns(4)
+            countries = ["전체"] + sorted(work["country"].dropna().unique().tolist())
+            f_country = f1.selectbox("국가", countries, key="season_country")
+            classes = ["전체"] + sorted(work["asset_class"].dropna().unique().tolist())
+            f_class = f2.selectbox("자산군", classes, key="season_class")
+            f_cap = f3.selectbox("시총", list(MARKET_CAP_BUCKETS.keys()), key="season_cap")
+            sectors = ["전체"] + sorted(work["sector"].dropna().unique().tolist())
+            f_sector = f4.selectbox("섹터", sectors, key="season_sector",
+                                     disabled=(len(sectors) == 1))
+
+            if f_country != "전체":
+                work = work[work["country"] == f_country]
+            if f_class != "전체":
+                work = work[work["asset_class"] == f_class]
+            if f_cap != "전체":
+                work = work[_market_cap_bucket_mask(work["market_cap_usd"], f_cap)]
+            if f_sector != "전체":
+                work = work[work["sector"] == f_sector]
+
+            sort_label = st.selectbox(
+                "정렬", ["승률 높은순", "평균수익률 높은순", "진입 임박순"], key="season_sort")
+            if sort_label == "승률 높은순":
+                work = work.sort_values("win_rate", ascending=False)
+            elif sort_label == "평균수익률 높은순":
+                work = work.sort_values("avg_return", ascending=False)
+            else:
+                work["_days_away"] = (work["entry_date"] - today_ts).abs()
+                work = work.sort_values("_days_away")
+
+            work = work.reset_index(drop=True)
+            st.caption(f"{len(work)}종목 · {sort_label}")
+
+            if work.empty:
+                st.info("현재 매수창에 들어온 종목이 없습니다.")
+            else:
+                rows = []
+                for i, r in work.iterrows():
+                    rows.append({
+                        "순위": i + 1,
+                        "종목": f"{r['name']} ({r['ticker']})",
+                        "국가": r["country"],
+                        "섹터": r["sector"] or "—",
+                        "매수 시기": (
+                            f"{r['entry_date']:%m/%d}~{r['exit_date']:%m/%d} "
+                            f"({int(r['hold_days'])}일 보유)"
+                        ),
+                        "승률": r["win_rate"],
+                        "평균수익률": r["avg_return"],
+                        "표본": f"{int(r['n_years'])}/{smeta.get('lookback_years', 10)}년",
+                    })
+                disp = pd.DataFrame(rows)
+                st.dataframe(
+                    disp.style.format({"승률": "{:.0%}", "평균수익률": "{:+.1%}"}),
+                    use_container_width=True, hide_index=True,
+                    height=min(60 + 35 * len(disp), 700),
+                )
 
 st.divider()
 st.caption("※ 규칙 기반 계산기이며 투자 자문이 아닙니다. "

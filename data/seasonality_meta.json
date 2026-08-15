@@ -1,0 +1,33 @@
+{
+  "as_of": "2026-08-15",
+  "lookback_years": 10,
+  "hold_periods": [
+    10,
+    15,
+    20,
+    25,
+    30
+  ],
+  "win_rate_threshold": 0.9,
+  "min_sample_years": 7,
+  "universe_size": 703,
+  "scanned_tickers": 689,
+  "failed_tickers": [
+    "0126Z0",
+    "279570",
+    "BFB",
+    "BRKB",
+    "FDXF",
+    "HONA",
+    "FISV",
+    "KHC",
+    "LVS",
+    "LH",
+    "KEY",
+    "Q",
+    "UAL",
+    "LRCX"
+  ],
+  "result_rows": 21563,
+  "elapsed_sec": 385.1
+}
