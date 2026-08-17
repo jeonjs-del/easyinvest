@@ -1179,7 +1179,10 @@ with tab5:
             else:
                 st.caption(status)
 
-            rep = tdf[tdf["is_representative"]].copy()
+            # 종목당 1행: (종목,신호유형,장단기)에서 대표 보유기간 + 최고 변형인 행만 남긴다.
+            # 나머지 변형(예: EMA40/EMA21/SMA20 근접이 동시에 살아있는 경우)은 카드 안에서
+            # "다른 신호도 발생"으로만 안내한다.
+            rep = tdf[tdf["is_representative"] & tdf["is_best_variant"]].copy()
 
             f1, f2, f3, f4, f5 = st.columns(5)
             countries = ["전체"] + sorted(rep["country"].dropna().unique().tolist())
@@ -1201,7 +1204,8 @@ with tab5:
                 rep = rep[_market_cap_bucket_mask(rep["market_cap_usd"], f_cap, TREND_CAP_BUCKETS)]
 
             if sort_label == "별 우선":
-                rep = rep.sort_values(["star_rating", "profit_factor"], ascending=[False, False])
+                rep = rep.sort_values(["star_rating", "rs_total", "profit_factor"],
+                                       ascending=[False, False, False])
             elif sort_label == "RS순":
                 rep = rep.sort_values("rs_total", ascending=False)
             else:
@@ -1240,8 +1244,17 @@ with tab5:
                         m4.metric("손익비", f"{r['profit_factor']:.2f}")
                         m5.metric(r["sample_label"], f"{int(r['n_samples'])}")
 
+                        other_variants = tdf[
+                            (tdf["ticker"] == r["ticker"]) & (tdf["signal_type"] == r["signal_type"])
+                            & (tdf["trend_term"] == r["trend_term"]) & tdf["is_representative"]
+                            & (tdf["variant_key"] != r["variant_key"])
+                        ]["variant_label"].tolist()
+                        if other_variants:
+                            st.caption(f"다른 신호도 발생: {', '.join(other_variants)}")
+
                         st.markdown("##### 보유기간별 성적표 (★ = 대표 보유기간)")
-                        sub = (tdf[(tdf["ticker"] == r["ticker"]) & (tdf["variant_key"] == r["variant_key"])]
+                        sub = (tdf[(tdf["ticker"] == r["ticker"]) & (tdf["variant_key"] == r["variant_key"])
+                                   & (tdf["trend_term"] == r["trend_term"])]
                                .sort_values("hold_days"))
                         tbl = pd.DataFrame({
                             "보유일": sub["hold_days"].astype(int),

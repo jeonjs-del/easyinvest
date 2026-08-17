@@ -56,16 +56,6 @@ def _fetch_price(ticker, start):
         return None
 
 
-def _fetch_market_cap_usd(ticker):
-    import yfinance as yf
-    try:
-        fi = yf.Ticker(ticker).fast_info
-        cap = fi.get("marketCap") if hasattr(fi, "get") else fi["marketCap"]
-        return float(cap) if cap else None
-    except Exception:
-        return None
-
-
 def _scan_one(meta, price, hold_periods):
     """한 종목의 (월, 월중n번째거래일, 보유기간)별 연도별 승률/평균수익률 계산."""
     df = pd.DataFrame({"close": price})
@@ -122,15 +112,6 @@ def run():
         head = ", ".join(failed[:30])
         print(f"  실패 종목: {head}{' ...' if len(failed) > 30 else ''}")
 
-    us_tickers = [u["ticker"] for u in universe if u["market"] == "US" and u["ticker"] in prices]
-    print(f"미국 종목 시가총액(USD) 조회 중... ({len(us_tickers)}개)")
-    caps = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-        futs = {exe.submit(_fetch_market_cap_usd, tk): tk for tk in us_tickers}
-        for fut in as_completed(futs):
-            caps[futs[fut]] = fut.result()
-    print(f"  시가총액 조회 성공 {sum(1 for v in caps.values() if v)} / {len(us_tickers)}")
-
     usdkrw = None
     try:
         usdkrw = float(fdr.DataReader("USD/KRW", start_date)["Close"].dropna().iloc[-1])
@@ -144,9 +125,7 @@ def run():
         if tk not in prices:
             continue
         meta = {k: v for k, v in u.items() if not k.startswith("_")}
-        if meta["market"] == "US":
-            meta["market_cap_usd"] = caps.get(tk)
-        elif meta["market"] == "KR" and u.get("_market_cap_krw") and usdkrw:
+        if meta["market"] == "KR" and u.get("_market_cap_krw") and usdkrw:
             meta["market_cap_usd"] = u["_market_cap_krw"] / usdkrw
         stats = _scan_one(meta, prices[tk], HOLD_PERIODS)
         if not stats.empty:
