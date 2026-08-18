@@ -22,7 +22,17 @@ Streamlit 앱(app.py)은 이 결과 파일만 읽고 재계산하지 않는다.
 (예: EMA40/EMA21/SMA20 근접)이 동시에 살아있으면, 별점 -> 손익비 -> 표본수 순으로
 가장 좋은 변형 하나만 "is_best_variant=True"로 표시한다. 나머지 변형도 행 자체는
 결과 파일에 남아있으니(app.py에서 "다른 신호도 발생" 카운트로 사용), 종목당 여러
-줄이 중복 노출되던 문제만 리스트 단계에서 해소한다.
+줄이 중복 노출되던 문제만 리스트 단계에서 해소한다. 종목(티커) 단위로 1행만 남기는
+최종 중복 제거는 app.py가 화면 필터를 적용한 뒤 수행한다(신호 유형으로 필터링하면
+그 필터 안에서 다시 최고 1개를 골라야 하므로, 스캐너가 미리 고정된 "종목당 1개"를
+정해두면 필터와 충돌한다).
+
+별점(star_rating)은 승률만으로 정해지지 않는다: 손익비·표본수 조건을 같이 걸고,
+같은 시장 벤치마크(BENCHMARK_TICKERS: 미국 SPY/한국 KOSPI) 대비 초과수익
+(excess_return)까지 요구한다. 안 그러면 상승장에서 그냥 시장을 따라간 것만으로도
+승률이 높게 나오는 신고가돌파(특히 252일 보유)가 부당하게 ★★★를 받는다.
+신고가돌파는 상승장에서 신호 자체가 과다발생하기 쉬워 최소 표본수도
+MIN_SAMPLE_BY_SIGNAL로 다른 신호보다 더 엄격하게(100) 요구한다.
 
 주의 — "장기/단기" 구분은 원 사이트 UI에서 관찰한 것을 역추정한 것으로 확정된
 정의가 아니다(예: "EMA10 단기 근접"과 "EMA10 장기 근접"이 같은 이평 기간으로 동시에
@@ -82,14 +92,28 @@ BUY_ZONE_UPPER_MULT = 1.05      # 매수구간 = [기준선, 기준선 * 이 값
 
 RS_WEIGHTS = {"3m": 3, "6m": 2, "12m": 1}   # 종합/섹터 RS 가중치 (3:2:1 기본)
 
-STAR_RULES = [                  # (승률 임계값, 표본수 임계값, 별점) — 위에서부터 먼저 만족하는 규칙 적용
-    (0.60, 100, 3),
-    (0.55, 50, 2),
+BENCHMARK_TICKERS = {"US": "SPY", "KR": "^KS11"}  # 초과수익 계산용 시장 벤치마크(각 시장 지수)
+
+STAR_RULES = [                  # (승률, 표본수, 손익비, 초과수익) 최소 조건 — 위에서부터 먼저 만족하는 규칙 적용.
+    # 승률만으로 3성이 나오지 않도록 손익비/초과수익 조건을 같이 건다. 표본수 문턱은
+    # MIN_SAMPLE/MIN_SAMPLE_BY_SIGNAL(대표 보유기간 채택 단계)에서 이미 신호유형별로
+    # 걸러지므로 여기서는 그 값을 그대로 재확인만 한다(=사실상 항상 통과) — 처음에는
+    # 여기도 표본수 100을 요구했는데, 신호유형별 표본수 규모가 원래 크게 달라서
+    # (박스돌파는 대표 보유기간 표본이 중앙값 39개 수준이라 100을 거의 못 넘기고,
+    # 신고가돌파는 상승장에 자주 발생해 중앙값 185개로 100을 쉽게 넘음) 그 100 문턱이
+    # 박스돌파를 3성에서 사실상 전멸시키고(65개 중 3개) 상대적으로 신고가돌파만 남기는
+    # 부작용이 있었다(상위100 중 신고가 67개). 표본수 문턱을 빼고 승률·손익비·초과수익
+    # 조합만으로 걸렀더니 상위100 신호유형 비중이 이평눌림목 46·신고가돌파 39·
+    # 박스돌파 15로 훨씬 고르게 나온다(테스트 재현: tests/test_calibration.py 밖,
+    # 스캔 결과 데이터로 직접 확인한 값).
+    (0.55, MIN_SAMPLE, 2.5, 0.05, 3),
+    (0.50, MIN_SAMPLE, 1.5, 0.0, 2),
 ]
 STAR_DEFAULT = 1
 RISK_WIN_RATE = 0.50            # 대표 보유기간 승률이 이 미만이면 '위험형' 배지
 
 SAMPLE_LABELS = {"이평눌림목": "터치수", "박스돌파": "돌파수", "신고가돌파": "표본수"}
+MIN_SAMPLE_BY_SIGNAL = {"신고가돌파": 100}  # 신고가는 상승장에서 과다발생하기 쉬워 표본 요건을 더 엄격히
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 OUTPUT_PARQUET = DATA_DIR / "trend.parquet"
@@ -123,7 +147,10 @@ def _ma_series(close, kind, period):
 
 
 # ---- 보유기간별 통계 --------------------------------------------------------
-def _hold_stats(close_arr, positions, hold_periods):
+def _hold_stats(close_arr, positions, hold_periods, market_arr=None):
+    """market_arr(같은 기간의 벤치마크 종가, 종목 날짜에 정렬됨)를 주면 초과수익도 계산한다.
+    벤치마크가 없거나 특정 구간에 값이 없으면 그 구간은 초과수익 계산에서 제외되고,
+    유효 데이터가 하나도 없으면 excess_return=None(별점 산정에서는 조건 통과로 취급)."""
     n = len(close_arr)
     rows = []
     for h in hold_periods:
@@ -143,9 +170,19 @@ def _hold_stats(close_arr, positions, hold_periods):
         else:
             pf = float("inf") if avg_win > 0 else 0.0
         expectancy = win_rate * avg_win + (1 - win_rate) * avg_loss
+
+        excess_return = None
+        if market_arr is not None:
+            m_entry = market_arr[valid]
+            m_exit = market_arr[valid + h]
+            ok = ~np.isnan(m_entry) & ~np.isnan(m_exit) & (m_entry > 0)
+            if ok.any():
+                mkt_rets = m_exit[ok] / m_entry[ok] - 1.0
+                excess_return = float((rets[ok] - mkt_rets).mean())
+
         rows.append({"hold_days": h, "win_rate": win_rate, "avg_win": avg_win,
                       "avg_loss": avg_loss, "profit_factor": pf, "expectancy": expectancy,
-                      "n_samples": int(len(rets))})
+                      "excess_return": excess_return, "n_samples": int(len(rets))})
     return rows
 
 
@@ -161,23 +198,25 @@ def _pick_representative(rows, min_sample, total_occurrences, min_sample_ratio, 
     return max(eligible, key=lambda r: r[metric])
 
 
-def _star_rating(win_rate, n_samples):
-    for wr_thr, n_thr, star in STAR_RULES:
-        if win_rate >= wr_thr and n_samples >= n_thr:
+def _star_rating(win_rate, n_samples, profit_factor, excess_return):
+    for wr_thr, n_thr, pf_thr, ex_thr, star in STAR_RULES:
+        excess_ok = excess_return is None or excess_return >= ex_thr
+        if win_rate >= wr_thr and n_samples >= n_thr and profit_factor >= pf_thr and excess_ok:
             return star
     return STAR_DEFAULT
 
 
 def _build_candidate_rows(meta, signal_type, variant_key, variant_label,
-                           close_arr, positions, baseline_arr, term_label):
+                           close_arr, positions, baseline_arr, term_label, market_arr=None):
     n = len(close_arr)
     if len(positions) == 0 or positions[-1] != n - 1:
         return []  # 오늘(마지막 봉) 신호가 유효해야 현재 후보로 채택
     window_start = max(0, n - STAT_TERMS[term_label] * TRADING_DAYS_PER_YEAR)
     term_positions = positions[positions >= window_start]
     total_occurrences = len(term_positions)
-    stat_rows = _hold_stats(close_arr, term_positions, HOLD_PERIODS)
-    rep = _pick_representative(stat_rows, MIN_SAMPLE, total_occurrences, MIN_SAMPLE_RATIO, REPRESENTATIVE_METRIC)
+    min_sample = MIN_SAMPLE_BY_SIGNAL.get(signal_type, MIN_SAMPLE)
+    stat_rows = _hold_stats(close_arr, term_positions, HOLD_PERIODS, market_arr)
+    rep = _pick_representative(stat_rows, min_sample, total_occurrences, MIN_SAMPLE_RATIO, REPRESENTATIVE_METRIC)
     if rep is None:
         return []  # 최소 표본수/비율 미달 -> 제외
     baseline = baseline_arr[-1]
@@ -191,7 +230,7 @@ def _build_candidate_rows(meta, signal_type, variant_key, variant_label,
         status = "구간내"
     else:
         status = "구간위"
-    star = _star_rating(rep["win_rate"], rep["n_samples"])
+    star = _star_rating(rep["win_rate"], rep["n_samples"], rep["profit_factor"], rep["excess_return"])
     risk = rep["win_rate"] < RISK_WIN_RATE
 
     out = []
@@ -205,6 +244,7 @@ def _build_candidate_rows(meta, signal_type, variant_key, variant_label,
             "sample_label": SAMPLE_LABELS[signal_type],
             "hold_days": r["hold_days"], "win_rate": r["win_rate"], "avg_win": r["avg_win"],
             "avg_loss": r["avg_loss"], "profit_factor": r["profit_factor"], "expectancy": r["expectancy"],
+            "excess_return": r["excess_return"],
             "n_samples": r["n_samples"], "total_occurrences": total_occurrences,
             "is_representative": r["hold_days"] == rep["hold_days"],
             "star_rating": star, "risk_flag": risk,
@@ -254,39 +294,44 @@ def detect_newhigh_positions(close, period):
 
 
 # ---- 종목별 신호 스캔 --------------------------------------------------------
-def _scan_ticker(meta, df, signal_types):
+def _scan_ticker(meta, df, signal_types, benchmark=None):
     df = df.dropna(subset=["Close", "High", "Low"])
     if len(df) < 260:
         return []
     close, high, low = df["Close"], df["High"], df["Low"]
     close_arr = close.to_numpy()
 
+    market_arr = None
+    if benchmark is not None:
+        market_arr = benchmark.reindex(close.index, method="ffill").to_numpy(dtype="float64")
+
     results = []
     terms = list(STAT_TERMS.keys())
 
+    # 라벨은 원사이트 표기("EMA10 단기 근접", "박스돌파 장기")를 따라 장/단기를 항상 붙인다.
     if "이평눌림목" in signal_types:
         for kind, period in MA_VARIANTS:
             positions, ma = detect_ma_near_positions(close, low, kind, period)
             for term_label in terms:
                 results.extend(_build_candidate_rows(
-                    meta, "이평눌림목", f"{kind}_{period}", f"{kind}{period} 근접",
-                    close_arr, positions, ma.to_numpy(), term_label))
+                    meta, "이평눌림목", f"{kind}_{period}", f"{kind}{period} {term_label} 근접",
+                    close_arr, positions, ma.to_numpy(), term_label, market_arr))
 
     if "박스돌파" in signal_types:
         for period in BOX_PERIODS:
             positions, box_top = detect_box_breakout_positions(close, high, low, period)
             for term_label in terms:
                 results.extend(_build_candidate_rows(
-                    meta, "박스돌파", f"BOX_{period}", f"박스돌파({period}일)",
-                    close_arr, positions, box_top.to_numpy(), term_label))
+                    meta, "박스돌파", f"BOX_{period}", f"박스돌파 {term_label}",
+                    close_arr, positions, box_top.to_numpy(), term_label, market_arr))
 
     if "신고가돌파" in signal_types:
         for period in NEWHIGH_PERIODS:
             positions, prior_max = detect_newhigh_positions(close, period)
             for term_label in terms:
                 results.extend(_build_candidate_rows(
-                    meta, "신고가돌파", f"NEWHIGH_{period}", f"{period}일신고가 돌파",
-                    close_arr, positions, prior_max.to_numpy(), term_label))
+                    meta, "신고가돌파", f"NEWHIGH_{period}", f"{period}일신고가 {term_label} 돌파",
+                    close_arr, positions, prior_max.to_numpy(), term_label, market_arr))
 
     return results
 
@@ -397,6 +442,17 @@ def run(signal_types=None, markets=None):
     print("RS(상대강도) 계산 중...")
     rs_total, rs_sector = _compute_rs(universe, close_map)
 
+    print("시장 벤치마크(초과수익 계산용) 조회 중...")
+    benchmarks = {}
+    for mkt, btk in BENCHMARK_TICKERS.items():
+        if not any(u["market"] == mkt for u in universe):
+            continue
+        try:
+            bdf = fdr.DataReader(btk, start_date)
+            benchmarks[mkt] = bdf["Close"].dropna()
+        except Exception as e:
+            print(f"  벤치마크({btk}) 조회 실패({e}) -> {mkt} 초과수익 미반영")
+
     print("신호 스캔 중...")
     all_rows, done = [], 0
     for u in universe:
@@ -408,7 +464,7 @@ def run(signal_types=None, markets=None):
             meta["market_cap_usd"] = u["_market_cap_krw"] / usdkrw
         meta["rs_total"] = rs_total.get(tk)
         meta["rs_sector"] = rs_sector.get(tk)
-        all_rows.extend(_scan_ticker(meta, prices[tk], signal_types))
+        all_rows.extend(_scan_ticker(meta, prices[tk], signal_types, benchmarks.get(u["market"])))
         done += 1
         if done % 100 == 0 or done == len(prices):
             print(f"  진행 {done}/{len(prices)}")
@@ -428,7 +484,7 @@ def run(signal_types=None, markets=None):
                          [["ticker", "signal_type", "trend_term", "variant_key"]]
                          .assign(is_best_variant=True))
         result = result.merge(best_variant, on=["ticker", "signal_type", "trend_term", "variant_key"], how="left")
-        result["is_best_variant"] = result["is_best_variant"].fillna(False)
+        result["is_best_variant"] = result["is_best_variant"].fillna(False).astype(bool)
 
         rep = result[result["is_representative"]]
         candidate_counts = rep.groupby("signal_type")["ticker"].nunique().to_dict()
@@ -448,6 +504,9 @@ def run(signal_types=None, markets=None):
             "stat_terms": STAT_TERMS,
             "ma_near_tolerance": MA_NEAR_TOLERANCE,
             "box_max_range": BOX_MAX_RANGE,
+            "star_rules": STAR_RULES,
+            "min_sample_by_signal": MIN_SAMPLE_BY_SIGNAL,
+            "benchmark_tickers": {k: v for k, v in BENCHMARK_TICKERS.items() if k in benchmarks},
             "signal_types": signal_types,
             "universe_size": len(universe),
             "scanned_tickers": len(prices),

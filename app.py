@@ -57,6 +57,7 @@ TREND_PARQUET = "data/trend.parquet"
 TREND_META = "data/trend_meta.json"
 TREND_STALE_DAYS = 30
 TREND_CAP_BUCKETS = {"전체": 0, "≥$1B": 1e9, "≥$10B": 1e10}
+TREND_MAX_DISPLAY = 100         # 표시 종목 수 상한(원사이트와 동일)
 
 
 def normalize(sym):
@@ -1179,9 +1180,13 @@ with tab5:
             else:
                 st.caption(status)
 
-            # 종목당 1행: (종목,신호유형,장단기)에서 대표 보유기간 + 최고 변형인 행만 남긴다.
-            # 나머지 변형(예: EMA40/EMA21/SMA20 근접이 동시에 살아있는 경우)은 카드 안에서
-            # "다른 신호도 발생"으로만 안내한다.
+            # 1차: (종목,신호유형,장단기)에서 최고 변형만 남긴다(예: EMA40/EMA21/SMA20
+            # 근접이 동시에 살아있으면 그중 하나만). 이 단계에서도 종목 하나가 신호유형별로
+            # 여러 번 나올 수 있다(예: 이평눌림목+박스돌파 동시 신호) — 그래서 필터를 다
+            # 적용한 뒤 아래에서 티커 기준으로 한 번 더 최상위 1행만 남긴다. 필터 적용 후에
+            # 다시 고르는 이유: "신호=이평눌림목"으로만 볼 때도 그 조건 안에서 최고 1개를
+            # 골라야 하는데, 스캐너 단계에서 신호유형을 넘나드는 고정 1위를 미리 정해두면
+            # 필터와 결과가 어긋난다.
             rep = tdf[tdf["is_representative"] & tdf["is_best_variant"]].copy()
 
             f1, f2, f3, f4, f5 = st.columns(5)
@@ -1203,6 +1208,11 @@ with tab5:
             if f_cap != "전체":
                 rep = rep[_market_cap_bucket_mask(rep["market_cap_usd"], f_cap, TREND_CAP_BUCKETS)]
 
+            # 2차: 티커 기준 중복 제거(별점 -> 손익비 -> 표본수 순 최상위 1행만).
+            rep = rep.sort_values(["star_rating", "profit_factor", "n_samples"],
+                                   ascending=[False, False, False])
+            rep = rep.drop_duplicates(subset="ticker", keep="first")
+
             if sort_label == "별 우선":
                 rep = rep.sort_values(["star_rating", "rs_total", "profit_factor"],
                                        ascending=[False, False, False])
@@ -1212,7 +1222,12 @@ with tab5:
                 rep = rep.sort_values("win_rate", ascending=False)
             rep = rep.reset_index(drop=True)
 
-            st.caption(f"{len(rep)}종목 · {sort_label}")
+            total_unique = len(rep)
+            rep = rep.head(TREND_MAX_DISPLAY)
+            if total_unique > TREND_MAX_DISPLAY:
+                st.caption(f"{len(rep)}종목 표시 (조건 충족 {total_unique}종목 중 상위 {TREND_MAX_DISPLAY}) · {sort_label}")
+            else:
+                st.caption(f"{total_unique}종목 · {sort_label}")
 
             if rep.empty:
                 st.info("조건에 맞는 후보가 없습니다.")
@@ -1237,20 +1252,32 @@ with tab5:
                         c2.metric("현재가", f"{r['close_price']:,.2f}")
                         c3.metric("가격 위치", r["price_status"])
 
-                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1, m2, m3, m4, m5, m6 = st.columns(6)
                         m1.metric("승률", f"{r['win_rate']:.0%}")
                         m2.metric("평균이익", f"{r['avg_win']:+.1%}")
                         m3.metric("평균손실", f"{r['avg_loss']:+.1%}")
                         m4.metric("손익비", f"{r['profit_factor']:.2f}")
                         m5.metric(r["sample_label"], f"{int(r['n_samples'])}")
+                        excess = r.get("excess_return")
+                        m6.metric("초과수익(벤치마크 대비)", f"{excess:+.1%}" if pd.notna(excess) else "—")
 
-                        other_variants = tdf[
-                            (tdf["ticker"] == r["ticker"]) & (tdf["signal_type"] == r["signal_type"])
-                            & (tdf["trend_term"] == r["trend_term"]) & tdf["is_representative"]
-                            & (tdf["variant_key"] != r["variant_key"])
-                        ]["variant_label"].tolist()
-                        if other_variants:
-                            st.caption(f"다른 신호도 발생: {', '.join(other_variants)}")
+                        # 이 종목이 지금 다른 신호(유형/변형/장단기)로도 살아있는지 — 티커
+                        # 중복 제거로 위 카드엔 최상위 1개만 보이므로 나머지는 여기서 안내.
+                        others = tdf[
+                            (tdf["ticker"] == r["ticker"]) & tdf["is_representative"] & tdf["is_best_variant"]
+                            & ~((tdf["signal_type"] == r["signal_type"])
+                                & (tdf["variant_key"] == r["variant_key"])
+                                & (tdf["trend_term"] == r["trend_term"]))
+                        ].sort_values(["star_rating", "profit_factor"], ascending=[False, False])
+                        if not others.empty:
+                            if st.checkbox(f"이 종목의 다른 신호 보기 ({len(others)}개)", key=f"others_{i}_{r['ticker']}"):
+                                for _, o in others.iterrows():
+                                    o_stars = "★" * int(o["star_rating"]) + "☆" * (3 - int(o["star_rating"]))
+                                    st.caption(
+                                        f"{o_stars} [{o['signal_type']}] {o['variant_label']} · "
+                                        f"{int(o['hold_days'])}일 보유 · 승률 {o['win_rate']:.0%} · "
+                                        f"손익비 {o['profit_factor']:.2f}"
+                                    )
 
                         st.markdown("##### 보유기간별 성적표 (★ = 대표 보유기간)")
                         sub = (tdf[(tdf["ticker"] == r["ticker"]) & (tdf["variant_key"] == r["variant_key"])
