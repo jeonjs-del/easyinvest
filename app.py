@@ -4,6 +4,7 @@
 실행:  streamlit run app.py   (같은 폴더에 strategies.py 필요)
 """
 import json
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -536,9 +537,16 @@ def _position_sizing_plan(price, asset, max_loss_pct, stop_pct, tp_mult):
     }
 
 
+def _round_half_up(x):
+    """0.5 지점을 항상 위로 반올림. 파이썬 기본 `:.0f` 포맷은 0.5를 짝수 쪽으로
+    반올림(banker's rounding)해서, 예: 323372.5원이 323,372원으로 내려가 검증 예시
+    (323,373원)와 어긋나는 경우가 있다 — 화면 표시용 금액은 전부 이 함수로 반올림한다."""
+    return math.floor(x + 0.5) if x >= 0 else -math.floor(-x + 0.5)
+
+
 def _krw_abbrev(x):
     """1,412만원 스타일 축약 표기 (원 단위 미만은 버림)."""
-    x = int(round(x))
+    x = _round_half_up(x)
     eok, rem = divmod(x, 100_000_000)
     man = rem // 10_000
     parts = []
@@ -1356,43 +1364,60 @@ with tab5:
                 step=(100.0 if p_is_krw else 0.5), key=f"plan_price_{p_ticker}",
             )
 
+            # 투자자산: 원화/달러 종목을 오가도 서로 다른 통화의 숫자가 섞이지 않도록
+            # 통화별로 세션에 값을 따로 유지한다(관심목록처럼 Gist에 영구 저장하진
+            # 않고, 세션이 유지되는 동안만 — 다시 열 때마다 남아있길 원하면 알려달라).
+            asset_key = "plan_asset_krw" if p_is_krw else "plan_asset_usd"
+            if asset_key not in st.session_state:
+                st.session_state[asset_key] = 100_000_000.0 if p_is_krw else 100_000.0
+
+            ac1, ac2 = st.columns([3, 2])
+            with ac1:
+                asset = st.number_input(
+                    f"투자자산 ({'원' if p_is_krw else 'USD'})", min_value=0.0,
+                    step=(1_000_000.0 if p_is_krw else 1_000.0),
+                    format="%.0f" if p_is_krw else "%.2f", key=asset_key,
+                )
+            with ac2:
+                st.markdown("<div style='height:1.8em'></div>", unsafe_allow_html=True)
+                if asset > 0:
+                    st.caption(f"= {_krw_abbrev(asset)}" if p_is_krw else f"= ${asset:,.2f}")
+            asset_valid = asset > 0
+            if not asset_valid:
+                st.error("투자자산은 0보다 큰 값을 입력해주세요.")
+
             mode = st.radio("방식", ["디폴트", "직접 입력"], horizontal=True, key="plan_mode")
-            default_asset = 100_000_000.0 if p_is_krw else 100_000.0
-            # 미국(달러) 종목은 원화 기본값(1억원)을 그대로 쓸 수 없어, 자산 기준통화도
-            # 종목 통화에 맞춰 별도 기본값($100,000)을 둔다 — "직접 입력"에서 조정 가능.
+            # 디폴트: 1%/7%/3배 고정, 투자자산만 입력. 직접 입력: 네 값 모두 조정 가능.
             if mode == "직접 입력":
-                q1, q2, q3, q4 = st.columns(4)
-                asset = q1.number_input(
-                    "투자자산", min_value=0.0, value=default_asset,
-                    step=(1_000_000.0 if p_is_krw else 1_000.0), key="plan_asset")
-                loss_pct = q2.number_input(
+                q1, q2, q3 = st.columns(3)
+                loss_pct = q1.number_input(
                     "최대손실(%)", min_value=0.1, value=1.0, step=0.1, key="plan_loss") / 100
-                stop_pct = q3.number_input(
+                stop_pct = q2.number_input(
                     "손절폭(%)", min_value=0.1, value=7.0, step=0.5, key="plan_stop") / 100
-                tp_mult = q4.number_input(
+                tp_mult = q3.number_input(
                     "익절배수", min_value=0.1, value=3.0, step=0.5, key="plan_mult")
             else:
-                asset, loss_pct, stop_pct, tp_mult = default_asset, 0.01, 0.07, 3.0
+                loss_pct, stop_pct, tp_mult = 0.01, 0.07, 3.0
 
             # 불타기(분할 추가매수): 원 사이트의 정확한 규칙이 확인되지 않아, 우선
             # 총 매수금액을 1차 60% / 2차 40%로 나누는 임시 규칙으로 구현했다.
             # 규칙이 확인되면 아래 pyramiding 분기만 교체하면 된다.
             pyramiding = st.radio("불타기", ["안 함", "함"], horizontal=True, key="plan_pyramid")
 
-            if st.button("계획 보기", type="primary"):
+            if asset_valid and st.button("계획 보기", type="primary"):
                 st.session_state.plan_computed = True
 
-            if st.session_state.get("plan_computed"):
+            if asset_valid and st.session_state.get("plan_computed"):
                 plan = _position_sizing_plan(buy_price, asset, loss_pct, stop_pct, tp_mult)
                 if plan is None or plan["shares"] <= 0:
                     st.warning("손절폭·매수가 조합상 매수 가능 주식 수가 0입니다. 파라미터를 확인해주세요.")
                 else:
                     if p_is_krw:
                         header_price = f"{buy_price:,.0f}원"
-                        amt_str = f"{plan['buy_amount']:,.0f}원 ({_krw_abbrev(plan['buy_amount'])})"
-                        loss_str = f"{plan['worst_loss']:,.0f}원"
-                        stop_str = f"{plan['stop_price']:,.0f}원"
-                        tp1_str = f"{plan['tp1_price']:,.0f}원"
+                        amt_str = f"{_round_half_up(plan['buy_amount']):,}원 ({_krw_abbrev(plan['buy_amount'])})"
+                        loss_str = f"{_round_half_up(plan['worst_loss']):,}원"
+                        stop_str = f"{math.floor(plan['stop_price']):,}원"  # 손절가는 원 단위 버림
+                        tp1_str = f"{_round_half_up(plan['tp1_price']):,}원"
                         ma_str = f"{ma20:,.0f}원" if ma20 is not None else "—"
                     else:
                         header_price = f"${buy_price:,.2f}"
