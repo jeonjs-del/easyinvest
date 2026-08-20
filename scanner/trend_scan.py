@@ -27,12 +27,21 @@ Streamlit 앱(app.py)은 이 결과 파일만 읽고 재계산하지 않는다.
 그 필터 안에서 다시 최고 1개를 골라야 하므로, 스캐너가 미리 고정된 "종목당 1개"를
 정해두면 필터와 충돌한다).
 
-별점(star_rating)은 승률만으로 정해지지 않는다: 손익비·표본수 조건을 같이 걸고,
-같은 시장 벤치마크(BENCHMARK_TICKERS: 미국 SPY/한국 KOSPI) 대비 초과수익
-(excess_return)까지 요구한다. 안 그러면 상승장에서 그냥 시장을 따라간 것만으로도
-승률이 높게 나오는 신고가돌파(특히 252일 보유)가 부당하게 ★★★를 받는다.
-신고가돌파는 상승장에서 신호 자체가 과다발생하기 쉬워 최소 표본수도
-MIN_SAMPLE_BY_SIGNAL로 다른 신호보다 더 엄격하게(100) 요구한다.
+별점(star_rating)은 승률만으로 정해지지 않는다. 먼저 "승률" 자체를 절대수익이
+아니라 같은 시장 벤치마크(BENCHMARK_TICKERS: 미국 SPY/한국 KOSPI) 대비 초과수익
+기준으로 정의한다(보유기간 수익률 > 같은 기간 벤치마크 수익률 = 승리) — 상승장에서
+그냥 시장을 따라 올라간 것과 실제로 시장을 이긴 것을 구분하기 위함이다(절대수익
+기준 승률은 abs_win_rate로 별도 보관). 그리고 별점은 유니버스 전체를 하나의
+절대기준으로 비교하지 않고, 신호유형(이평눌림목/박스돌파/신고가돌파) 내부에서만
+초과승률·초과수익의 백분위로 매긴다(_assign_percentile_stars) — 절대기준 하나로
+비교하면 신고가돌파처럼 대표 표본수가 원래 훨씬 큰 유형이 표본수·상승장 편향만으로
+상위를 독식한다(실측: Eton/Micron/Aehr 등 신고가돌파가 승률 60~78%·손익비 3~6·
+초과수익 27~85%p로 절대기준을 여유있게 통과해 상위100 다수를 차지). 신고가돌파는
+상승장에서 신호 자체가 과다발생하기 쉬워 최소 표본수도 MIN_SAMPLE_BY_SIGNAL로 다른
+신호보다 더 엄격하게(100) 요구한다. 또한 대표 보유기간 후보에서 20일 미만
+(REPRESENTATIVE_MIN_HOLD_DAYS)은 제외하고, 63일 이상(REPRESENTATIVE_PREFERRED_
+MIN_HOLD_DAYS) 후보가 있으면 그중에서만 고른다 — 초단기 보유기간이 대표로 뽑혀
+카드 첫인상이 원 사이트와 어긋나는 것을 막기 위함.
 
 주의 — "장기/단기" 구분은 원 사이트 UI에서 관찰한 것을 역추정한 것으로 확정된
 정의가 아니다(예: "EMA10 단기 근접"과 "EMA10 장기 근접"이 같은 이평 기간으로 동시에
@@ -71,6 +80,8 @@ HOLD_PERIODS = [2, 3, 5, 10, 20, 63, 126, 252]
 MIN_SAMPLE = 20                 # 대표 보유기간 선정 및 최종 후보 포함의 최소 표본수
 MIN_SAMPLE_RATIO = 0.8          # 대표 보유기간 후보 조건: 표본수가 해당 창 전체 신호발생수의 이 비율 이상
 REPRESENTATIVE_METRIC = "profit_factor"  # 대표 보유기간 선택 기준: "profit_factor" 또는 "expectancy"
+REPRESENTATIVE_MIN_HOLD_DAYS = 20         # 대표 보유기간 후보에서 이 미만(2/3/5/10일)은 아예 제외 — 초단기가 대표로 뽑히지 않게
+REPRESENTATIVE_PREFERRED_MIN_HOLD_DAYS = 63  # 이 이상인 후보가 있으면 그중에서만 고른다(가능하면 63일 이상 우선)
 MAX_WORKERS = 12
 
 MA_VARIANTS = [("SMA", 10), ("SMA", 20), ("SMA", 30),
@@ -94,23 +105,30 @@ RS_WEIGHTS = {"3m": 3, "6m": 2, "12m": 1}   # 종합/섹터 RS 가중치 (3:2:1 
 
 BENCHMARK_TICKERS = {"US": "SPY", "KR": "^KS11"}  # 초과수익 계산용 시장 벤치마크(각 시장 지수)
 
-STAR_RULES = [                  # (승률, 표본수, 손익비, 초과수익) 최소 조건 — 위에서부터 먼저 만족하는 규칙 적용.
-    # 승률만으로 3성이 나오지 않도록 손익비/초과수익 조건을 같이 건다. 표본수 문턱은
-    # MIN_SAMPLE/MIN_SAMPLE_BY_SIGNAL(대표 보유기간 채택 단계)에서 이미 신호유형별로
-    # 걸러지므로 여기서는 그 값을 그대로 재확인만 한다(=사실상 항상 통과) — 처음에는
-    # 여기도 표본수 100을 요구했는데, 신호유형별 표본수 규모가 원래 크게 달라서
-    # (박스돌파는 대표 보유기간 표본이 중앙값 39개 수준이라 100을 거의 못 넘기고,
-    # 신고가돌파는 상승장에 자주 발생해 중앙값 185개로 100을 쉽게 넘음) 그 100 문턱이
-    # 박스돌파를 3성에서 사실상 전멸시키고(65개 중 3개) 상대적으로 신고가돌파만 남기는
-    # 부작용이 있었다(상위100 중 신고가 67개). 표본수 문턱을 빼고 승률·손익비·초과수익
-    # 조합만으로 걸렀더니 상위100 신호유형 비중이 이평눌림목 46·신고가돌파 39·
-    # 박스돌파 15로 훨씬 고르게 나온다(테스트 재현: tests/test_calibration.py 밖,
-    # 스캔 결과 데이터로 직접 확인한 값).
+STAR_RULES = [                  # (승률, 표본수, 손익비, 초과수익) 최소 조건 — 절대기준 방식.
+    # 더 이상 기본 별점 산정에는 쓰이지 않는다(아래 STAR_TOP_PERCENTILE 방식으로 대체,
+    # 이유는 그 함수 docstring 참고). 벤치마크 조회가 실패해 초과수익을 계산할 수
+    # 없는 예외적인 행에서만 fallback으로 남겨둔다.
     (0.55, MIN_SAMPLE, 2.5, 0.05, 3),
     (0.50, MIN_SAMPLE, 1.5, 0.0, 2),
 ]
 STAR_DEFAULT = 1
-RISK_WIN_RATE = 0.50            # 대표 보유기간 승률이 이 미만이면 '위험형' 배지
+
+# 별점을 신호유형(이평/박스/신고가) 내부 백분위로 매긴다. 절대기준 하나로 전체
+# 유니버스를 비교하면 신고가돌파처럼 대표 표본수가 원래 훨씬 큰(중앙값 192 vs 이평
+# 54, 박스 54) 신호유형이 3성을 구조적으로 독식한다(실측: Eton/Micron/Aehr 등
+# 신고가돌파가 승률 60~78%·손익비 3~6·초과수익 27~85%p로 절대기준을 여유있게
+# 통과해 상위 100 중 다수를 차지). "이평은 이평끼리, 박스는 박스끼리, 신고가는
+# 신고가끼리" 순위를 매기면 한 유형이 표본수·상승장 편향만으로 상위를 독식하지
+# 못한다. 순위 지표는 초과수익 기준 승률(excess_win_rate)과 초과수익
+# (excess_return — 승률가중 기대값과 수학적으로 동일: win_rate*avg_win 형태의
+# 기대값 공식은 항상 전체 평균과 같아진다)의 평균 백분위.
+STAR_TOP_PERCENTILE = 0.85       # 신호유형 내 상위 15% -> 3성 후보
+STAR_MID_PERCENTILE = 0.55       # 상위 45% -> 2성 후보, 나머지 1성
+STAR_MIN_EXCESS_WIN_RATE_3STAR = 0.50  # 백분위가 높아도 초과승률이 이 미만이면 3성에서 강등
+STAR_MIN_EXCESS_RETURN = 0.0     # 2성 이상은 초과수익 기대값이 0 이상이어야 함
+
+RISK_WIN_RATE = 0.50            # 대표 보유기간 승률(초과수익 기준)이 이 미만이면 '위험형' 배지
 
 SAMPLE_LABELS = {"이평눌림목": "터치수", "박스돌파": "돌파수", "신고가돌파": "표본수"}
 MIN_SAMPLE_BY_SIGNAL = {"신고가돌파": 100}  # 신고가는 상승장에서 과다발생하기 쉬워 표본 요건을 더 엄격히
@@ -148,9 +166,15 @@ def _ma_series(close, kind, period):
 
 # ---- 보유기간별 통계 --------------------------------------------------------
 def _hold_stats(close_arr, positions, hold_periods, market_arr=None):
-    """market_arr(같은 기간의 벤치마크 종가, 종목 날짜에 정렬됨)를 주면 초과수익도 계산한다.
-    벤치마크가 없거나 특정 구간에 값이 없으면 그 구간은 초과수익 계산에서 제외되고,
-    유효 데이터가 하나도 없으면 excess_return=None(별점 산정에서는 조건 통과로 취급)."""
+    """market_arr(같은 기간의 벤치마크 종가, 종목 날짜에 정렬됨)를 주면 초과수익 지표도
+    계산한다. 벤치마크가 없거나 특정 구간에 값이 없으면 그 구간은 초과수익 계산에서
+    제외되고, 유효 데이터가 하나도 없으면 excess_*=None.
+
+    "승률"(win_rate)의 정의는 시장 대비 초과수익 기준을 우선한다 — 즉 "보유기간
+    수익률 > 같은 기간 벤치마크 수익률"을 승리로 본다. 상승장에서 그냥 시장을 따라
+    올라간 것과 실제로 시장을 이긴 것을 구분하기 위함이다. 벤치마크가 없는 예외적인
+    경우에만 절대수익 기준으로 대체한다. 절대수익 기준 승률은 abs_win_rate로 항상
+    별도 보관해 카드에 같이 표시한다."""
     n = len(close_arr)
     rows = []
     for h in hold_periods:
@@ -162,27 +186,38 @@ def _hold_stats(close_arr, positions, hold_periods, market_arr=None):
         rets = exit_ / entry - 1.0
         wins = rets[rets > 0]
         losses = rets[rets <= 0]
-        win_rate = len(wins) / len(rets)
+        abs_win_rate = len(wins) / len(rets)
         avg_win = float(wins.mean()) if len(wins) else 0.0
         avg_loss = float(losses.mean()) if len(losses) else 0.0
         if avg_loss < 0:
             pf = avg_win / abs(avg_loss)
         else:
             pf = float("inf") if avg_win > 0 else 0.0
-        expectancy = win_rate * avg_win + (1 - win_rate) * avg_loss
+        expectancy = abs_win_rate * avg_win + (1 - abs_win_rate) * avg_loss
 
         excess_return = None
+        excess_win_rate = None
+        avg_excess_win = None
+        avg_excess_loss = None
         if market_arr is not None:
             m_entry = market_arr[valid]
             m_exit = market_arr[valid + h]
             ok = ~np.isnan(m_entry) & ~np.isnan(m_exit) & (m_entry > 0)
             if ok.any():
-                mkt_rets = m_exit[ok] / m_entry[ok] - 1.0
-                excess_return = float((rets[ok] - mkt_rets).mean())
+                excess = rets[ok] - (m_exit[ok] / m_entry[ok] - 1.0)
+                excess_return = float(excess.mean())
+                excess_win_rate = float((excess > 0).mean())
+                ew, el = excess[excess > 0], excess[excess <= 0]
+                avg_excess_win = float(ew.mean()) if len(ew) else 0.0
+                avg_excess_loss = float(el.mean()) if len(el) else 0.0
 
-        rows.append({"hold_days": h, "win_rate": win_rate, "avg_win": avg_win,
-                      "avg_loss": avg_loss, "profit_factor": pf, "expectancy": expectancy,
-                      "excess_return": excess_return, "n_samples": int(len(rets))})
+        win_rate = excess_win_rate if excess_win_rate is not None else abs_win_rate
+
+        rows.append({"hold_days": h, "win_rate": win_rate, "abs_win_rate": abs_win_rate,
+                      "avg_win": avg_win, "avg_loss": avg_loss, "profit_factor": pf,
+                      "expectancy": expectancy, "excess_return": excess_return,
+                      "excess_win_rate": excess_win_rate, "avg_excess_win": avg_excess_win,
+                      "avg_excess_loss": avg_excess_loss, "n_samples": int(len(rets))})
     return rows
 
 
@@ -190,20 +225,67 @@ def _pick_representative(rows, min_sample, total_occurrences, min_sample_ratio, 
     """대표 보유기간 선정: 최소 표본수(min_sample)와, 창 전체 신호발생수 대비 표본
     비율(min_sample_ratio) 조건을 모두 만족하는 보유기간 중 metric이 최대인 것.
     표본 비율 조건이 없으면 손익비가 보유기간이 길어질수록 커지는 추세추종 신호
-    특성상 대표 보유기간이 항상 최장(252일)으로 쏠리는 문제가 있었다."""
+    특성상 대표 보유기간이 항상 최장(252일)으로 쏠리는 문제가 있었다.
+
+    보유기간 REPRESENTATIVE_MIN_HOLD_DAYS(20일) 미만은 애초에 후보에서 제외한다
+    (2/3/5/10일 같은 초단기가 대표로 뽑히면 카드 첫인상이 '초단타'처럼 보여 원
+    사이트와 어긋난다). 나아가 REPRESENTATIVE_PREFERRED_MIN_HOLD_DAYS(63일) 이상인
+    후보가 하나라도 있으면 그중에서만 고르고, 전혀 없을 때만 20~62일 구간까지
+    넓혀서 고른다."""
     eligible = [r for r in rows
-                if r["n_samples"] >= min_sample and r["n_samples"] >= min_sample_ratio * total_occurrences]
+                if r["hold_days"] >= REPRESENTATIVE_MIN_HOLD_DAYS
+                and r["n_samples"] >= min_sample
+                and r["n_samples"] >= min_sample_ratio * total_occurrences]
     if not eligible:
         return None
-    return max(eligible, key=lambda r: r[metric])
+    preferred = [r for r in eligible if r["hold_days"] >= REPRESENTATIVE_PREFERRED_MIN_HOLD_DAYS]
+    pool = preferred if preferred else eligible
+    return max(pool, key=lambda r: r[metric])
 
 
 def _star_rating(win_rate, n_samples, profit_factor, excess_return):
+    """절대기준 fallback — 벤치마크가 없어 초과수익을 계산 못한 예외적인 행에서만 쓴다.
+    기본 경로는 _assign_percentile_stars() 참고."""
     for wr_thr, n_thr, pf_thr, ex_thr, star in STAR_RULES:
         excess_ok = excess_return is None or excess_return >= ex_thr
         if win_rate >= wr_thr and n_samples >= n_thr and profit_factor >= pf_thr and excess_ok:
             return star
     return STAR_DEFAULT
+
+
+def _assign_percentile_stars(rep):
+    """대표 보유기간 행(신호유형 x 종목 단위 1행)에 별점을 매긴다. 신호유형(이평/박스/
+    신고가) 내부에서만 백분위를 비교해, 신고가돌파처럼 표본이 원래 많은 유형이
+    표본수·상승장 편향만으로 상위를 독식하지 못하게 한다. 순위 지표는 초과수익
+    기준 승률(excess_win_rate)과 초과수익(excess_return, 승률가중 기대값과 수학적으로
+    동일)의 평균 백분위. 벤치마크가 없어 초과수익을 계산 못한 행은 _star_rating()
+    절대기준으로 대체한다."""
+    has_excess = rep["excess_win_rate"].notna() & rep["excess_return"].notna()
+    stars = pd.Series(STAR_DEFAULT, index=rep.index, dtype="int64")
+
+    sub = rep.loc[has_excess]
+    if not sub.empty:
+        pct_wr = sub.groupby("signal_type")["excess_win_rate"].rank(pct=True)
+        pct_ex = sub.groupby("signal_type")["excess_return"].rank(pct=True)
+        score_pct = (pct_wr + pct_ex) / 2
+
+        is_3star = ((score_pct >= STAR_TOP_PERCENTILE)
+                    & (sub["excess_win_rate"] >= STAR_MIN_EXCESS_WIN_RATE_3STAR)
+                    & (sub["excess_return"] >= STAR_MIN_EXCESS_RETURN))
+        is_2star = (~is_3star
+                    & (score_pct >= STAR_MID_PERCENTILE)
+                    & (sub["excess_return"] >= STAR_MIN_EXCESS_RETURN))
+
+        sub_stars = pd.Series(STAR_DEFAULT, index=sub.index, dtype="int64")
+        sub_stars[is_2star] = 2
+        sub_stars[is_3star] = 3
+        stars.loc[sub.index] = sub_stars
+
+    fallback = rep.loc[~has_excess]
+    if not fallback.empty:
+        stars.loc[fallback.index] = fallback.apply(
+            lambda r: _star_rating(r["abs_win_rate"], r["n_samples"], r["profit_factor"], None), axis=1)
+    return stars
 
 
 def _build_candidate_rows(meta, signal_type, variant_key, variant_label,
@@ -230,7 +312,8 @@ def _build_candidate_rows(meta, signal_type, variant_key, variant_label,
         status = "구간내"
     else:
         status = "구간위"
-    star = _star_rating(rep["win_rate"], rep["n_samples"], rep["profit_factor"], rep["excess_return"])
+    # 별점은 여기서 매기지 않는다 — 신호유형별 백분위 비교라 전체 스캔 결과가 모인
+    # 뒤(run() 안에서 _assign_percentile_stars)에 한 번에 매긴다.
     risk = rep["win_rate"] < RISK_WIN_RATE
 
     out = []
@@ -242,12 +325,14 @@ def _build_candidate_rows(meta, signal_type, variant_key, variant_label,
             "baseline_price": buy_low, "buy_zone_low": buy_low, "buy_zone_high": buy_high,
             "close_price": close_now, "price_status": status,
             "sample_label": SAMPLE_LABELS[signal_type],
-            "hold_days": r["hold_days"], "win_rate": r["win_rate"], "avg_win": r["avg_win"],
-            "avg_loss": r["avg_loss"], "profit_factor": r["profit_factor"], "expectancy": r["expectancy"],
-            "excess_return": r["excess_return"],
+            "hold_days": r["hold_days"], "win_rate": r["win_rate"], "abs_win_rate": r["abs_win_rate"],
+            "avg_win": r["avg_win"], "avg_loss": r["avg_loss"], "profit_factor": r["profit_factor"],
+            "expectancy": r["expectancy"], "excess_return": r["excess_return"],
+            "excess_win_rate": r["excess_win_rate"], "avg_excess_win": r["avg_excess_win"],
+            "avg_excess_loss": r["avg_excess_loss"],
             "n_samples": r["n_samples"], "total_occurrences": total_occurrences,
             "is_representative": r["hold_days"] == rep["hold_days"],
-            "star_rating": star, "risk_flag": risk,
+            "risk_flag": risk,
         })
         out.append(row)
     return out
@@ -474,11 +559,22 @@ def run(signal_types=None, markets=None):
     if all_rows:
         result = pd.DataFrame(all_rows)
 
-        # 종목별 최고 변형 선택 (별점 -> 손익비 -> 표본수 순): (종목,신호유형,장단기)당
+        # 별점: 신호유형(이평/박스/신고가) 내부 백분위로 산정(_assign_percentile_stars
+        # 참고). 대표 보유기간 행에서만 계산한 뒤, 같은 (종목,신호유형,변형,장단기)
+        # 그룹의 나머지 보유기간 행에도 동일한 별점을 적용한다.
+        rep_for_star = result[result["is_representative"]].copy()
+        rep_for_star["star_rating"] = _assign_percentile_stars(rep_for_star)
+        star_map = rep_for_star[["ticker", "signal_type", "variant_key", "trend_term", "star_rating"]]
+        result = result.merge(star_map, on=["ticker", "signal_type", "variant_key", "trend_term"], how="left")
+        result["star_rating"] = result["star_rating"].fillna(STAR_DEFAULT).astype(int)
+
+        # 종목별 최고 변형 선택 (별점 -> 초과수익기대값 -> 표본수 순): (종목,신호유형,장단기)당
         # 대표 보유기간 행 하나만 비교 대상으로 삼아 변형 중 최고를 고르고,
         # 그 변형에 속한 모든 보유기간 행에 is_best_variant=True를 표시한다.
+        # 2차 기준을 손익비 대신 초과수익(excess_return)으로 쓴다 — 시장 대비 실제
+        # 아웃퍼폼 크기를 반영하려는 의도와 일관되게.
         rep = result[result["is_representative"]].copy()
-        rep_ranked = rep.sort_values(["star_rating", "profit_factor", "n_samples"],
+        rep_ranked = rep.sort_values(["star_rating", "excess_return", "n_samples"],
                                       ascending=[False, False, False])
         best_variant = (rep_ranked.drop_duplicates(subset=["ticker", "signal_type", "trend_term"], keep="first")
                          [["ticker", "signal_type", "trend_term", "variant_key"]]
@@ -501,10 +597,17 @@ def run(signal_types=None, markets=None):
             "min_sample": MIN_SAMPLE,
             "min_sample_ratio": MIN_SAMPLE_RATIO,
             "representative_metric": REPRESENTATIVE_METRIC,
+            "representative_min_hold_days": REPRESENTATIVE_MIN_HOLD_DAYS,
+            "representative_preferred_min_hold_days": REPRESENTATIVE_PREFERRED_MIN_HOLD_DAYS,
             "stat_terms": STAT_TERMS,
             "ma_near_tolerance": MA_NEAR_TOLERANCE,
             "box_max_range": BOX_MAX_RANGE,
-            "star_rules": STAR_RULES,
+            "star_percentile_rules": {
+                "top_percentile": STAR_TOP_PERCENTILE, "mid_percentile": STAR_MID_PERCENTILE,
+                "min_excess_win_rate_3star": STAR_MIN_EXCESS_WIN_RATE_3STAR,
+                "min_excess_return": STAR_MIN_EXCESS_RETURN,
+            },
+            "star_rules_fallback": STAR_RULES,
             "min_sample_by_signal": MIN_SAMPLE_BY_SIGNAL,
             "benchmark_tickers": {k: v for k, v in BENCHMARK_TICKERS.items() if k in benchmarks},
             "signal_types": signal_types,

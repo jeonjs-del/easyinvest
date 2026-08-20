@@ -1216,13 +1216,14 @@ with tab5:
             if f_cap != "전체":
                 rep = rep[_market_cap_bucket_mask(rep["market_cap_usd"], f_cap, TREND_CAP_BUCKETS)]
 
-            # 2차: 티커 기준 중복 제거(별점 -> 손익비 -> 표본수 순 최상위 1행만).
-            rep = rep.sort_values(["star_rating", "profit_factor", "n_samples"],
+            # 2차: 티커 기준 중복 제거(별점 -> 초과수익 -> 표본수 순 최상위 1행만).
+            # 2차 기준을 손익비 대신 초과수익(벤치마크 대비 실제 아웃퍼폼 크기)으로 쓴다.
+            rep = rep.sort_values(["star_rating", "excess_return", "n_samples"],
                                    ascending=[False, False, False])
             rep = rep.drop_duplicates(subset="ticker", keep="first")
 
             if sort_label == "별 우선":
-                rep = rep.sort_values(["star_rating", "rs_total", "profit_factor"],
+                rep = rep.sort_values(["star_rating", "rs_total", "excess_return"],
                                        ascending=[False, False, False])
             elif sort_label == "RS순":
                 rep = rep.sort_values("rs_total", ascending=False)
@@ -1260,14 +1261,16 @@ with tab5:
                         c2.metric("현재가", f"{r['close_price']:,.2f}")
                         c3.metric("가격 위치", r["price_status"])
 
-                        m1, m2, m3, m4, m5, m6 = st.columns(6)
-                        m1.metric("승률", f"{r['win_rate']:.0%}")
+                        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+                        m1.metric("승률(초과수익 기준)", f"{r['win_rate']:.0%}")
                         m2.metric("평균이익", f"{r['avg_win']:+.1%}")
                         m3.metric("평균손실", f"{r['avg_loss']:+.1%}")
                         m4.metric("손익비", f"{r['profit_factor']:.2f}")
                         m5.metric(r["sample_label"], f"{int(r['n_samples'])}")
                         excess = r.get("excess_return")
                         m6.metric("초과수익(벤치마크 대비)", f"{excess:+.1%}" if pd.notna(excess) else "—")
+                        abs_wr = r.get("abs_win_rate")
+                        m7.metric("승률(절대수익 기준)", f"{abs_wr:.0%}" if pd.notna(abs_wr) else "—")
 
                         # 이 종목이 지금 다른 신호(유형/변형/장단기)로도 살아있는지 — 티커
                         # 중복 제거로 위 카드엔 최상위 1개만 보이므로 나머지는 여기서 안내.
@@ -1276,7 +1279,7 @@ with tab5:
                             & ~((tdf["signal_type"] == r["signal_type"])
                                 & (tdf["variant_key"] == r["variant_key"])
                                 & (tdf["trend_term"] == r["trend_term"]))
-                        ].sort_values(["star_rating", "profit_factor"], ascending=[False, False])
+                        ].sort_values(["star_rating", "excess_return"], ascending=[False, False])
                         if not others.empty:
                             if st.checkbox(f"이 종목의 다른 신호 보기 ({len(others)}개)", key=f"others_{i}_{r['ticker']}"):
                                 for _, o in others.iterrows():
