@@ -1216,8 +1216,8 @@ with tab5:
             if f_cap != "전체":
                 rep = rep[_market_cap_bucket_mask(rep["market_cap_usd"], f_cap, TREND_CAP_BUCKETS)]
 
-            # 2차: 티커 기준 중복 제거(별점 -> 손익비 -> 표본수 순 최상위 1행만).
-            rep = rep.sort_values(["star_rating", "profit_factor", "n_samples"],
+            # 2차: 티커 기준 중복 제거(별점 -> 초과수익 기반 기대값 -> 표본수 순 최상위 1행만).
+            rep = rep.sort_values(["star_rating", "excess_expectancy", "n_samples"],
                                    ascending=[False, False, False])
             rep = rep.drop_duplicates(subset="ticker", keep="first")
 
@@ -1260,14 +1260,19 @@ with tab5:
                         c2.metric("현재가", f"{r['close_price']:,.2f}")
                         c3.metric("가격 위치", r["price_status"])
 
-                        m1, m2, m3, m4, m5, m6 = st.columns(6)
-                        m1.metric("승률", f"{r['win_rate']:.0%}")
-                        m2.metric("평균이익", f"{r['avg_win']:+.1%}")
-                        m3.metric("평균손실", f"{r['avg_loss']:+.1%}")
-                        m4.metric("손익비", f"{r['profit_factor']:.2f}")
-                        m5.metric(r["sample_label"], f"{int(r['n_samples'])}")
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("승률(시장 대비)", f"{r['win_rate']:.0%}",
+                                  help="보유기간 수익률이 같은 기간 벤치마크(SPY/KOSPI) 수익률을 넘긴 비율")
+                        m2.metric("승률(절대수익)", f"{r['abs_win_rate']:.0%}",
+                                  help="보유기간 수익률이 0보다 큰(그냥 올랐던) 비율 — 참고용, 별점 산정에는 쓰이지 않음")
                         excess = r.get("excess_return")
-                        m6.metric("초과수익(벤치마크 대비)", f"{excess:+.1%}" if pd.notna(excess) else "—")
+                        m3.metric("초과수익(벤치마크 대비)", f"{excess:+.1%}" if pd.notna(excess) else "—")
+                        m4.metric(r["sample_label"], f"{int(r['n_samples'])}")
+
+                        n1, n2, n3 = st.columns(3)
+                        n1.metric("평균이익", f"{r['avg_win']:+.1%}")
+                        n2.metric("평균손실", f"{r['avg_loss']:+.1%}")
+                        n3.metric("손익비", f"{r['profit_factor']:.2f}")
 
                         # 이 종목이 지금 다른 신호(유형/변형/장단기)로도 살아있는지 — 티커
                         # 중복 제거로 위 카드엔 최상위 1개만 보이므로 나머지는 여기서 안내.
@@ -1293,7 +1298,8 @@ with tab5:
                                .sort_values("hold_days"))
                         tbl = pd.DataFrame({
                             "보유일": sub["hold_days"].astype(int),
-                            "승률": sub["win_rate"],
+                            "승률(시장대비)": sub["win_rate"],
+                            "승률(절대)": sub["abs_win_rate"],
                             "평균이익": sub["avg_win"],
                             "평균손실": sub["avg_loss"],
                             "손익비": sub["profit_factor"],
@@ -1301,7 +1307,8 @@ with tab5:
                             "대표": sub["is_representative"].map(lambda v: "★" if v else ""),
                         })
                         st.dataframe(
-                            tbl.style.format({"승률": "{:.0%}", "평균이익": "{:+.1%}",
+                            tbl.style.format({"승률(시장대비)": "{:.0%}", "승률(절대)": "{:.0%}",
+                                              "평균이익": "{:+.1%}",
                                               "평균손실": "{:+.1%}", "손익비": "{:.2f}"}),
                             use_container_width=True, hide_index=True,
                         )
