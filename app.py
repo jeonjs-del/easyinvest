@@ -411,7 +411,7 @@ def _fetch_ma_row(symbol, periods):
 
 
 # ============================================================================
-#  코인 탭 — 랭킹(CoinGecko + Binance) / 글로벌 24-7(Hyperliquid xyz dex)
+#  코인 탭 — 랭킹(CoinGecko + 일봉 히스토리 다중소스) / 글로벌 24-7(Hyperliquid)
 # ============================================================================
 @st.cache_data(ttl=300)
 def _fetch_coingecko_markets(pool_size):
@@ -430,35 +430,31 @@ def _fetch_coingecko_markets(pool_size):
         return []
 
 
-@st.cache_data(ttl=60 * 60 * 24)
-def _fetch_binance_usdt_symbols():
-    """Binance 공개 exchangeInfo(무인증) — USDT 마켓이 있는 심볼 집합. 1·2·3·4주
-    수익률(RS 계산용)과 캔들차트는 CoinGecko가 아니라 여기서 받는다(과거 일봉이
-    필요한데 CoinGecko는 무료 플랜에서 일 단위 히스토리 접근이 제한적)."""
-    try:
-        r = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=20)
-        r.raise_for_status()
-        return {s["symbol"] for s in r.json()["symbols"]
-                if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"}
-    except Exception:
-        return set()
-
-
 @st.cache_data(ttl=60 * 60)
 def _fetch_binance_klines(symbol, interval, limit=500):
-    try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": min(limit, 1000)},
-            timeout=15,
-        )
-        r.raise_for_status()
+    """상단 차트(기간/봉 전환) 전용 — Binance 직접 호출 + data-api.binance.vision
+    폴백. 랭킹 표의 RS·주간/월간 수익률 계산은 이 함수를 쓰지 않고 아래
+    _fetch_coin_daily_history의 다중소스 체인을 쓴다(이유는 그 함수 docstring)."""
+    for host in ("https://api.binance.com", "https://data-api.binance.vision"):
+        try:
+            r = requests.get(
+                f"{host}/api/v3/klines",
+                params={"symbol": symbol, "interval": interval, "limit": min(limit, 1000)},
+                timeout=15,
+            )
+        except requests.exceptions.RequestException as e:
+            print(f"[coin] 차트용 klines 실패({host}, {symbol}): {type(e).__name__}: {e}")
+            continue
+        if r.status_code != 200:
+            print(f"[coin] 차트용 klines 실패({host}, {symbol}): HTTP {r.status_code} {r.text[:150]}")
+            continue
+        rows = r.json()
+        if not rows:
+            continue
         return [{"time": pd.to_datetime(row[0], unit="ms"), "open": float(row[1]),
                   "high": float(row[2]), "low": float(row[3]), "close": float(row[4]),
-                  "volume": float(row[5])}
-                 for row in r.json()]
-    except Exception:
-        return []
+                  "volume": float(row[5])} for row in rows]
+    return []
 
 
 def _lookback_return(closes, days_back):
@@ -470,10 +466,188 @@ def _lookback_return(closes, days_back):
     return (closes[-1] / base - 1.0) if base else None
 
 
+def _log_coin_fetch_fail(source, detail):
+    print(f"[coin] {source} 실패: {detail}")
+
+
+def _fetch_daily_binance_style(host, base_symbol, source_name, limit=400):
+    """Binance(api.binance.com)/Binance 공개 데이터 미러(data-api.binance.vision)
+    공용 파서 — 응답 스키마가 동일하다."""
+    sym = base_symbol + "USDT"
+    try:
+        r = requests.get(f"{host}/api/v3/klines",
+                          params={"symbol": sym, "interval": "1d", "limit": min(limit, 1000)},
+                          timeout=15)
+    except requests.exceptions.Timeout:
+        _log_coin_fetch_fail(source_name, f"{sym} 타임아웃")
+        return None
+    except requests.exceptions.RequestException as e:
+        _log_coin_fetch_fail(source_name, f"{sym} {type(e).__name__}: {e}")
+        return None
+    if r.status_code != 200:
+        # 미국 IP를 막는 지역제한이면 보통 451, 과호출이면 429로 온다 — 로그에서 구분되게 남긴다.
+        _log_coin_fetch_fail(source_name, f"{sym} HTTP {r.status_code}: {r.text[:150]}")
+        return None
+    rows = r.json()
+    if not rows:
+        _log_coin_fetch_fail(source_name, f"{sym} 빈 응답")
+        return None
+    return [{"time": pd.to_datetime(row[0], unit="ms"), "close": float(row[4])} for row in rows]
+
+
+def _fetch_daily_coinbase(base_symbol):
+    """Coinbase Exchange candles — 이미 프리미엄 탭에서 쓰는 Coinbase API와 같은 회사,
+    검증된 소스. granularity=86400(일봉), 응답은 [time,low,high,open,close,volume]
+    최신순이라 시간순으로 다시 정렬한다."""
+    sym = f"{base_symbol}-USD"
+    try:
+        r = requests.get(f"https://api.exchange.coinbase.com/products/{sym}/candles",
+                          params={"granularity": 86400}, timeout=15,
+                          headers={"User-Agent": "easyinvest/1.0"})
+    except requests.exceptions.Timeout:
+        _log_coin_fetch_fail("Coinbase", f"{sym} 타임아웃")
+        return None
+    except requests.exceptions.RequestException as e:
+        _log_coin_fetch_fail("Coinbase", f"{sym} {type(e).__name__}: {e}")
+        return None
+    if r.status_code != 200:
+        _log_coin_fetch_fail("Coinbase", f"{sym} HTTP {r.status_code}: {r.text[:150]}")
+        return None
+    rows = r.json()
+    if not rows:
+        _log_coin_fetch_fail("Coinbase", f"{sym} 빈 응답")
+        return None
+    rows = sorted(rows, key=lambda row: row[0])
+    return [{"time": pd.to_datetime(row[0], unit="s"), "close": float(row[4])} for row in rows]
+
+
+def _fetch_daily_bybit(base_symbol):
+    sym = base_symbol + "USDT"
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/kline",
+                          params={"category": "spot", "symbol": sym, "interval": "D", "limit": 400},
+                          timeout=15)
+    except requests.exceptions.Timeout:
+        _log_coin_fetch_fail("Bybit", f"{sym} 타임아웃")
+        return None
+    except requests.exceptions.RequestException as e:
+        _log_coin_fetch_fail("Bybit", f"{sym} {type(e).__name__}: {e}")
+        return None
+    if r.status_code != 200:
+        _log_coin_fetch_fail("Bybit", f"{sym} HTTP {r.status_code}: {r.text[:150]}")
+        return None
+    data = r.json()
+    rows = (data.get("result") or {}).get("list") or []
+    if not rows:
+        _log_coin_fetch_fail("Bybit", f"{sym} 빈 응답({data.get('retMsg')})")
+        return None
+    rows = sorted(rows, key=lambda row: int(row[0]))
+    return [{"time": pd.to_datetime(int(row[0]), unit="ms"), "close": float(row[4])} for row in rows]
+
+
+def _fetch_daily_okx(base_symbol):
+    sym = f"{base_symbol}-USDT"
+    try:
+        r = requests.get("https://www.okx.com/api/v5/market/candles",
+                          params={"instId": sym, "bar": "1D", "limit": 300}, timeout=15)
+    except requests.exceptions.Timeout:
+        _log_coin_fetch_fail("OKX", f"{sym} 타임아웃")
+        return None
+    except requests.exceptions.RequestException as e:
+        _log_coin_fetch_fail("OKX", f"{sym} {type(e).__name__}: {e}")
+        return None
+    if r.status_code != 200:
+        _log_coin_fetch_fail("OKX", f"{sym} HTTP {r.status_code}: {r.text[:150]}")
+        return None
+    data = r.json()
+    rows = data.get("data") or []
+    if not rows:
+        _log_coin_fetch_fail("OKX", f"{sym} 빈 응답({data.get('msg')})")
+        return None
+    rows = sorted(rows, key=lambda row: int(row[0]))
+    return [{"time": pd.to_datetime(int(row[0]), unit="ms"), "close": float(row[4])} for row in rows]
+
+
+def _fetch_daily_coingecko_market_chart(coin_id, days=365):
+    """CoinGecko market_chart — 최후 폴백. 무료 티어 레이트리밋에 걸리기 쉬워서
+    코인당 최대 1회만 호출되게(다른 소스가 전부 실패한 경우에만) 체인 맨 끝에 둔다.
+    days=400을 넘겨봤더니 "요청 범위가 허용 범위를 초과"(401)로 거부됐다 — 무료
+    티어는 최근 365일까지만 일 단위 히스토리를 준다(그 이상은 유료). 365일이면
+    RS(1~4주)·3·6개월 수익률은 그대로 되고, 12개월 수익률만 한 칸 모자라 계산이
+    안 될 수 있다(그 경우 12개월 칸만 비게 됨)."""
+    if not coin_id:
+        return None
+    try:
+        r = requests.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+                          params={"vs_currency": "usd", "days": days, "interval": "daily"}, timeout=15)
+    except requests.exceptions.Timeout:
+        _log_coin_fetch_fail("CoinGecko", f"{coin_id} 타임아웃")
+        return None
+    except requests.exceptions.RequestException as e:
+        _log_coin_fetch_fail("CoinGecko", f"{coin_id} {type(e).__name__}: {e}")
+        return None
+    if r.status_code != 200:
+        _log_coin_fetch_fail("CoinGecko", f"{coin_id} HTTP {r.status_code}: {r.text[:150]}")
+        return None
+    prices = r.json().get("prices") or []
+    if not prices:
+        _log_coin_fetch_fail("CoinGecko", f"{coin_id} 빈 응답")
+        return None
+    return [{"time": pd.to_datetime(ts, unit="ms"), "close": float(p)} for ts, p in prices]
+
+
+@st.cache_data(ttl=60 * 60)
+def _fetch_coin_daily_history(base_symbol, coin_id):
+    """일봉 종가 히스토리를 다중 소스 폴백 체인으로 받는다: (closes_rows, 소스이름)
+    반환, 전부 실패하면 (None, None).
+
+    Binance(api.binance.com)는 미국 IP를 지역차단해 HTTP 451을 반환하는 사례가
+    있다 — Streamlit Community Cloud는 AWS 미국 리전에서 돈다. 로컬(한국)에서는
+    되는데 배포본에서만 "Binance 조회 실패"가 나는 게 바로 이 증상이었다. 그래서
+    Binance 하나에 의존하지 않고 아래 순서로 첫 성공을 쓴다:
+    1) Binance 직접 — 로컬 등 차단 안 된 환경에서는 여기서 바로 성공.
+    2) data-api.binance.vision — Binance가 만든 별도 공개 데이터 미러. 지역차단
+       정책이 api.binance.com과 다를 수 있어 시도해볼 가치가 있음(직접 검증은
+       못 했고, 실패하면 바로 다음으로 넘어가므로 안전).
+    3) Coinbase Exchange candles — 프리미엄 탭에서 이미 쓰는 Coinbase사 API라
+       접근성 검증됨.
+    4) Bybit 공개 스팟 kline.
+    5) OKX 공개 candles.
+    6) CoinGecko market_chart — 시세용으로 이미 쓰는 소스라 요청 자체는 늘 되지만
+       무료 티어 레이트리밋이 낮아 진짜 마지막에만 쓴다.
+    각 시도의 실패 사유(HTTP 상태코드/응답 본문/예외 종류)는 print()로 로그에
+    남긴다 — Streamlit Cloud의 "Manage app" 로그에서 그대로 보인다."""
+    attempts = [
+        ("Binance", lambda: _fetch_daily_binance_style("https://api.binance.com", base_symbol, "Binance")),
+        ("data-api.binance.vision",
+         lambda: _fetch_daily_binance_style("https://data-api.binance.vision", base_symbol,
+                                             "data-api.binance.vision")),
+        ("Coinbase", lambda: _fetch_daily_coinbase(base_symbol)),
+        ("Bybit", lambda: _fetch_daily_bybit(base_symbol)),
+        ("OKX", lambda: _fetch_daily_okx(base_symbol)),
+        ("CoinGecko", lambda: _fetch_daily_coingecko_market_chart(coin_id)),
+    ]
+    for name, fn in attempts:
+        rows = fn()
+        if rows and len(rows) >= 29:
+            return rows, name
+    return None, None
+
+
+def _coingecko_pct(m, key):
+    # CoinGecko는 %(예: -1.2)로 주는데 앱 전체 관례(RET_COLOR_CAP 등)는 소수
+    # 비율(예: -0.012)이라 여기서 100으로 나눠 맞춘다.
+    v = m.get(key)
+    return v / 100.0 if v is not None else None
+
+
 @st.cache_data(ttl=300)
 def build_coin_ranking(pool_size=COIN_UNIVERSE_POOL):
-    """(결과 DataFrame, 상태) 반환. 상태: "ok"/"coingecko_fail"/"binance_fail"/
-    "no_match"/"no_data" — 실패 원인을 화면에서 구분해 보여주기 위함.
+    """(결과 DataFrame, 상태, 출처별 코인수) 반환. 상태는 "ok" 또는 "coingecko_fail"
+    (CoinGecko 자체가 죽어 표시할 시세가 하나도 없는 경우)뿐이다 — 일봉 히스토리
+    (RS·주간/월간 수익률) 조회가 코인별로 실패해도 그 코인의 현재가·24h·7일·30일·
+    시총·거래량·스파크라인은 CoinGecko 데이터만으로 정상 표시하고, RS·주간/월간
+    관련 열만 비워둔다(표 전체가 사라지지 않게).
 
     RS(상대강도) 계산: 1·2·3·4주 수익률 각각을 이 유니버스(풀) 내에서 백분위
     (0~100, pandas rank(pct=True))로 바꾼 뒤, COIN_RS_WEEK_WEIGHTS 가중평균을
@@ -482,62 +656,51 @@ def build_coin_ranking(pool_size=COIN_UNIVERSE_POOL):
     보는 것이 RS의 취지라, 반드시 유니버스 내부 비교(percentile)로 계산한다."""
     markets = _fetch_coingecko_markets(pool_size)
     if not markets:
-        return pd.DataFrame(), "coingecko_fail"
-    usdt_syms = _fetch_binance_usdt_symbols()
-    if not usdt_syms:
-        return pd.DataFrame(), "binance_fail"
+        return pd.DataFrame(), "coingecko_fail", {}
 
-    candidates = [(m, m["symbol"].upper() + "USDT") for m in markets]
-    candidates = [(m, s) for m, s in candidates if s in usdt_syms]
-    if not candidates:
-        return pd.DataFrame(), "no_match"
-
-    def _fetch_row(item):
-        m, bsym = item
-        # 일봉 400개(약 400일치)면 1~4주 수익률뿐 아니라 3·6·12개월 수익률까지
-        # 같은 호출 하나로 다 계산할 수 있다(컬럼 토글에 맞춰 다시 조회하지 않음).
-        candles = _fetch_binance_klines(bsym, "1d", 400)
-        if len(candles) < 29:
-            return None
-        closes = [c["close"] for c in candles]
-        rets_week = [_lookback_return(closes, d) for d in (7, 14, 21, 28)]
-        if any(v is None for v in rets_week):
-            return None
-        ret_1w, ret_2w, ret_3w, ret_4w = rets_week
-        # CoinGecko는 %(예: -1.2)로 주는데 앱 전체 관례(RET_COLOR_CAP 등)는 소수
-        # 비율(예: -0.012)이라 여기서 100으로 나눠 맞춘다.
-        def _pct(key):
-            v = m.get(key)
-            return v / 100.0 if v is not None else None
-        return {
-            "symbol": m["symbol"].upper(), "name": m["name"], "binance_symbol": bsym,
+    def _fetch_row(m):
+        base = m["symbol"].upper()
+        history, source = _fetch_coin_daily_history(base, m.get("id"))
+        row = {
+            "symbol": base, "name": m["name"], "coin_id": m.get("id"),
             "price": m["current_price"],
-            "chg_24h": _pct("price_change_percentage_24h_in_currency"),
-            "chg_7d": _pct("price_change_percentage_7d_in_currency"),
-            "chg_30d": _pct("price_change_percentage_30d_in_currency"),
+            "chg_24h": _coingecko_pct(m, "price_change_percentage_24h_in_currency"),
+            "chg_7d": _coingecko_pct(m, "price_change_percentage_7d_in_currency"),
+            "chg_30d": _coingecko_pct(m, "price_change_percentage_30d_in_currency"),
             "market_cap": m.get("market_cap"), "market_cap_rank": m.get("market_cap_rank"),
             "volume": m.get("total_volume"),
             "sparkline": (m.get("sparkline_in_7d") or {}).get("price") or [],
-            "ret_1w": ret_1w, "ret_2w": ret_2w, "ret_3w": ret_3w, "ret_4w": ret_4w,
-            "ret_3m": _lookback_return(closes, 90),
-            "ret_6m": _lookback_return(closes, 182),
-            "ret_12m": _lookback_return(closes, 365),
+            "ret_1w": None, "ret_2w": None, "ret_3w": None, "ret_4w": None,
+            "ret_3m": None, "ret_6m": None, "ret_12m": None,
+            "history_source": source,
         }
+        if history:
+            closes = [c["close"] for c in history]
+            rets_week = [_lookback_return(closes, d) for d in (7, 14, 21, 28)]
+            if all(v is not None for v in rets_week):
+                row["ret_1w"], row["ret_2w"], row["ret_3w"], row["ret_4w"] = rets_week
+            row["ret_3m"] = _lookback_return(closes, 90)
+            row["ret_6m"] = _lookback_return(closes, 182)
+            row["ret_12m"] = _lookback_return(closes, 365)
+        return row
 
-    with ThreadPoolExecutor(max_workers=12) as exe:
-        rows = list(exe.map(_fetch_row, candidates))
-    rows = [r for r in rows if r is not None]
-    if not rows:
-        return pd.DataFrame(), "no_data"
+    with ThreadPoolExecutor(max_workers=10) as exe:
+        rows = list(exe.map(_fetch_row, markets))
 
     df = pd.DataFrame(rows)
     for w in (1, 2, 3, 4):
         df[f"rs_{w}w"] = df[f"ret_{w}w"].rank(pct=True) * 100
     wsum = sum(COIN_RS_WEEK_WEIGHTS.values())
-    df["rs_total"] = sum(df[f"rs_{w}w"] * wt for w, wt in COIN_RS_WEEK_WEIGHTS.items()) / wsum
-    df = df.sort_values("rs_total", ascending=False).reset_index(drop=True)
+    week_cols = [f"ret_{w}w" for w in (1, 2, 3, 4)]
+    has_all_weeks = df[week_cols].notna().all(axis=1)
+    df["rs_total"] = np.nan
+    df.loc[has_all_weeks, "rs_total"] = sum(
+        df.loc[has_all_weeks, f"rs_{w}w"] * wt for w, wt in COIN_RS_WEEK_WEIGHTS.items()) / wsum
+    df = df.sort_values("rs_total", ascending=False, na_position="last").reset_index(drop=True)
     df.insert(0, "#", df.index + 1)
-    return df, "ok"
+
+    source_counts = df["history_source"].fillna("실패").value_counts().to_dict()
+    return df, "ok", source_counts
 
 
 def _lwc_time(ts, intraday):
@@ -1006,7 +1169,7 @@ if "ma_indices" not in st.session_state:
 if "ma_periods" not in st.session_state:
     st.session_state.ma_periods, st.session_state.ma_periods_mode = load_ma_periods()
 if "coin_rank_symbol" not in st.session_state:
-    st.session_state.coin_rank_symbol = None       # 랭킹 탭 상단 차트 대상(binance_symbol)
+    st.session_state.coin_rank_symbol = None       # 랭킹 탭 상단 차트 대상(코인 base 심볼, 예: "BTC")
 if "coin_g247_symbol" not in st.session_state:
     st.session_state.coin_g247_symbol = None       # 글로벌24-7 탭 하단 차트 대상(hl_symbol)
 
@@ -2168,8 +2331,10 @@ with tab7:
 
     # ---- 랭킹 ---------------------------------------------------------------
     with sub_rank:
-        st.caption("데이터: CoinGecko(시세·시총·스파크라인) + Binance(과거 일봉 — RS·주간/월간 "
-                   "수익률 계산용). 시세는 5분, 과거 일봉은 1시간 캐시.")
+        st.caption("데이터: CoinGecko(시세·시총·스파크라인). 과거 일봉(RS·주간/월간 수익률용)은 "
+                   "Binance→data-api.binance.vision→Coinbase→Bybit→OKX→CoinGecko 순으로 첫 성공한 "
+                   "소스를 씀(지역 차단·장애 대비 다중소스 폴백 — 아래 표 하단 출처 참고). "
+                   "시세는 5분, 과거 일봉은 1시간 캐시.")
 
         fc1, fc2, fc3, fc4, fc5, fc6 = st.columns([1.1, 1, 1.3, 1, 1, 1.2])
         tier_label = fc1.selectbox("시총 구간", ["top10", "top20", "top50", "top100", "전체"],
@@ -2182,16 +2347,10 @@ with tab7:
         show_month_ret = fc6.checkbox("+3·6·12개월", key="coin_col_monthret")
 
         with st.spinner("코인 시세·RS 조회 중..."):
-            rank_df, rank_status = build_coin_ranking(COIN_UNIVERSE_POOL)
+            rank_df, rank_status, source_counts = build_coin_ranking(COIN_UNIVERSE_POOL)
 
-        _rank_errors = {
-            "coingecko_fail": "CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
-            "binance_fail": "Binance 심볼 목록 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
-            "no_match": "CoinGecko 상위 코인 중 Binance USDT 마켓이 있는 코인이 없습니다.",
-            "no_data": "표시할 코인 데이터가 없습니다(전 종목 히스토리 조회 실패).",
-        }
-        if rank_status in _rank_errors:
-            st.warning(f"⚠️ {_rank_errors[rank_status]}")
+        if rank_status == "coingecko_fail":
+            st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요.")
         elif rank_df.empty:
             st.info("표시할 코인 데이터가 없습니다.")
         else:
@@ -2261,17 +2420,21 @@ with tab7:
                     height=min(60 + 35 * len(disp), 600),
                     on_select="rerun", selection_mode="single-row", key="coin_rank_table",
                 )
+                _src_label = " · ".join(f"{k} {v}개" for k, v in source_counts.items())
+                st.caption(f"과거 일봉 출처: {_src_label}")
+
                 _sel_rows = rank_ev.selection.rows if rank_ev and rank_ev.selection else []
                 if _sel_rows:
-                    _sel_sym = work.iloc[_sel_rows[0]]["binance_symbol"]
+                    _sel_sym = work.iloc[_sel_rows[0]]["symbol"]
                     if _sel_sym != st.session_state.coin_rank_symbol:
                         st.session_state.coin_rank_symbol = _sel_sym
                         st.rerun()
 
-                chart_sym = st.session_state.coin_rank_symbol or work.iloc[0]["binance_symbol"]
-                chart_row = work[work["binance_symbol"] == chart_sym]
+                chart_base = st.session_state.coin_rank_symbol or work.iloc[0]["symbol"]
+                chart_row = work[work["symbol"] == chart_base]
+                chart_sym = chart_base + "USDT"
                 chart_label = (chart_row.iloc[0]["symbol"] + " · " + chart_row.iloc[0]["name"]
-                               if not chart_row.empty else chart_sym)
+                               if not chart_row.empty else chart_base)
                 st.markdown(f"#### {chart_label}")
                 cc1, cc2 = st.columns(2)
                 chart_period = cc1.radio("기간", list(COIN_CHART_PERIOD_DAYS), index=0,
