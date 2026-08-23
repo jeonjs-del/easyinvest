@@ -37,6 +37,25 @@ MA_COLORS = {
 }
 RETURN_PERIODS = ["1일", "5일", "1개월", "3개월", "6개월", "1년"]
 RET_COLOR_CAP = 0.30  # 수익률 색상 진하기의 절대값 상한 (±30%, 이상은 최대 진하기로 클립)
+
+# 매수 탭과 무관한 별도 탭: 이동평균 대비 위치
+MA_TAB_INDICES_FILE = "ma_tab_indices.json"
+MA_TAB_INDICES_GIST_FILENAME = "ma_tab_indices.json"
+MA_TAB_PERIODS_FILE = "ma_tab_periods.json"
+MA_TAB_PERIODS_GIST_FILENAME = "ma_tab_periods.json"
+# 심볼은 scanner/seasonality_scan.py 재스캔 때와 별개로 이 자리에서 직접 fdr.DataReader로
+# 확인한 것 — NDX(나스닥100)·US500·KS11·KQ11은 FDR이 그대로 지원하고, BTCUSD는
+# "BTCUSD"/"BTC-USD" 심볼이 404라 "BTC/USD"(FDR 코인 조회 문법)로 대체했다.
+DEFAULT_MA_INDICES = [
+    {"symbol": "KS11", "label": "코스피"},
+    {"symbol": "KQ11", "label": "코스닥"},
+    {"symbol": "US500", "label": "S&P500"},
+    {"symbol": "NDX", "label": "나스닥100"},
+    {"symbol": "BTC/USD", "label": "BTCUSD"},
+]
+DEFAULT_MA_PERIODS = [5, 10, 20, 50, 120, 200]
+MA_PERIOD_MIN, MA_PERIOD_MAX = 1, 500
+MA_GAP_COLOR_CAP = 0.20   # 이격도 색상 진하기의 절대값 상한 (±20%, 이상은 최대 진하기로 클립)
 DEFAULT_INDICES = {
     "코스피": "KS11", "코스닥": "KQ11", "S&P500": "US500", "나스닥종합": "IXIC",
     "다우": "DJI", "러셀2000": "RUT", "닛케이225": "N225", "상해종합": "SSEC",
@@ -70,26 +89,6 @@ def normalize(sym):
     return s
 
 
-def _load_watchlist_local():
-    if os.path.exists(WATCHLIST_FILE):
-        try:
-            with open(WATCHLIST_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list) and data:
-                return [normalize(str(c)) for c in data]
-        except Exception:
-            pass
-    return DEFAULT_WATCHLIST.copy()
-
-
-def _save_watchlist_local(codes):
-    try:
-        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(codes, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass  # Cloud filesystem은 재시작 시 초기화 — 저장 실패는 무시
-
-
 def _gist_configured():
     try:
         g = st.secrets.get("gist")
@@ -103,47 +102,70 @@ def _gist_headers(token):
 
 
 @st.cache_data(ttl=300)
-def _gist_fetch_content(token, gist_id):
-    """Gist의 watchlist.json raw 내용을 반환. 파일이 없거나 비어있으면 빈 문자열."""
+def _gist_fetch_content(token, gist_id, filename):
+    """Gist 안의 특정 파일 raw 내용을 반환. 파일이 없거나 비어있으면 빈 문자열.
+    같은 Gist 하나에 watchlist.json 외에 이평 탭용 파일들도 함께 저장한다."""
     r = requests.get(f"https://api.github.com/gists/{gist_id}",
                       headers=_gist_headers(token), timeout=10)
     r.raise_for_status()
     files = r.json().get("files", {})
-    f = files.get(GIST_FILENAME)
+    f = files.get(filename)
     return f.get("content", "") if f else ""
 
 
-def load_watchlist():
-    """(관심목록, storage_mode) 반환. storage_mode: 'gist' 또는 'local'."""
+def _load_json_list_local(path, default):
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return list(default)
+
+
+def _save_json_list_local(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass  # Cloud filesystem은 재시작 시 초기화 — 저장 실패는 무시
+
+
+def load_json_list(gist_filename, local_path, default, item_fn=None):
+    """(리스트, storage_mode) 반환. storage_mode: 'gist' 또는 'local'.
+    item_fn이 주어지면 항목마다 적용해 정규화한다(예: 관심목록 종목코드 normalize)."""
+    item_fn = item_fn or (lambda x: x)
     if _gist_configured():
         token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
         try:
-            content = _gist_fetch_content(token, gist_id)
+            content = _gist_fetch_content(token, gist_id, gist_filename)
         except Exception:
             # API 호출 실패 → 로컬 파일 방식으로 폴백
-            return _load_watchlist_local(), "local"
+            return _load_json_list_local(local_path, default), "local"
         if content and content.strip():
             try:
                 data = json.loads(content)
                 if isinstance(data, list):
                     # 저장된 값이 빈 배열이어도 그대로 유지 (사용자가 전부 삭제한 상태)
-                    return [normalize(str(c)) for c in data], "gist"
+                    return [item_fn(c) for c in data], "gist"
             except Exception:
                 pass
         # Gist는 연결됐지만 파일이 비어있음/저장된 적 없음 → 디폴트 사용
-        return DEFAULT_WATCHLIST.copy(), "gist"
-    return _load_watchlist_local(), "local"
+        return list(default), "gist"
+    return _load_json_list_local(local_path, default), "local"
 
 
-def save_watchlist(codes, mode):
+def save_json_list(data, mode, gist_filename, local_path):
     if mode == "gist":
         try:
             token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
             r = requests.patch(
                 f"https://api.github.com/gists/{gist_id}",
                 headers=_gist_headers(token),
-                json={"files": {GIST_FILENAME: {
-                    "content": json.dumps(codes, ensure_ascii=False, indent=2)
+                json={"files": {gist_filename: {
+                    "content": json.dumps(data, ensure_ascii=False, indent=2)
                 }}},
                 timeout=10,
             )
@@ -152,7 +174,33 @@ def save_watchlist(codes, mode):
         except Exception:
             pass  # 저장 실패는 무시 (다음 rerun에서 재시도 가능)
         return
-    _save_watchlist_local(codes)
+    _save_json_list_local(local_path, data)
+
+
+def load_watchlist():
+    return load_json_list(GIST_FILENAME, WATCHLIST_FILE, DEFAULT_WATCHLIST,
+                           item_fn=lambda c: normalize(str(c)))
+
+
+def save_watchlist(codes, mode):
+    save_json_list(codes, mode, GIST_FILENAME, WATCHLIST_FILE)
+
+
+def load_ma_indices():
+    return load_json_list(MA_TAB_INDICES_GIST_FILENAME, MA_TAB_INDICES_FILE, DEFAULT_MA_INDICES)
+
+
+def save_ma_indices(items, mode):
+    save_json_list(items, mode, MA_TAB_INDICES_GIST_FILENAME, MA_TAB_INDICES_FILE)
+
+
+def load_ma_periods():
+    return load_json_list(MA_TAB_PERIODS_GIST_FILENAME, MA_TAB_PERIODS_FILE, DEFAULT_MA_PERIODS,
+                           item_fn=lambda p: int(p))
+
+
+def save_ma_periods(periods, mode):
+    save_json_list(periods, mode, MA_TAB_PERIODS_GIST_FILENAME, MA_TAB_PERIODS_FILE)
 
 
 @st.cache_data(ttl=60 * 60 * 24)
@@ -250,6 +298,50 @@ def _apply_bg(styler, fn, subset=None):
         return styler.map(fn, subset=subset)
     except AttributeError:
         return styler.applymap(fn, subset=subset)
+
+
+# ============================================================================
+#  이동평균 탭
+# ============================================================================
+def _validate_ma_symbol(symbol):
+    """추가 버튼을 눌렀을 때 즉석에서 FDR 조회가 되는 심볼인지 확인(최근 30일만
+    가볍게 조회) — 잘못된 심볼을 목록에 넣어 이후 스캔마다 계속 실패하는 것을 방지."""
+    try:
+        start = (pd.Timestamp.today() - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+        df = fdr.DataReader(symbol, start)
+        return df is not None and not df.empty and "Close" in df.columns and df["Close"].notna().any()
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=60 * 30)
+def _fetch_ma_row(symbol, periods):
+    """symbol의 현재가·1일등락률과, periods 각각의 SMA 대비 이격도(현재가/SMA-1)를 계산.
+    조회 자체가 실패하면 None. 개별 이평 기간은 데이터가 모자라도 그 칸만 None으로
+    비우고 나머지는 계산한다(종목 전체를 제외하지 않음)."""
+    if not periods:
+        return None
+    max_p = max(periods)
+    start = (pd.Timestamp.today() - pd.Timedelta(days=max(400, max_p * 3))).strftime("%Y-%m-%d")
+    try:
+        df = fdr.DataReader(symbol, start)
+    except Exception:
+        return None
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+    close = df["Close"].dropna()
+    if len(close) < 2:
+        return None
+    price = float(close.iloc[-1])
+    day_ret = float(price / close.iloc[-2] - 1.0)
+    gaps = {}
+    for p in periods:
+        if len(close) < p:
+            gaps[p] = None
+            continue
+        sma = float(close.iloc[-p:].mean())
+        gaps[p] = (price / sma - 1.0) if sma else None
+    return {"price": price, "day_ret": day_ret, "last_date": close.index[-1], "gaps": gaps}
 
 
 # ============================================================================
@@ -580,6 +672,10 @@ if "taa_results" not in st.session_state:
 # 차트 클릭 측정용
 if "click_pts" not in st.session_state:
     st.session_state.click_pts = []       # [(date_str, close_price), ...]
+if "ma_indices" not in st.session_state:
+    st.session_state.ma_indices, st.session_state.ma_indices_mode = load_ma_indices()
+if "ma_periods" not in st.session_state:
+    st.session_state.ma_periods, st.session_state.ma_periods_mode = load_ma_periods()
 
 st.title("📈 나의 투자 대시보드")
 st.caption("차트 · 관심목록 · 동적자산배분 — 탭 전환. 데이터: FinanceDataReader")
@@ -588,8 +684,8 @@ if st.session_state.storage_mode == "local":
 
 watchlist = st.session_state.watchlist
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수", "📏 이동평균"])
 
 # =====================  차트  ==============================================
 with tab1:
@@ -1579,6 +1675,159 @@ with tab5:
                     use_container_width=True, hide_index=True,
                     height=min(60 + 35 * len(disp), 700),
                 )
+
+# =====================  이동평균  ===========================================
+with tab6:
+    st.subheader("📏 이동평균 대비 위치")
+    st.caption("등록한 지수·종목의 현재가가 각 이동평균선 위/아래 어디에 있는지 한눈에 봅니다.")
+
+    with st.expander("⚙️ 지수·이동평균 목록 관리"):
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            st.markdown("**지수·종목 목록**")
+            cur_items = st.session_state.ma_indices
+            if cur_items:
+                idx_labels = [f"{it['label']} ({it['symbol']})" for it in cur_items]
+                idx_remove = st.multiselect("삭제할 항목", idx_labels, key="ma_idx_remove_sel")
+                if st.button("선택 삭제", key="ma_idx_remove_btn") and idx_remove:
+                    remove_syms = {s.rsplit("(", 1)[-1].rstrip(")") for s in idx_remove}
+                    st.session_state.ma_indices = [
+                        it for it in cur_items if it["symbol"] not in remove_syms]
+                    save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
+                    st.rerun()
+            else:
+                st.caption("등록된 지수·종목이 없습니다.")
+            with st.form("ma_idx_add_form", clear_on_submit=True):
+                new_sym = st.text_input("심볼 (예: KS11, AAPL, 005930)")
+                new_label = st.text_input("표시 이름 (비우면 자동)")
+                idx_add_sub = st.form_submit_button("추가")
+            if idx_add_sub and new_sym.strip():
+                sym = normalize(new_sym.strip())
+                if sym in {it["symbol"] for it in st.session_state.ma_indices}:
+                    st.warning(f"이미 등록된 심볼입니다: {sym}")
+                elif not _validate_ma_symbol(sym):
+                    st.error(f"'{sym}' 데이터를 조회할 수 없습니다 — 심볼을 확인해주세요.")
+                else:
+                    label = new_label.strip() or names.get(sym) or sym
+                    st.session_state.ma_indices = st.session_state.ma_indices + [
+                        {"symbol": sym, "label": label}]
+                    save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
+                    st.success(f"'{label}({sym})' 추가됨")
+                    st.rerun()
+        with mc2:
+            st.markdown("**이동평균 기간(일)**")
+            cur_periods_mgmt = st.session_state.ma_periods
+            if cur_periods_mgmt:
+                period_remove = st.multiselect(
+                    "삭제할 기간", sorted(cur_periods_mgmt), key="ma_period_remove_sel")
+                if st.button("선택 삭제", key="ma_period_remove_btn") and period_remove:
+                    st.session_state.ma_periods = [
+                        p for p in cur_periods_mgmt if p not in period_remove]
+                    save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
+                    st.rerun()
+            else:
+                st.caption("등록된 이동평균이 없습니다.")
+            with st.form("ma_period_add_form", clear_on_submit=True):
+                new_period = st.number_input(
+                    "기간(일)", min_value=MA_PERIOD_MIN, max_value=MA_PERIOD_MAX, value=20, step=1)
+                period_add_sub = st.form_submit_button("추가")
+            if period_add_sub:
+                np_ = int(new_period)
+                if np_ in st.session_state.ma_periods:
+                    st.warning(f"이미 등록된 기간입니다: {np_}일")
+                else:
+                    st.session_state.ma_periods = sorted(st.session_state.ma_periods + [np_])
+                    save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
+                    st.rerun()
+
+        if st.button("🔄 기본값으로 초기화", key="ma_reset_btn"):
+            st.session_state.ma_indices = DEFAULT_MA_INDICES.copy()
+            st.session_state.ma_periods = DEFAULT_MA_PERIODS.copy()
+            save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
+            save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
+            st.rerun()
+
+    ma_indices = st.session_state.ma_indices
+    ma_periods = sorted(st.session_state.ma_periods)
+
+    if not ma_indices:
+        st.info("등록된 지수·종목이 없습니다. 위 '지수·이동평균 목록 관리'에서 추가해주세요.")
+    elif not ma_periods:
+        st.info("등록된 이동평균 기간이 없습니다. 위 '지수·이동평균 목록 관리'에서 추가해주세요.")
+    else:
+        with st.spinner("시세 조회 중..."):
+            with ThreadPoolExecutor(max_workers=8) as exe:
+                fetch_results = list(exe.map(
+                    lambda it: (it, _fetch_ma_row(it["symbol"], tuple(ma_periods))), ma_indices))
+
+        period_cols = [f"{p}일선" for p in ma_periods]
+        rows, failed = [], []
+        for it, data in fetch_results:
+            if data is None:
+                failed.append(it["label"])
+                continue
+            gaps, above, valid = {}, 0, 0
+            for p in ma_periods:
+                g = data["gaps"].get(p)
+                gaps[f"{p}일선"] = g
+                if g is not None:
+                    valid += 1
+                    if g > 0:
+                        above += 1
+            if valid == 0:
+                failed.append(it["label"])
+                continue
+            rows.append({
+                "지수": it["label"], "현재가": data["price"], "1일등락률": data["day_ret"],
+                **gaps, "요약": f"{valid}개 중 {above}개 위",
+                "_above": above, "_valid": valid, "_last_date": data["last_date"],
+            })
+
+        if failed:
+            st.warning("조회 실패로 표에서 제외됨: " + ", ".join(failed))
+
+        if not rows:
+            st.info("표시할 데이터가 없습니다.")
+        else:
+            df_ma = pd.DataFrame(rows)
+            as_of = df_ma["_last_date"].max()
+            st.caption(f"데이터 기준일: {as_of:%Y-%m-%d}")
+
+            sort_label = st.selectbox("정렬", ["강한 순", "약한 순", "이름순"], key="ma_sort")
+            if sort_label == "강한 순":
+                df_ma = df_ma.sort_values(["_above", "_valid"], ascending=[False, False])
+            elif sort_label == "약한 순":
+                df_ma = df_ma.sort_values(["_above", "_valid"], ascending=[True, False])
+            else:
+                df_ma = df_ma.sort_values("지수")
+            df_ma = df_ma.reset_index(drop=True)
+
+            display_cols = ["지수", "현재가", "1일등락률"] + period_cols + ["요약"]
+            disp = df_ma[display_cols]
+
+            def _fmt_gap(v):
+                if pd.isna(v):
+                    return "—"
+                return f"{'▲' if v >= 0 else '▼'} {v:+.1%}"
+
+            styled = disp.style.format(
+                {"현재가": "{:,.2f}", "1일등락률": "{:+.2%}", **{c: _fmt_gap for c in period_cols}},
+                na_rep="—",
+            )
+            # 이평 칸들은 전부 같은 단위(이격도 %)라 컬럼별이 아니라 표 전체에서
+            # 공통 진하기 상한을 써야 "5일선 -15%"와 "200일선 -15%"가 똑같이 진하게
+            # 보인다(관심목록 수익률 표는 색칠 대상 컬럼이 하나뿐이라 컬럼별 상한이면
+            # 충분했지만, 여기는 컬럼이 여러 개라 다르게 처리).
+            all_gaps = pd.concat([df_ma[c] for c in period_cols]) if period_cols else pd.Series(dtype=float)
+            gap_cap = _abs_cap(all_gaps, MA_GAP_COLOR_CAP)
+            for c in period_cols:
+                styled = _apply_bg(styled, lambda v, cap=gap_cap: _color_scale_zero(v, cap), subset=[c])
+            ret_cap = _abs_cap(df_ma["1일등락률"], RET_COLOR_CAP)
+            styled = _apply_bg(styled, lambda v, cap=ret_cap: _color_scale_zero(v, cap), subset=["1일등락률"])
+
+            # use_container_width라 열이 많아지면 표 자체가 가로 스크롤됨(모바일 포함).
+            st.dataframe(styled, use_container_width=True, hide_index=True,
+                         height=min(60 + 35 * len(disp), 600))
 
 st.divider()
 st.caption("※ 규칙 기반 계산기이며 투자 자문이 아닙니다. "
