@@ -1492,9 +1492,14 @@ with tab5:
             }
             work["entry_date"] = [occ_map[(m, d)] for m, d in zip(work["month"], work["tdom"])]
             work = work.dropna(subset=["entry_date"])
-            window_start = work["entry_date"] - pd.Timedelta(days=BUY_WINDOW_BEFORE)
-            window_end = work["entry_date"] + pd.Timedelta(days=BUY_WINDOW_AFTER)
-            work = work[(today_ts >= window_start) & (today_ts <= window_end)].copy()
+            # 매수창은 "오늘"을 기준으로 잡는다(스캔 기준일 as_of가 아니라 앱을 보는
+            # 시점) — entry_date가 [오늘-BUY_WINDOW_BEFORE, 오늘+BUY_WINDOW_AFTER]
+            # 안에 들어오는 종목만 남긴다. 예전엔 반대로 entry_date를 기준으로 창을
+            # 잡아(entry-2~entry+5 안에 오늘이 들어오는지) 사실상 [오늘-5~오늘+2]를
+            # 보는 것과 같아져, 앞뒤가 뒤집힌 채로 필터링되고 있었다.
+            window_start = today_ts - pd.Timedelta(days=BUY_WINDOW_BEFORE)
+            window_end = today_ts + pd.Timedelta(days=BUY_WINDOW_AFTER)
+            work = work[(work["entry_date"] >= window_start) & (work["entry_date"] <= window_end)].copy()
             work["exit_date"] = work.apply(
                 lambda r: r["entry_date"] + pd.tseries.offsets.BDay(int(r["hold_days"])), axis=1)
 
@@ -1531,10 +1536,16 @@ with tab5:
                 else:
                     work = work[work["sector"] == f_sector]
 
+            # 티커 기준 중복 제거(승률 -> 평균수익률 -> 표본연수 순 최상위 1행만) —
+            # 같은 종목이 진입일만 다른 여러 (월,월중n번째거래일,보유기간) 조합으로
+            # 동시에 매수창에 들어오면(예: Ares Management, Gartner) 한 번만 보여준다.
+            work = work.sort_values(["win_rate", "avg_return", "n_years"], ascending=[False, False, False])
+            work = work.drop_duplicates(subset="ticker", keep="first")
+
             sort_label = st.selectbox(
                 "정렬", ["승률 높은순", "평균수익률 높은순", "진입 임박순"], key="season_sort")
             if sort_label == "승률 높은순":
-                work = work.sort_values("win_rate", ascending=False)
+                work = work.sort_values(["win_rate", "avg_return"], ascending=[False, False])
             elif sort_label == "평균수익률 높은순":
                 work = work.sort_values("avg_return", ascending=False)
             else:

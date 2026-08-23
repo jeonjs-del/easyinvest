@@ -3,9 +3,19 @@
 내 PC에서 직접 실행한다 (Streamlit Cloud에서는 실행하지 않음):
     python scanner/seasonality_scan.py
 
-한국(KOSPI200 근사)·미국(S&P500) 유니버스 전 종목의 최근 LOOKBACK_YEARS년
+한국(KOSPI200 근사)·미국(NASDAQ+NYSE+AMEX 전 종목, scanner/universe.py의
+US_MIN_MARKET_CAP_USD 시총 필터만 적용 — 추세추종 스캐너와 동일한
+build_universe()를 그대로 재사용한다) 유니버스 전 종목의 최근 LOOKBACK_YEARS년
 일봉을 내려받아, (종목, 진입월, 월중 n번째 거래일, 보유기간) 조합별로
 연도별 수익률의 승률·평균수익률·표본연수를 계산한다.
+
+LOOKBACK_YEARS=15가 기본값이다(원사이트가 15년 기준으로 보임 — 승률 93% =
+15년 중 14번 성공 같은 값과 일치). MIN_SAMPLE_YEARS=13으로, 상장한 지 얼마
+안 돼 15년 중 13년 미만의 표본만 가진 종목은 결과에서 아예 제외한다 —
+그렇지 않으면 "9/10년인데 승률 100%"처럼 표본이 얇은 종목이 승률만으로
+부풀려져 상위에 올라오는 문제가 있었다. 승률 자체는 항상 성공 횟수 ÷ 실제
+표본수(n_years)로 계산하고(고정 분모를 쓰지 않음), 화면에는 "n_years/
+lookback_years년"으로 실제 표본 기간을 그대로 보여준다(app.py "표본" 열).
 
 "월중 n번째 거래일"을 진입 시점 단위로 쓰는 이유: 캘린더 날짜(예: 매년 8/15)는
 요일이 매년 달라져 실제 거래일이 흔들리므로, 재현성 있는 계절성 신호로는
@@ -32,11 +42,18 @@ from scanner.universe import build_universe
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ---- config (필요시 이 값들만 바꾸면 됨) -----------------------------------
-LOOKBACK_YEARS = 10
+LOOKBACK_YEARS = 15                     # 원사이트 기준 추정치(15년 중 n번 성공 방식과 일치)
 HOLD_PERIODS = [10, 15, 20, 25, 30]     # 보유기간 후보 (거래일 기준)
 WIN_RATE_THRESHOLD = 0.90               # 결과에 남길 최소 승률
-MIN_SAMPLE_YEARS = 7                    # 표본 연수가 이보다 적으면 신뢰 불가로 제외
+MIN_SAMPLE_YEARS = 13                   # LOOKBACK_YEARS년 중 이보다 표본이 적으면(상장 얼마 안 된 종목 등) 제외
 MAX_WORKERS = 12
+
+# 미국 유니버스 시총 하한: 추세추종(trend_scan.py)의 $50M보다 훨씬 낮게 잡는다.
+# 원사이트 계절성 상위권에 Manhattan Bridge Capital($46.6M) 같은 초소형주가 나와
+# $50M로는 걸러진다. $5M은 실질적으로 데이터 품질 문제(시총 0/결측에 가까운
+# 거래정지·상장폐지 직전 종목)만 걸러내는 수준이고, 실제 시총 구간 필터링은
+# app.py UI(MARKET_CAP_BUCKETS)에서 사용자가 고르게 한다.
+US_MIN_MARKET_CAP_USD = 5e6
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 OUTPUT_PARQUET = DATA_DIR / "seasonality.parquet"
@@ -86,7 +103,7 @@ def _scan_one(meta, price, hold_periods):
 
 def run():
     t0 = time.time()
-    universe = build_universe()
+    universe = build_universe(us_min_market_cap_usd=US_MIN_MARKET_CAP_USD)
     n_kr = sum(1 for u in universe if u["market"] == "KR")
     n_us = sum(1 for u in universe if u["market"] == "US")
     print(f"유니버스 {len(universe)}종목 (한국 {n_kr} / 미국 {n_us})")

@@ -120,7 +120,7 @@ def _fetch_naver_exchange_listing(exchange):
     return rows
 
 
-def get_us_universe():
+def get_us_universe(min_market_cap_usd=US_MIN_MARKET_CAP_USD):
     gics = _sp500_gics_lookup()
     seen, out = set(), []
     for exchange in _NAVER_EXCHANGES:
@@ -130,7 +130,7 @@ def get_us_universe():
                 continue
             cap_raw = s.get("marketValueRaw")
             cap = float(cap_raw) if cap_raw else None
-            if cap is None or cap < US_MIN_MARKET_CAP_USD:
+            if cap is None or cap < min_market_cap_usd:
                 continue
             seen.add(sym)
             ticker = _normalize_us_symbol(sym)
@@ -149,5 +149,10 @@ def get_us_universe():
     return out
 
 
-def build_universe():
-    return get_kr_universe() + get_us_universe()
+def build_universe(us_min_market_cap_usd=US_MIN_MARKET_CAP_USD):
+    """us_min_market_cap_usd로 미국 유니버스의 1차 시총 필터를 호출부마다 다르게
+    줄 수 있다. 추세추종(trend_scan.py)은 인자 없이 호출해 기존 $50M 하한을 그대로
+    쓴다(건드리지 않음). 계절성(seasonality_scan.py)은 훨씬 낮은 값을 넘겨 Manhattan
+    Bridge Capital($46.6M) 같은 초소형주도 포함시키고, 시총 구간 필터는 앱 UI
+    (MARKET_CAP_BUCKETS)에서 사용자가 고르게 한다."""
+    return get_kr_universe() + get_us_universe(min_market_cap_usd=us_min_market_cap_usd)
