@@ -56,6 +56,72 @@ DEFAULT_MA_INDICES = [
 DEFAULT_MA_PERIODS = [5, 10, 20, 50, 120, 200]
 MA_PERIOD_MIN, MA_PERIOD_MAX = 1, 500
 MA_GAP_COLOR_CAP = 0.20   # 이격도 색상 진하기의 절대값 상한 (±20%, 이상은 최대 진하기로 클립)
+
+# ---- 코인 탭 -----------------------------------------------------------
+COIN_UNIVERSE_POOL = 200   # CoinGecko 시가총액 상위 몇 개까지를 "전체" 유니버스 풀로 볼지
+# RS(상대강도) 종합 점수 = 1~4주 수익률의 유니버스 내 백분위(0~100) 가중평균.
+# 가중치는 최근 주에 더 크게 뒀다(원사이트 스타일 모멘텀 — 최근 흐름을 더 반영).
+COIN_RS_WEEK_WEIGHTS = {1: 4, 2: 3, 3: 2, 4: 1}
+COIN_CHART_PERIOD_DAYS = {"1년": 365, "3년": 1095, "전체": 100000}
+COIN_CHART_INTERVAL_MAP = {"일봉": "1d", "주봉": "1w", "월봉": "1M"}
+COIN_RET_COLOR_CAP = 0.50  # 코인은 변동성이 커서 관심목록(±30%)보다 상한을 넉넉히 잡음
+
+# Hyperliquid의 빌더 배포 퍼프 DEX 중 전통자산(주식·지수·원자재·환율 등)을 취급하는
+# "xyz" dex 유니버스를 그대로 쓴다. 카테고리 분류는 dict 하드코딩(수동/휴리스틱) —
+# Hyperliquid가 자산을 추가/변경하면 이 dict만 고치면 된다. 목록에 없는 심볼은
+# CATEGORY_FALLBACK으로 분류된다.
+HL_XYZ_DEX = "xyz"
+# 이 dict에 없는 심볼(Hyperliquid가 새로 추가한 자산)은 일단 이 기본값으로 분류된다.
+# xyz dex 유니버스는 대부분 미국 개별 종목이라 "미국주식"을 기본값으로 뒀다 —
+# 아래 dict에 명시적으로 적은 것들(해외기업·지수·원자재·환율·ETF·비상장)만 예외.
+HL_CATEGORY_FALLBACK = "미국주식"
+HL_CATEGORIES = ["전체", "미국주식", "글로벌주식", "지수", "원자재", "환율", "비상장", "섹터"]
+HL_SYMBOL_CATEGORY = {
+    # 지수
+    "XYZ100": "지수", "SP500": "지수", "KR200": "지수", "JP225": "지수", "NIFTY": "지수",
+    "IBOV": "지수", "VIX": "지수", "VOL": "지수",
+    # 환율
+    "EUR": "환율", "GBP": "환율", "JPY": "환율", "KRW": "환율", "DXY": "환율",
+    # 원자재
+    "GOLD": "원자재", "SILVER": "원자재", "COPPER": "원자재", "NATGAS": "원자재",
+    "URANIUM": "원자재", "ALUMINIUM": "원자재", "PLATINUM": "원자재", "PALLADIUM": "원자재",
+    "CL": "원자재", "BRENTOIL": "원자재", "CORN": "원자재", "WHEAT": "원자재", "TTF": "원자재",
+    # 섹터 ETF
+    "SMH": "섹터", "SOXL": "섹터", "XLE": "섹터", "XBI": "섹터", "MAGS": "섹터",
+    "URNM": "섹터", "DRAM": "섹터",
+    # 글로벌주식(미국 외 기업·ADR·해외 ETF)
+    "TSM": "글로벌주식", "BABA": "글로벌주식", "SMSN": "글로벌주식", "HYUNDAI": "글로벌주식",
+    "SOFTBANK": "글로벌주식", "KIOXIA": "글로벌주식", "EWY": "글로벌주식", "EWJ": "글로벌주식",
+    "EWT": "글로벌주식", "EWZ": "글로벌주식", "ASML": "글로벌주식", "NOK": "글로벌주식",
+    "ARM": "글로벌주식", "IBIDEN": "글로벌주식", "SKHX": "글로벌주식", "SKHY": "글로벌주식",
+    "CXMT": "글로벌주식",
+    # 비상장/프리IPO 성격
+    "SPCX": "비상장", "H100": "비상장", "GIGADEV": "비상장", "PURRDAT": "비상장",
+    "USAR": "비상장", "SHAZ": "비상장", "KSTR": "비상장", "KORU": "비상장",
+    "MINIMAX": "비상장", "UNITREE": "비상장", "LYTE": "비상장", "NCLD": "비상장",
+    "ZHIPU": "비상장", "STRC": "비상장", "BOT": "비상장", "BIRD": "비상장", "CBRS": "비상장",
+    # 이 dict에 없는 나머지(TSLA/NVDA/AAPL 등 미국 개별 종목 대부분)는
+    # HL_CATEGORY_FALLBACK("미국주식")으로 분류된다.
+}
+# 주요 종목만 한글명을 달아준다(전부 번역하지 않음 — 목록에 없으면 심볼만 표시).
+# 나중에 필요하면 이 dict에 항목을 추가하면 된다.
+HL_SYMBOL_KOREAN_NAME = {
+    "XYZ100": "XYZ 100지수", "SP500": "S&P500", "KR200": "코스피200", "JP225": "니케이225",
+    "NIFTY": "인도 니프티", "IBOV": "브라질 보베스파", "VIX": "변동성지수", "DXY": "달러인덱스",
+    "EUR": "유로", "GBP": "파운드", "JPY": "엔", "KRW": "원",
+    "GOLD": "금", "SILVER": "은", "COPPER": "구리", "NATGAS": "천연가스", "URANIUM": "우라늄",
+    "ALUMINIUM": "알루미늄", "PLATINUM": "백금", "PALLADIUM": "팔라듐", "CL": "WTI 원유",
+    "BRENTOIL": "브렌트유", "CORN": "옥수수", "WHEAT": "밀",
+    "AAPL": "애플", "TSLA": "테슬라", "NVDA": "엔비디아", "GOOGL": "구글", "AMZN": "아마존",
+    "MSFT": "마이크로소프트", "META": "메타", "AMD": "AMD", "NFLX": "넷플릭스",
+    "COIN": "코인베이스", "PLTR": "팔란티어", "HOOD": "로빈후드", "MSTR": "마이크로스트래티지",
+    "COST": "코스트코", "DELL": "델", "IBM": "IBM", "AVGO": "브로드컴", "QCOM": "퀄컴",
+    "INTC": "인텔", "GME": "게임스탑", "ZM": "줌", "EBAY": "이베이", "CRWD": "크라우드스트라이크",
+    "RDDT": "레딧", "MRNA": "모더나", "ASML": "ASML", "BABA": "알리바바", "TSM": "TSMC",
+    "SMSN": "삼성전자", "HYUNDAI": "현대차", "SOFTBANK": "소프트뱅크",
+    "SMH": "반도체 ETF", "SOXL": "반도체 3배 ETF", "XLE": "에너지 섹터 ETF",
+    "XBI": "바이오 ETF", "MAGS": "매그니피센트7 ETF", "SPCX": "스페이스X",
+}
 DEFAULT_INDICES = {
     "코스피": "KS11", "코스닥": "KQ11", "S&P500": "US500", "나스닥종합": "IXIC",
     "다우": "DJI", "러셀2000": "RUT", "닛케이225": "N225", "상해종합": "SSEC",
@@ -342,6 +408,269 @@ def _fetch_ma_row(symbol, periods):
         sma = float(close.iloc[-p:].mean())
         gaps[p] = (price / sma - 1.0) if sma else None
     return {"price": price, "day_ret": day_ret, "last_date": close.index[-1], "gaps": gaps}
+
+
+# ============================================================================
+#  코인 탭 — 랭킹(CoinGecko + Binance) / 글로벌 24-7(Hyperliquid xyz dex)
+# ============================================================================
+@st.cache_data(ttl=300)
+def _fetch_coingecko_markets(pool_size):
+    """CoinGecko 공개 markets 엔드포인트(무인증) — 시세·시총·거래량·24h/7d/30d
+    변동률·7일 스파크라인을 한 번에 준다."""
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": pool_size,
+                    "page": 1, "sparkline": "true", "price_change_percentage": "24h,7d,30d"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def _fetch_binance_usdt_symbols():
+    """Binance 공개 exchangeInfo(무인증) — USDT 마켓이 있는 심볼 집합. 1·2·3·4주
+    수익률(RS 계산용)과 캔들차트는 CoinGecko가 아니라 여기서 받는다(과거 일봉이
+    필요한데 CoinGecko는 무료 플랜에서 일 단위 히스토리 접근이 제한적)."""
+    try:
+        r = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=20)
+        r.raise_for_status()
+        return {s["symbol"] for s in r.json()["symbols"]
+                if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"}
+    except Exception:
+        return set()
+
+
+@st.cache_data(ttl=60 * 60)
+def _fetch_binance_klines(symbol, interval, limit=500):
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol, "interval": interval, "limit": min(limit, 1000)},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return [{"time": pd.to_datetime(row[0], unit="ms"), "open": float(row[1]),
+                  "high": float(row[2]), "low": float(row[3]), "close": float(row[4]),
+                  "volume": float(row[5])}
+                 for row in r.json()]
+    except Exception:
+        return []
+
+
+def _lookback_return(closes, days_back):
+    n = len(closes)
+    idx = n - 1 - days_back
+    if idx < 0:
+        return None
+    base = closes[idx]
+    return (closes[-1] / base - 1.0) if base else None
+
+
+@st.cache_data(ttl=300)
+def build_coin_ranking(pool_size=COIN_UNIVERSE_POOL):
+    """(결과 DataFrame, 상태) 반환. 상태: "ok"/"coingecko_fail"/"binance_fail"/
+    "no_match"/"no_data" — 실패 원인을 화면에서 구분해 보여주기 위함.
+
+    RS(상대강도) 계산: 1·2·3·4주 수익률 각각을 이 유니버스(풀) 내에서 백분위
+    (0~100, pandas rank(pct=True))로 바꾼 뒤, COIN_RS_WEEK_WEIGHTS 가중평균을
+    "종합RS"로 쓴다. 가중치는 최근 주(1주 전)에 더 크게 둬서 최근 모멘텀을 더
+    반영한다 — 절대수익률이 아니라 "같은 시점 다른 코인들 대비 얼마나 잘했는가"를
+    보는 것이 RS의 취지라, 반드시 유니버스 내부 비교(percentile)로 계산한다."""
+    markets = _fetch_coingecko_markets(pool_size)
+    if not markets:
+        return pd.DataFrame(), "coingecko_fail"
+    usdt_syms = _fetch_binance_usdt_symbols()
+    if not usdt_syms:
+        return pd.DataFrame(), "binance_fail"
+
+    candidates = [(m, m["symbol"].upper() + "USDT") for m in markets]
+    candidates = [(m, s) for m, s in candidates if s in usdt_syms]
+    if not candidates:
+        return pd.DataFrame(), "no_match"
+
+    def _fetch_row(item):
+        m, bsym = item
+        # 일봉 400개(약 400일치)면 1~4주 수익률뿐 아니라 3·6·12개월 수익률까지
+        # 같은 호출 하나로 다 계산할 수 있다(컬럼 토글에 맞춰 다시 조회하지 않음).
+        candles = _fetch_binance_klines(bsym, "1d", 400)
+        if len(candles) < 29:
+            return None
+        closes = [c["close"] for c in candles]
+        rets_week = [_lookback_return(closes, d) for d in (7, 14, 21, 28)]
+        if any(v is None for v in rets_week):
+            return None
+        ret_1w, ret_2w, ret_3w, ret_4w = rets_week
+        # CoinGecko는 %(예: -1.2)로 주는데 앱 전체 관례(RET_COLOR_CAP 등)는 소수
+        # 비율(예: -0.012)이라 여기서 100으로 나눠 맞춘다.
+        def _pct(key):
+            v = m.get(key)
+            return v / 100.0 if v is not None else None
+        return {
+            "symbol": m["symbol"].upper(), "name": m["name"], "binance_symbol": bsym,
+            "price": m["current_price"],
+            "chg_24h": _pct("price_change_percentage_24h_in_currency"),
+            "chg_7d": _pct("price_change_percentage_7d_in_currency"),
+            "chg_30d": _pct("price_change_percentage_30d_in_currency"),
+            "market_cap": m.get("market_cap"), "market_cap_rank": m.get("market_cap_rank"),
+            "volume": m.get("total_volume"),
+            "sparkline": (m.get("sparkline_in_7d") or {}).get("price") or [],
+            "ret_1w": ret_1w, "ret_2w": ret_2w, "ret_3w": ret_3w, "ret_4w": ret_4w,
+            "ret_3m": _lookback_return(closes, 90),
+            "ret_6m": _lookback_return(closes, 182),
+            "ret_12m": _lookback_return(closes, 365),
+        }
+
+    with ThreadPoolExecutor(max_workers=12) as exe:
+        rows = list(exe.map(_fetch_row, candidates))
+    rows = [r for r in rows if r is not None]
+    if not rows:
+        return pd.DataFrame(), "no_data"
+
+    df = pd.DataFrame(rows)
+    for w in (1, 2, 3, 4):
+        df[f"rs_{w}w"] = df[f"ret_{w}w"].rank(pct=True) * 100
+    wsum = sum(COIN_RS_WEEK_WEIGHTS.values())
+    df["rs_total"] = sum(df[f"rs_{w}w"] * wt for w, wt in COIN_RS_WEEK_WEIGHTS.items()) / wsum
+    df = df.sort_values("rs_total", ascending=False).reset_index(drop=True)
+    df.insert(0, "#", df.index + 1)
+    return df, "ok"
+
+
+def _lwc_time(ts, intraday):
+    """intraday=True면 UTCTimestamp(정수 초, 시:분까지 표시), False면 기존 차트
+    탭과 같은 'YYYY-MM-DD' 문자열."""
+    t = pd.Timestamp(ts)
+    return int(t.timestamp()) if intraday else t.strftime("%Y-%m-%d")
+
+
+def _render_price_chart(candles, key, height=420, intraday=False, closed_mask=None):
+    """candles: [{"time","open","high","low","close"}, ...] 정렬된 리스트.
+    closed_mask는 candles와 길이가 같은 bool 리스트로, True인 구간(정규장 휴장)을
+    회색으로 표시한다. Lightweight Charts엔 배경 음영 프리미티브가 없어서, 캔들의
+    가격축과는 무관한 별도 오버레이 스케일(visible=False)에 값 0/1짜리 꽉 찬 Area
+    시리즈를 캔들보다 먼저(=아래에) 깔아 흉내낸다 — 오버레이 스케일이 독립적이라
+    캔들 쪽 자동 스케일에는 영향을 주지 않는다."""
+    series_list = []
+    if closed_mask is not None and any(closed_mask):
+        bg_data = [{"time": _lwc_time(c["time"], intraday), "value": 1 if closed else 0}
+                    for c, closed in zip(candles, closed_mask)]
+        series_list.append({
+            "type": "Area", "data": bg_data,
+            "options": {
+                "topColor": "rgba(120,120,120,0.35)", "bottomColor": "rgba(120,120,120,0.35)",
+                "lineColor": "rgba(0,0,0,0)", "lineWidth": 1, "priceLineVisible": False,
+                "lastValueVisible": False, "crosshairMarkerVisible": False,
+                "priceScaleId": "closed_bg",
+            },
+            "priceScale": {"scaleMargins": {"top": 0, "bottom": 0}, "visible": False},
+        })
+    candle_data = [{"time": _lwc_time(c["time"], intraday), "open": round(c["open"], 6),
+                     "high": round(c["high"], 6), "low": round(c["low"], 6), "close": round(c["close"], 6)}
+                    for c in candles]
+    series_list.append({
+        "type": "Candlestick", "data": candle_data,
+        "options": {"upColor": "#26a69a", "downColor": "#ef5350", "borderVisible": False,
+                    "wickUpColor": "#26a69a", "wickDownColor": "#ef5350"},
+    })
+    chart_opts = {
+        "height": height,
+        "layout": {"background": {"type": "solid", "color": "#FFFFFF"}, "textColor": "#333333"},
+        "rightPriceScale": {"scaleMargins": {"top": 0.05, "bottom": 0.05},
+                             "borderColor": "rgba(197,203,206,0.5)"},
+        "timeScale": {"borderColor": "rgba(197,203,206,0.5)", "rightOffset": 5,
+                       "timeVisible": intraday, "secondsVisible": False},
+        "grid": {"vertLines": {"color": "rgba(197,203,206,0.2)"},
+                  "horzLines": {"color": "rgba(197,203,206,0.3)"}},
+        "crosshair": {"mode": 1},
+    }
+    renderLightweightCharts([{"chart": chart_opts, "series": series_list}], key=key)
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def _fetch_hl_xyz_universe():
+    """Hyperliquid 공개 info API(무인증) — 빌더 배포 퍼프 DEX 중 전통자산을 다루는
+    "xyz" dex의 유니버스(심볼 목록, "xyz:AAPL" 형태)."""
+    try:
+        r = requests.post("https://api.hyperliquid.xyz/info",
+                           json={"type": "meta", "dex": HL_XYZ_DEX}, timeout=15)
+        r.raise_for_status()
+        return [u["name"] for u in r.json().get("universe", [])]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def _fetch_hl_candles(coin, interval, lookback_ms):
+    try:
+        now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+        req = {"type": "candleSnapshot",
+               "req": {"coin": coin, "interval": interval,
+                        "startTime": now_ms - lookback_ms, "endTime": now_ms}}
+        r = requests.post("https://api.hyperliquid.xyz/info", json=req, timeout=15)
+        r.raise_for_status()
+        return [{"time": pd.to_datetime(row["t"], unit="ms"), "open": float(row["o"]),
+                  "high": float(row["h"]), "low": float(row["l"]), "close": float(row["c"]),
+                  "volume": float(row["v"])} for row in r.json()]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def build_global247():
+    """(결과 DataFrame, 상태) 반환. 1시간봉 31일치 하나로 현재가·1h·24h·7d·30d
+    변동률을 전부 계산한다(심볼당 API 호출 1번 — 굳이 여러 인터벌을 따로 안 불러
+    Hyperliquid에 보내는 요청 수를 줄인다)."""
+    coins = _fetch_hl_xyz_universe()
+    if not coins:
+        return pd.DataFrame(), "hl_fail"
+
+    def _fetch_row(coin):
+        candles = _fetch_hl_candles(coin, "1h", 31 * 24 * 3600 * 1000)
+        if len(candles) < 25:
+            return None
+        closes = [c["close"] for c in candles]
+        n = len(closes)
+
+        def _chg(hours_back):
+            idx = n - 1 - hours_back
+            if idx < 0:
+                return None
+            base = closes[idx]
+            return (closes[-1] / base - 1.0) if base else None
+
+        sym = coin.split(":", 1)[-1]
+        return {
+            "symbol": sym, "hl_symbol": coin, "price": closes[-1],
+            "chg_1h": _chg(1), "chg_24h": _chg(24), "chg_7d": _chg(24 * 7), "chg_30d": _chg(24 * 30),
+            "category": HL_SYMBOL_CATEGORY.get(sym, HL_CATEGORY_FALLBACK),
+        }
+
+    with ThreadPoolExecutor(max_workers=12) as exe:
+        rows = list(exe.map(_fetch_row, coins))
+    rows = [r for r in rows if r is not None]
+    if not rows:
+        return pd.DataFrame(), "no_data"
+    df = pd.DataFrame(rows).sort_values("chg_24h", ascending=False, na_position="last").reset_index(drop=True)
+    return df, "ok"
+
+
+def _us_market_closed_mask(times):
+    """미국 정규장(09:30~16:00 America/New_York, 평일) 기준 휴장 여부의 근사치.
+    공휴일 캘린더는 반영하지 않는다(주말+시간대만 체크) — 이 앱의 다른 달력 근사
+    (계절성 탭의 진입일 계산 등)와 같은 수준의 단순화라 문서화만 해둔다."""
+    out = []
+    for t in times:
+        ts = pd.Timestamp(t)
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        et = ts.tz_convert("America/New_York")
+        is_weekday = et.weekday() < 5
+        in_hours = (9, 30) <= (et.hour, et.minute) < (16, 0)
+        out.append(not (is_weekday and in_hours))
+    return out
 
 
 # ============================================================================
@@ -676,6 +1005,10 @@ if "ma_indices" not in st.session_state:
     st.session_state.ma_indices, st.session_state.ma_indices_mode = load_ma_indices()
 if "ma_periods" not in st.session_state:
     st.session_state.ma_periods, st.session_state.ma_periods_mode = load_ma_periods()
+if "coin_rank_symbol" not in st.session_state:
+    st.session_state.coin_rank_symbol = None       # 랭킹 탭 상단 차트 대상(binance_symbol)
+if "coin_g247_symbol" not in st.session_state:
+    st.session_state.coin_g247_symbol = None       # 글로벌24-7 탭 하단 차트 대상(hl_symbol)
 
 st.title("📈 나의 투자 대시보드")
 st.caption("차트 · 관심목록 · 동적자산배분 — 탭 전환. 데이터: FinanceDataReader")
@@ -684,8 +1017,8 @@ if st.session_state.storage_mode == "local":
 
 watchlist = st.session_state.watchlist
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수", "📏 이동평균"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수", "📏 이동평균", "🪙 코인"])
 
 # =====================  차트  ==============================================
 with tab1:
@@ -1828,6 +2161,249 @@ with tab6:
             # use_container_width라 열이 많아지면 표 자체가 가로 스크롤됨(모바일 포함).
             st.dataframe(styled, use_container_width=True, hide_index=True,
                          height=min(60 + 35 * len(disp), 600))
+
+# =====================  코인  ================================================
+with tab7:
+    sub_rank, sub_g247, sub_onchain = st.tabs(["🏆 랭킹", "🌐 글로벌 24-7", "⛓️ 온체인"])
+
+    # ---- 랭킹 ---------------------------------------------------------------
+    with sub_rank:
+        st.caption("데이터: CoinGecko(시세·시총·스파크라인) + Binance(과거 일봉 — RS·주간/월간 "
+                   "수익률 계산용). 시세는 5분, 과거 일봉은 1시간 캐시.")
+
+        fc1, fc2, fc3, fc4, fc5, fc6 = st.columns([1.1, 1, 1.3, 1, 1, 1.2])
+        tier_label = fc1.selectbox("시총 구간", ["top10", "top20", "top50", "top100", "전체"],
+                                    index=4, key="coin_tier")
+        rank_n = fc2.number_input("순위 ≤ (0=미적용)", min_value=0, value=0, step=10, key="coin_rank_n")
+        mcap_min_m = fc3.number_input("시총 ≥ 백만$ (0=미적용)", min_value=0.0, value=0.0, step=100.0,
+                                       key="coin_mcap_min")
+        show_week_rs = fc4.checkbox("+주간RS", key="coin_col_weekrs")
+        show_week_ret = fc5.checkbox("+주간수익", key="coin_col_weekret")
+        show_month_ret = fc6.checkbox("+3·6·12개월", key="coin_col_monthret")
+
+        with st.spinner("코인 시세·RS 조회 중..."):
+            rank_df, rank_status = build_coin_ranking(COIN_UNIVERSE_POOL)
+
+        _rank_errors = {
+            "coingecko_fail": "CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
+            "binance_fail": "Binance 심볼 목록 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
+            "no_match": "CoinGecko 상위 코인 중 Binance USDT 마켓이 있는 코인이 없습니다.",
+            "no_data": "표시할 코인 데이터가 없습니다(전 종목 히스토리 조회 실패).",
+        }
+        if rank_status in _rank_errors:
+            st.warning(f"⚠️ {_rank_errors[rank_status]}")
+        elif rank_df.empty:
+            st.info("표시할 코인 데이터가 없습니다.")
+        else:
+            work = rank_df.copy()
+            _tier_map = {"top10": 10, "top20": 20, "top50": 50, "top100": 100, "전체": None}
+            _tier_n = _tier_map[tier_label]
+            if _tier_n is not None:
+                work = work[work["market_cap_rank"] <= _tier_n]
+            if rank_n > 0:
+                work = work[work["market_cap_rank"] <= rank_n]
+            if mcap_min_m > 0:
+                work = work[work["market_cap"] >= mcap_min_m * 1e6]
+            work = work.reset_index(drop=True)
+
+            if work.empty:
+                st.info("조건에 맞는 코인이 없습니다.")
+            else:
+                st.caption(f"{len(work)}개 코인 · 기본 정렬: 종합RS (표 헤더 클릭으로 재정렬 가능)")
+
+                col_data = {
+                    "#": work["#"], "이름": work["symbol"] + " · " + work["name"],
+                    "가격": work["price"], "24h": work["chg_24h"], "7일": work["chg_7d"],
+                    "30일": work["chg_30d"], "종합RS": work["rs_total"],
+                    "시총": work["market_cap"], "거래량": work["volume"],
+                    "7일 스파크라인": work["sparkline"],
+                }
+                if show_week_rs:
+                    for w in (1, 2, 3, 4):
+                        col_data[f"{w}주RS"] = work[f"rs_{w}w"]
+                if show_week_ret:
+                    for w in (1, 2, 3, 4):
+                        col_data[f"{w}주수익"] = work[f"ret_{w}w"]
+                if show_month_ret:
+                    col_data["3개월"] = work["ret_3m"]
+                    col_data["6개월"] = work["ret_6m"]
+                    col_data["12개월"] = work["ret_12m"]
+
+                disp = pd.DataFrame(col_data)
+                pct_cols = [c for c in ["24h", "7일", "30일"]
+                            + ([f"{w}주수익" for w in (1, 2, 3, 4)] if show_week_ret else [])
+                            + (["3개월", "6개월", "12개월"] if show_month_ret else [])]
+
+                styled = disp.style
+                for c in pct_cols:
+                    _cap = _abs_cap(disp[c], COIN_RET_COLOR_CAP)
+                    styled = _apply_bg(styled, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
+
+                col_config = {
+                    "#": st.column_config.NumberColumn(width="small"),
+                    "가격": st.column_config.NumberColumn(format="$%.6g"),
+                    "24h": st.column_config.NumberColumn(format="percent"),
+                    "7일": st.column_config.NumberColumn(format="percent"),
+                    "30일": st.column_config.NumberColumn(format="percent"),
+                    "종합RS": st.column_config.NumberColumn(format="%.0f"),
+                    "시총": st.column_config.NumberColumn(format="compact"),
+                    "거래량": st.column_config.NumberColumn(format="compact"),
+                    "7일 스파크라인": st.column_config.LineChartColumn(width="medium"),
+                }
+                for w in (1, 2, 3, 4):
+                    col_config[f"{w}주RS"] = st.column_config.NumberColumn(format="%.0f")
+                    col_config[f"{w}주수익"] = st.column_config.NumberColumn(format="percent")
+                for c in ("3개월", "6개월", "12개월"):
+                    col_config[c] = st.column_config.NumberColumn(format="percent")
+
+                rank_ev = st.dataframe(
+                    styled, use_container_width=True, hide_index=True, column_config=col_config,
+                    height=min(60 + 35 * len(disp), 600),
+                    on_select="rerun", selection_mode="single-row", key="coin_rank_table",
+                )
+                _sel_rows = rank_ev.selection.rows if rank_ev and rank_ev.selection else []
+                if _sel_rows:
+                    _sel_sym = work.iloc[_sel_rows[0]]["binance_symbol"]
+                    if _sel_sym != st.session_state.coin_rank_symbol:
+                        st.session_state.coin_rank_symbol = _sel_sym
+                        st.rerun()
+
+                chart_sym = st.session_state.coin_rank_symbol or work.iloc[0]["binance_symbol"]
+                chart_row = work[work["binance_symbol"] == chart_sym]
+                chart_label = (chart_row.iloc[0]["symbol"] + " · " + chart_row.iloc[0]["name"]
+                               if not chart_row.empty else chart_sym)
+                st.markdown(f"#### {chart_label}")
+                cc1, cc2 = st.columns(2)
+                chart_period = cc1.radio("기간", list(COIN_CHART_PERIOD_DAYS), index=0,
+                                          horizontal=True, key="coin_rank_period")
+                chart_iv_label = cc2.radio("봉", list(COIN_CHART_INTERVAL_MAP), index=0,
+                                            horizontal=True, key="coin_rank_iv")
+                _iv = COIN_CHART_INTERVAL_MAP[chart_iv_label]
+                _bars_needed = {"1d": 366, "1w": 53, "1M": 13}[_iv] \
+                    if chart_period == "1년" else \
+                    ({"1d": 1096, "1w": 157, "1M": 37} if chart_period == "3년"
+                     else {"1d": 1000, "1w": 1000, "1M": 1000})[_iv]
+                candles = _fetch_binance_klines(chart_sym, _iv, _bars_needed)
+                if not candles:
+                    st.warning("차트 데이터를 불러오지 못했습니다.")
+                else:
+                    _render_price_chart(candles, key=f"lwc_coin_rank_{chart_sym}_{_iv}", intraday=False)
+
+    # ---- 글로벌 24-7 ----------------------------------------------------------
+    with sub_g247:
+        st.info("ℹ️ 이 가격은 코인거래소(Hyperliquid)에서 형성되는 시세이며, 정규 거래소의 "
+                "공식 가격이 아닌 참고용입니다. 유동성이 낮아 실제 거래소 가격과 괴리가 있을 수 있습니다.")
+        st.caption("데이터: Hyperliquid 공개 API(xyz 퍼프 DEX — 주식·지수·원자재·환율 등 전통자산을 "
+                   "24시간 거래). 5분 캐시.")
+
+        cat_filter = st.selectbox("카테고리", HL_CATEGORIES, index=0, key="g247_cat")
+
+        with st.spinner("Hyperliquid 시세 조회 중..."):
+            g247_df, g247_status = build_global247()
+
+        _g247_errors = {
+            "hl_fail": "Hyperliquid 유니버스 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
+            "no_data": "표시할 데이터가 없습니다(전 종목 캔들 조회 실패).",
+        }
+        if g247_status in _g247_errors:
+            st.warning(f"⚠️ {_g247_errors[g247_status]}")
+        elif g247_df.empty:
+            st.info("표시할 데이터가 없습니다.")
+        else:
+            work247 = g247_df.copy()
+            if cat_filter != "전체":
+                work247 = work247[work247["category"] == cat_filter]
+            work247 = work247.reset_index(drop=True)
+
+            if work247.empty:
+                st.info("이 카테고리에 해당하는 자산이 없습니다.")
+            else:
+                st.caption(f"{len(work247)}개 자산 · 24h 변동률 기준 정렬(표 헤더 클릭으로 재정렬 가능)")
+
+                kr_name = work247["symbol"].map(lambda s: HL_SYMBOL_KOREAN_NAME.get(s))
+                disp247 = pd.DataFrame({
+                    "이름": [f"{s} · {k}" if k else s for s, k in zip(work247["symbol"], kr_name)],
+                    "현재가": work247["price"], "1h": work247["chg_1h"], "24h": work247["chg_24h"],
+                    "7일": work247["chg_7d"], "30일": work247["chg_30d"], "카테고리": work247["category"],
+                })
+                styled247 = disp247.style
+                for c in ["1h", "24h", "7일", "30일"]:
+                    _cap = _abs_cap(disp247[c], COIN_RET_COLOR_CAP)
+                    styled247 = _apply_bg(styled247, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
+
+                g247_ev = st.dataframe(
+                    styled247, use_container_width=True, hide_index=True,
+                    column_config={
+                        "현재가": st.column_config.NumberColumn(format="$%.6g"),
+                        "1h": st.column_config.NumberColumn(format="percent"),
+                        "24h": st.column_config.NumberColumn(format="percent"),
+                        "7일": st.column_config.NumberColumn(format="percent"),
+                        "30일": st.column_config.NumberColumn(format="percent"),
+                    },
+                    height=min(60 + 35 * len(disp247), 600),
+                    on_select="rerun", selection_mode="single-row", key="coin_g247_table",
+                )
+                _sel247 = g247_ev.selection.rows if g247_ev and g247_ev.selection else []
+                if _sel247:
+                    _sel_hl = work247.iloc[_sel247[0]]["hl_symbol"]
+                    if _sel_hl != st.session_state.coin_g247_symbol:
+                        st.session_state.coin_g247_symbol = _sel_hl
+                        st.rerun()
+
+                g247_sym = st.session_state.coin_g247_symbol or work247.iloc[0]["hl_symbol"]
+                g247_row = work247[work247["hl_symbol"] == g247_sym]
+                g247_sym_short = g247_row.iloc[0]["symbol"] if not g247_row.empty else g247_sym
+                g247_kr = HL_SYMBOL_KOREAN_NAME.get(g247_sym_short)
+                st.markdown(f"#### {g247_sym_short}" + (f" · {g247_kr}" if g247_kr else ""))
+
+                iv_label = st.radio("인터벌", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3,
+                                     horizontal=True, key="coin_g247_iv")
+                _lookback_ms = {
+                    "1m": 6 * 3600 * 1000, "5m": 24 * 3600 * 1000, "15m": 3 * 24 * 3600 * 1000,
+                    "1h": 14 * 24 * 3600 * 1000, "4h": 45 * 24 * 3600 * 1000,
+                    "1d": 365 * 24 * 3600 * 1000,
+                }[iv_label]
+                g247_candles = _fetch_hl_candles(g247_sym, iv_label, _lookback_ms)
+                if not g247_candles:
+                    st.warning("차트 데이터를 불러오지 못했습니다.")
+                else:
+                    _closed_mask = _us_market_closed_mask([c["time"] for c in g247_candles])
+                    _render_price_chart(g247_candles, key=f"lwc_g247_{g247_sym}_{iv_label}",
+                                         intraday=True, closed_mask=_closed_mask)
+                    st.caption("회색 배경 = 미국 정규장(09:30~16:00 ET, 평일) 휴장 구간(공휴일 미반영 근사치)")
+
+    # ---- 온체인 ---------------------------------------------------------------
+    with sub_onchain:
+        st.info("⛓️ 온체인 지표 탭은 준비 중입니다. 아래는 각 지표를 무료 API로 구할 수 있는지 "
+                "조사한 결과입니다.")
+        onchain_survey = pd.DataFrame([
+            {"지표": "MVRV", "가능여부": "가능", "소스": "bitcoin-data.com (무료, 무인증)"},
+            {"지표": "NUPL", "가능여부": "가능", "소스": "bitcoin-data.com"},
+            {"지표": "SOPR", "가능여부": "가능", "소스": "bitcoin-data.com"},
+            {"지표": "장기보유자 SOPR(LTH-SOPR)", "가능여부": "가능", "소스": "bitcoin-data.com"},
+            {"지표": "푸엘 멀티플(Puell Multiple)", "가능여부": "가능", "소스": "bitcoin-data.com"},
+            {"지표": "실현가격(Realized Price)", "가능여부": "가능", "소스": "bitcoin-data.com"},
+            {"지표": "MVRV Z-Score", "가능여부": "가능", "소스": "bitcoin-data.com"},
+            {"지표": "Pi Cycle Top", "가능여부": "자체계산", "소스": "가격(일봉)만으로 계산 가능 — 111일 SMA vs 350일 SMA×2"},
+            {"지표": "Mayer Multiple", "가능여부": "자체계산", "소스": "가격 ÷ 200일 SMA, 가격만으로 계산 가능"},
+            {"지표": "200주 이평(200W MA)", "가능여부": "자체계산", "소스": "가격(주봉)만으로 계산 가능"},
+            {"지표": "해시레이트", "가능여부": "가능", "소스": "Blockchain.com Charts API(무료, 무인증)"},
+            {"지표": "해시리본(Hash Ribbons)", "가능여부": "자체계산", "소스": "해시레이트의 30일/60일 SMA — Blockchain.com 원자료로 직접 계산"},
+            {"지표": "활성주소(Active Addresses)", "가능여부": "가능", "소스": "Blockchain.com Charts API(n-unique-addresses)"},
+            {"지표": "공포탐욕지수", "가능여부": "가능", "소스": "alternative.me Fear & Greed Index API(무료, 무인증)"},
+            {"지표": "펀딩비(Funding Rate)", "가능여부": "가능", "소스": "Binance/Hyperliquid 공개 API(fundingRate) — 이미 이 앱이 쓰는 소스 재사용 가능"},
+            {"지표": "미결제약정(Open Interest)", "가능여부": "가능", "소스": "Binance futures 공개 API(openInterest) — 무료, 무인증"},
+            {"지표": "ETF 흐름(BTC ETF Flow)", "가능여부": "부분", "소스": "Farside Investors — 공식 API는 없고 웹페이지 스크레이핑 필요(구조 변경에 취약)"},
+            {"지표": "김치프리미엄", "가능여부": "가능", "소스": "이미 프리미엄 탭에서 계산 중인 로직 재사용"},
+            {"지표": "글로벌 M2", "가능여부": "가능", "소스": "FRED(M2SL 등, 무료 API키 필요·무료 발급) — 국가별 M2 합산은 직접 구성 필요"},
+            {"지표": "CoinGlass 계열 지표 전반(청산맵 등)", "가능여부": "불가(무료로는)", "소스": "CoinGlass 공식 API는 유료 플랜부터 제공, 무료 티어는 웹 화면만"},
+        ])
+        st.dataframe(onchain_survey, use_container_width=True, hide_index=True,
+                     height=min(60 + 35 * len(onchain_survey), 760))
+        st.caption("가능=무료·무인증 API로 직접 조회 / 자체계산=가격 등 원자료만으로 이 앱에서 "
+                   "계산 가능 / 부분=공식 API 없이 우회 방법(스크레이핑 등)만 존재 / 불가=무료로는 "
+                   "확인한 방법이 없음. 구현은 아직 하지 않았고, 다음 라운드에서 우선순위를 정해 "
+                   "진행하면 됩니다.")
 
 st.divider()
 st.caption("※ 규칙 기반 계산기이며 투자 자문이 아닙니다. "
