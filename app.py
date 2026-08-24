@@ -653,7 +653,12 @@ def build_coin_ranking(pool_size=COIN_UNIVERSE_POOL):
     (0~100, pandas rank(pct=True))로 바꾼 뒤, COIN_RS_WEEK_WEIGHTS 가중평균을
     "종합RS"로 쓴다. 가중치는 최근 주(1주 전)에 더 크게 둬서 최근 모멘텀을 더
     반영한다 — 절대수익률이 아니라 "같은 시점 다른 코인들 대비 얼마나 잘했는가"를
-    보는 것이 RS의 취지라, 반드시 유니버스 내부 비교(percentile)로 계산한다."""
+    보는 것이 RS의 취지라, 반드시 유니버스 내부 비교(percentile)로 계산한다.
+
+    기본 정렬은 종합RS가 아니라 시총 순위(market_cap_rank) 오름차순 — 원사이트처럼
+    BTC·ETH·XRP... 순으로 뜨게 한다. "#"열도 시총 순위값 그대로 담아서, 화면에서
+    표 헤더를 클릭해 다른 기준(종합RS 등)으로 재정렬해도 "#"이 1,2,3으로 다시
+    매겨지지 않고 그 코인의 시총 순위를 계속 보여준다."""
     markets = _fetch_coingecko_markets(pool_size)
     if not markets:
         return pd.DataFrame(), "coingecko_fail", {}
@@ -688,6 +693,13 @@ def build_coin_ranking(pool_size=COIN_UNIVERSE_POOL):
         rows = list(exe.map(_fetch_row, markets))
 
     df = pd.DataFrame(rows)
+    # CoinGecko가 주는 market_cap_rank 필드를 그대로 믿지 않고 실제 market_cap 값으로
+    # 우리가 다시 매긴다 — 확인해보니 그 필드에 동률(예: 두 코인이 똑같이 9위)과
+    # 스냅샷이 어긋난 역전(더 큰 시총인데 순위 숫자는 더 나쁘게 나오는 경우)이
+    # 실제로 있었다. min 방식(동률은 같은 순위, 다음 순위는 그만큼 건너뜀)+시총
+    # 없는 코인은 최하위로 보낸다.
+    df["market_cap_rank"] = (df["market_cap"].rank(method="min", ascending=False, na_option="bottom")
+                              .astype(int))
     for w in (1, 2, 3, 4):
         df[f"rs_{w}w"] = df[f"ret_{w}w"].rank(pct=True) * 100
     wsum = sum(COIN_RS_WEEK_WEIGHTS.values())
@@ -696,8 +708,11 @@ def build_coin_ranking(pool_size=COIN_UNIVERSE_POOL):
     df["rs_total"] = np.nan
     df.loc[has_all_weeks, "rs_total"] = sum(
         df.loc[has_all_weeks, f"rs_{w}w"] * wt for w, wt in COIN_RS_WEEK_WEIGHTS.items()) / wsum
-    df = df.sort_values("rs_total", ascending=False, na_position="last").reset_index(drop=True)
-    df.insert(0, "#", df.index + 1)
+    # 기본 정렬·"#"열은 시총 순위(원사이트와 동일한 BTC·ETH·XRP... 순). RS 기준
+    # 정렬은 표 헤더를 클릭해 쓰면 되고("#"은 그 행의 시총 순위 그대로 유지돼
+    # 다시 매겨지지 않는다), 정렬을 초기화하면 이 기본 순서(시총순)로 돌아온다.
+    df = df.sort_values("market_cap_rank", ascending=True, na_position="last").reset_index(drop=True)
+    df.insert(0, "#", df["market_cap_rank"])
 
     source_counts = df["history_source"].fillna("실패").value_counts().to_dict()
     return df, "ok", source_counts
@@ -2368,7 +2383,8 @@ with tab7:
             if work.empty:
                 st.info("조건에 맞는 코인이 없습니다.")
             else:
-                st.caption(f"{len(work)}개 코인 · 기본 정렬: 종합RS (표 헤더 클릭으로 재정렬 가능)")
+                st.caption(f"{len(work)}개 코인 · 기본 정렬: 시총순 (표 헤더 클릭으로 재정렬 가능, "
+                           "'#'열은 항상 시총 순위 고정)")
 
                 col_data = {
                     "#": work["#"], "이름": work["symbol"] + " · " + work["name"],
