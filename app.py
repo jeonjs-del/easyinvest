@@ -19,7 +19,8 @@ import yfinance as yf
 # 로컬 패치 래퍼: 줌 상태 복원 + dblclick 지원
 from lwc_local import renderLightweightCharts
 
-from strategies import STRATEGIES, TAA_TICKERS, augment_panel
+from strategies import (STRATEGIES, TAA_TICKERS, augment_panel,
+                         VOLDM_TICKERS, VOLDM_ASSET_META, voldm_source_type)
 
 st.set_page_config(page_title="나의 투자 대시보드", layout="wide")
 
@@ -1548,6 +1549,7 @@ with tab3:
         _KR_ETF_LABEL = {
             "069500": "KODEX200(069500)",
             "278530": "KODEX200TR(278530)",
+            "KOSPI_BF": "KOSPI200(278530, 2017-11~ / KS200 소급)",
             "363580": "KODEX200IT TR(363580)",
             "114260": "국고채3년(114260)",
             "148070": "국고채10년(148070)",
@@ -1556,6 +1558,16 @@ with tab3:
             "US_BOND_MID_KRW": "미국10년국채환노출(IEF합성)",
             "US_BOND_LONG_KRW": "미국장기국채환노출(TLT합성)",
             "CASH": "현금",
+        }
+
+        _STRAT_DATA_NOTES = {
+            "변동성 변형 듀얼모멘텀":
+                "안전자산 6종 중 국고채3/10/30년(114260/148070/439870)은 Close 가격만 사용 — "
+                "연 1회(12월) 분배금을 지급하는데 총수익 반영이 안 돼 있어 미국채(환노출 합성,"
+                " 총수익)와의 1개월 모멘텀 비교가 구조적으로 유리/불리할 수 있음. "
+                "KOSPI200은 2017-11-21 이전을 KS200 가격지수로 소급(배당 미반영). "
+                "KOSPI200 IT 오버레이는 2020-09-25 이후만 적용(그 전엔 KOSPI200 100%). "
+                "국고채30년은 2022-08-23 이전엔 안전자산 후보에서 제외.",
         }
 
         def pos_str(w):
@@ -1612,6 +1624,51 @@ with tab3:
                     m2.metric("MDD",  f"{r['mdd']:.1%}")
                     m3.metric("Sharpe", f"{r['sharpe']:.2f}")
                     m4.metric("현재 포지션", pos_str(r.get("current") or {}))
+
+                    bt_start = r["equity"].index[0].strftime("%Y-%m")
+                    bt_end = r["equity"].index[-1].strftime("%Y-%m")
+                    note = _STRAT_DATA_NOTES.get(pick)
+                    st.caption(f"백테스트 구간: {bt_start} ~ {bt_end}"
+                               + (f" · ⚠️ {note}" if note else ""))
+
+                    if pick == "변동성 변형 듀얼모멘텀":
+                        with st.expander("데이터 출처 상세 (총수익 여부 · backfill/proxy 구간)"):
+                            meta_rows = []
+                            for key, ticker in VOLDM_TICKERS.items():
+                                meta = VOLDM_ASSET_META.get(key, {})
+                                meta_rows.append({
+                                    "자산": key, "사용 컬럼": ticker,
+                                    "총수익 반영": "O" if meta.get("total_return") else "X(가격 기준)",
+                                    "비고": meta.get("note", ""),
+                                })
+                            st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
+
+                            fn = STRATEGIES[pick]
+                            n_months = n_proxy_months = 0
+                            proxy_by_key = {}
+                            for t in range(len(mp) - 1):
+                                w = fn(mp, t, ctx)
+                                if not w:
+                                    continue
+                                n_months += 1
+                                flagged = False
+                                for key, ticker in VOLDM_TICKERS.items():
+                                    if ticker not in w:
+                                        continue
+                                    st_type = voldm_source_type(mp, key, t)
+                                    if st_type in ("benchmark_index", "proxy"):
+                                        flagged = True
+                                        proxy_by_key[key] = proxy_by_key.get(key, 0) + 1
+                                if flagged:
+                                    n_proxy_months += 1
+                            pct = (n_proxy_months / n_months * 100) if n_months else 0.0
+                            st.caption(
+                                f"전체 {n_months}개월 중 benchmark_index/proxy 자산이 선택된 달: "
+                                f"{n_proxy_months}개월({pct:.0f}%)"
+                            )
+                            if proxy_by_key:
+                                breakdown = " · ".join(f"{k}: {v}개월" for k, v in proxy_by_key.items())
+                                st.caption(f"자산별 내역 — {breakdown}")
 
                     recent_positions = r.get("recent_positions") or []
                     recent_rows = [

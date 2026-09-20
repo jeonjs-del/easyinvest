@@ -4,19 +4,38 @@
 mp: 월말 종가 패널(DataFrame, 컬럼=티커), t: 정수 인덱스, ctx: {'gt_bear','ue_up12','ue_ok'}.
 ETF 치환: EFA→IEFA, VWO/EEM→IEMG, DBC→PDBC, IWD→VTV, IWN→VBR, 현금→BIL.
 "CASH" 티커는 mp에 없는 심볼이라 backtest()가 수익률 0으로 처리한다(변동성 변형 듀얼모멘텀에서 사용).
+
+[변동성 변형 듀얼모멘텀 데이터 한계 — 2026-09-20 조사, AGENTS.md 데이터소스 섹션과 동기화]
+- 국고채 3/10/30년 ETF(114260/148070/439870)는 전부 연 1회(12월) 분배금을 지급하는 실측
+  확인됨(각 최근 1년 분배율 1.31%/3.62%/1.96%, funetf.co.kr 공시 기준). 그런데 이 세 종목은
+  mp에 Close 가격만 들어있어 총수익이 아니다 — SPY/미국채(Adj Close)나 KOSPI200·IT
+  TR(무분배 재투자형)와 섞으면 안전자산 6종 1개월 모멘텀 비교가 구조적으로 왜곡된다
+  (스펙 9항 위배). 국고채 TR형 ETF가 국내에 없어 티커 교체로는 해결 불가 — 최소한
+  VOLDM_ASSET_META로 어떤 자산이 가격 기준인지 명시해 화면/문서에 노출한다.
+- KOSPI200(278530, 2017-11-21 상장)은 augment_panel()이 KS200(FDR 무료 캐시, 1990~ 제공,
+  코스피200 가격지수·배당 미반영) 수익률로 상장 이전 구간을 소급 연결한 합성 컬럼
+  "KOSPI_BF"를 사용한다(가격 레벨 단순접합이 아니라 상장일 기준 수익률 체이닝).
+- KOSPI200 IT(363580, 2020-09-25 상장)와 국고채30년(439870, 2022-08-23 상장)은 상장 이전
+  구간을 메울 무료·비로그인 데이터원이 없어(KRX data.krx.co.kr의 지수/ETF 조회 API는
+  로그인 필요 — pykrx도 동일 이유로 실패, FDR의 무료 GitHub 캐시엔 KS11/KQ11/KS200만
+  있고 업종지수·TR지수는 없음) backfill을 적용하지 않는다. 상장 전에는 각각 IT 오버레이
+  생략(KOSPI200 100%로 대체) / 안전자산 후보 제외로 기존 동작을 유지한다.
 """
 import pandas as pd
 
 TAA_TICKERS = ["SPY", "IEFA", "IEMG", "AGG", "BND", "QQQ", "IWM", "VGK", "EWJ",
                "VNQ", "PDBC", "GLD", "TLT", "HYG", "LQD", "IEF", "TIP", "BIL",
                "SHY", "VTV", "VBR", "SCZ", "REM", "EMB", "BWX", "069500",
-               "278530", "363580", "114260", "148070", "439870", "USD/KRW"]
+               "278530", "363580", "114260", "148070", "439870", "USD/KRW",
+               "KS200"]
 
 # ---- 변동성 변형 듀얼모멘텀 종목 매핑 (교체 가능하도록 dict로 관리) ---------
-# KOSPI/KOSPI_IT는 신호·실행 동일 TR ETF 사용. 미국채 3종은 mp에 직접 없고
-# augment_panel()이 USD 자산 x USD/KRW로 합성한 파생 컬럼(*_KRW)을 가리킨다.
+# KOSPI는 278530을 KS200(코스피200 지수)으로 상장 전 구간을 소급 연결한 합성 컬럼
+# "KOSPI_BF"를 가리킨다(augment_panel 참고). KOSPI_IT는 신호·실행 동일 TR ETF 그대로 사용
+# (backfill 없음). 미국채 3종은 mp에 직접 없고 augment_panel()이 USD 자산 x USD/KRW로
+# 합성한 파생 컬럼(*_KRW)을 가리킨다.
 VOLDM_TICKERS = {
-    "KOSPI": "278530",          # KODEX 200TR
+    "KOSPI": "KOSPI_BF",        # 278530(KODEX 200TR) + KS200 소급합성
     "KOSPI_IT": "363580",       # KODEX 200IT TR
     "SPY": "SPY",
     "KR_BOND_SHORT": "114260",  # KODEX 국고채3년
@@ -33,11 +52,74 @@ VOLDM_FX_SOURCE = {
     "US_BOND_LONG_KRW": "TLT",
 }
 VOLDM_FX_TICKER = "USD/KRW"
+# KOSPI 상장 전 backfill에 쓸 (실거래 ETF 컬럼, 벤치마크 지수 컬럼) 쌍.
+VOLDM_BACKFILL = {"KOSPI_BF": ("278530", "KS200")}
 # 안전자산 동률 시 우선순위(높은 순). config처럼 여기서만 바꾸면 됨.
 VOLDM_SAFE_PRIORITY = ["KR_BOND_SHORT", "KR_BOND_MID", "KR_BOND_LONG",
                         "US_BOND_SHORT", "US_BOND_MID", "US_BOND_LONG"]
 VOLDM_VOL_THRESHOLD = 0.35
 VOLDM_IT_WEIGHT = 0.25
+
+# 자산별 데이터 성격 메타(화면/보고용). source_type: actual_etf(실거래 ETF, 상장 이후) /
+# benchmark_index(상장 전 벤치마크 지수로 소급) / proxy(해외자산 환노출 합성).
+# total_return: 배당/이자 분배가 가격에 재투자되어 있는지(True) 여부. 국고채 3종은 연 1회
+# 분배금을 지급하는데 Close 가격만 쓰므로 False(가격지수 기준, 총수익 아님).
+VOLDM_ASSET_META = {
+    "KOSPI": {"total_return": False,
+              "note": "278530은 TR(무분배 재투자)이라 상장 후 구간은 총수익이지만, "
+                      "2017-11-21 이전은 KS200 가격지수로 소급해 배당 미반영 구간이 섞여있음"},
+    "KOSPI_IT": {"total_return": True,
+                 "note": "363580 TR(무분배 재투자), 2020-09-25 이전 데이터 없음(backfill 안 함)"},
+    "SPY": {"total_return": True, "note": "Adj Close(배당 재투자) 사용"},
+    "KR_BOND_SHORT": {"total_return": False,
+                       "note": "114260, 연 1회(12월) 분배금 지급(최근 1년 분배율 1.31%) — Close만 사용, 총수익 아님"},
+    "KR_BOND_MID": {"total_return": False,
+                     "note": "148070, 연 1회(12월) 분배금 지급(최근 1년 분배율 3.62%) — Close만 사용, 총수익 아님"},
+    "KR_BOND_LONG": {"total_return": False,
+                      "note": "439870, 연 1회(12월) 분배금 지급(최근 1년 분배율 1.96%) — Close만 사용, 총수익 아님. "
+                              "2022-08-23 이전 데이터 없음(backfill 안 함)"},
+    "US_BOND_SHORT": {"total_return": True, "note": "SHY Adj Close × USD/KRW 합성(proxy)"},
+    "US_BOND_MID": {"total_return": True, "note": "IEF Adj Close × USD/KRW 합성(proxy)"},
+    "US_BOND_LONG": {"total_return": True, "note": "TLT Adj Close × USD/KRW 합성(proxy)"},
+}
+
+
+def _backfill_with_index(mp, etf_col, index_col):
+    """etf_col의 상장 이전 구간을 index_col의 수익률로 소급 연결한다(수익률 체이닝 —
+    가격 레벨을 그대로 이어붙이지 않고, 상장일 값과 지수값의 비율(scale)을 과거 전체에
+    동일 적용해 상장일에서 수치가 정확히 맞물리게 한다).
+    반환: (합성 가격 Series, 출처 태그 Series — 'actual_etf'/'benchmark_index')."""
+    if etf_col not in mp.columns or index_col not in mp.columns:
+        return None, None
+    etf, idx = mp[etf_col], mp[index_col]
+    etf_start = etf.first_valid_index()
+    if etf_start is None:
+        return None, None
+    idx_at_start = idx.loc[etf_start] if etf_start in idx.index else None
+    src = pd.Series(pd.NA, index=mp.index, dtype="object")
+    src.loc[etf.notna()] = "actual_etf"
+    if idx_at_start is None or pd.isna(idx_at_start) or idx_at_start == 0:
+        return etf.copy(), src
+    scale = etf.loc[etf_start] / idx_at_start
+    composite = etf.copy()
+    pre_mask = (mp.index < etf_start) & idx.notna()
+    composite.loc[pre_mask] = idx.loc[pre_mask] * scale
+    src.loc[pre_mask] = "benchmark_index"
+    return composite, src
+
+
+def voldm_source_type(mp, key, t):
+    """VOLDM_TICKERS[key] 컬럼이 시점 t에서 actual_etf/benchmark_index/proxy 중 무엇인지."""
+    col = VOLDM_TICKERS.get(key)
+    if col is None:
+        return None
+    src_col = f"{col}_SRC"
+    if src_col in mp.columns:
+        v = mp[src_col].iloc[t]
+        return v if pd.notna(v) else None
+    if col not in mp.columns or pd.isna(mp[col].iloc[t]):
+        return None
+    return "proxy" if col in VOLDM_FX_SOURCE else "actual_etf"
 
 
 def augment_panel(mp):
@@ -64,6 +146,14 @@ def augment_panel(mp):
         after = mp.index[mp.index > start]
         idx.loc[after] = (1 + krw_ret.loc[after]).cumprod()
         mp[krw_col] = idx
+        mp[f"{krw_col}_SRC"] = pd.Series(
+            ["proxy" if pd.notna(v) else pd.NA for v in idx], index=mp.index, dtype="object")
+
+    for composite_col, (etf_col, index_col) in VOLDM_BACKFILL.items():
+        composite, src = _backfill_with_index(mp, etf_col, index_col)
+        if composite is not None:
+            mp[composite_col] = composite
+            mp[f"{composite_col}_SRC"] = src
     return mp
 
 # ---- 모멘텀 유틸 ----------------------------------------------------------
