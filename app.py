@@ -3,9 +3,11 @@
 데이터: FinanceDataReader (국내/미국 주식·ETF·지수 + FRED). 서버 수집 → CORS 제약 없음.
 실행:  streamlit run app.py   (같은 폴더에 strategies.py 필요)
 """
+import contextlib
 import json
 import math
 import os
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
@@ -913,7 +915,7 @@ def _ret(s, t, k):
 
 def backtest(fn, mp, ctx):
     n = len(mp)
-    rets, dates = [], []
+    rets, dates, held = [], [], []
     for t in range(n - 1):
         w = fn(mp, t, ctx)
         if not w:
@@ -925,6 +927,8 @@ def backtest(fn, mp, ctx):
                 nxt += wt * r
         rets.append(nxt)
         dates.append(mp.index[t + 1])
+        # t월 말 신호로 정한 비중을 t+1월 동안 보유 → mret과 같은 날짜(t+1)에 묶어 저장
+        held.append({"signal": mp.index[t], "weights": dict(w)})
     if not rets:
         return None
     mr = pd.Series(rets, index=dates)
@@ -941,12 +945,13 @@ def backtest(fn, mp, ctx):
         recent_positions.append((mp.index[idx], fn(mp, idx, ctx) or {}))
     return {"equity": equity, "mret": mr, "cagr": cagr, "mdd": mdd,
             "sharpe": sharpe, "current": fn(mp, n - 1, ctx) or {},
-            "recent_positions": recent_positions}
+            "recent_positions": recent_positions,
+            "held": pd.Series(held, index=dates, dtype=object)}
 
 
 # 결과 딕셔너리 구조(backtest()의 반환 키)가 바뀌면 이 값을 올려서
 # st.cache_data에 남아있는 구버전 캐시를 무효화한다.
-TAA_RESULTS_VERSION = 3
+TAA_RESULTS_VERSION = 4
 
 
 @st.cache_data(ttl=60 * 60 * 4)
@@ -959,8 +964,10 @@ def run_all_strategies(_version=TAA_RESULTS_VERSION):
     for name, fn in STRATEGIES.items():
         try:
             res[name] = backtest(fn, mp, ctx)
-        except Exception:
-            res[name] = None  # 전략 하나가 실패해도 나머지는 계속 계산
+        except Exception as e:
+            # 전략 하나가 실패해도 나머지는 계속 계산 — 사유는 화면에 띄울 수 있게 남긴다.
+            print(f"[taa] '{name}' 백테스트 실패:\n{traceback.format_exc()}")
+            res[name] = {"error": f"{type(e).__name__}: {e}"}
     return res, mp, ctx["ue_ok"]
 
 
@@ -1586,8 +1593,8 @@ with tab3:
 
         table, failed_strats = [], []
         for nm, r in results.items():
-            if not r:
-                failed_strats.append(nm)
+            if not r or "error" in r:
+                failed_strats.append(f"{nm}({r['error']})" if r else f"{nm}(계산 가능한 구간 없음)")
                 continue
             table.append({
                 "전략명": nm, "현재 포지션": pos_str(r.get("current") or {}),
@@ -1606,122 +1613,180 @@ with tab3:
                    .reset_index(drop=True))
             tdf.insert(0, "순위", tdf.index + 1)
 
-            sel = st.dataframe(
-                tdf.style.format({"CAGR": "{:+.1%}", "MDD": "{:.1%}", "Sharpe": "{:.2f}"},
-                                 na_rep="—"),
-                use_container_width=True, hide_index=True,
-                height=min(60 + 35 * len(tdf), 600),
-                on_select="rerun", selection_mode="single-row", key="strat_table",
-            )
-            sel_rows = sel.selection.rows if sel and hasattr(sel, "selection") else []
-            pick_idx = sel_rows[0] if sel_rows else 0
-            pick = tdf.iloc[pick_idx]["전략명"]
+            strat_names = list(tdf["전략명"])
+            # 클릭한 셀은 위젯 상태로만 넘어온다 — 선택 행 하이라이트를 표에 입히려면
+            # 표를 그리기 전에 미리 읽어야 한다.
+            _cells = ((st.session_state.get("strat_table") or {}).get("selection") or {}).get("cells") or []
+            if _cells and 0 <= _cells[0][0] < len(strat_names):
+                st.session_state.taa_pick = strat_names[_cells[0][0]]
+            pick = st.session_state.get("taa_pick")
+            if pick not in strat_names:
+                pick = strat_names[0]  # 선택이 없으면 CAGR 1위
 
-            r = results.get(pick)
-            if not r:
-                st.warning(f"'{pick}' 전략 데이터를 불러오지 못했습니다.")
-            else:
+            def _hl_pick(row):
+                css = "background-color: rgba(255,212,59,0.35); font-weight: 700"
+                return [css if row["전략명"] == pick else ""] * len(row)
+
+            st.caption("전략명(행의 아무 칸)을 클릭하면 아래에 상세가 표시됩니다.")
+            try:
+                st.dataframe(
+                    tdf.style.format({"CAGR": "{:+.1%}", "MDD": "{:.1%}", "Sharpe": "{:.2f}"},
+                                     na_rep="—").apply(_hl_pick, axis=1),
+                    use_container_width=True, hide_index=True,
+                    height=min(60 + 35 * len(tdf), 600),
+                    on_select="rerun", selection_mode="single-cell", key="strat_table",
+                )
+            except Exception as _se:
+                # 셀 선택 미지원 Streamlit 버전 → 전략명 버튼 목록으로 대체
+                print(f"[taa] 셀 선택 미지원, 버튼 목록으로 대체: {type(_se).__name__}: {_se}")
+                for _nm in strat_names:
+                    if st.button(("▶ " if _nm == pick else "") + _nm, key=f"strat_btn_{_nm}"):
+                        st.session_state.taa_pick = _nm
+                        st.rerun()
+
+            r = results[pick]
+            st.markdown(f"#### 전략 상세 — {pick}")
+
+            @contextlib.contextmanager
+            def _detail_section(section):
+                """상세 화면을 구역별로 격리 — 한 구역이 실패해도 나머지는 그대로 표시한다."""
                 try:
-                    st.markdown(f"#### 전략 상세 — {pick}")
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("CAGR", f"{r['cagr']:+.1%}")
-                    m2.metric("MDD",  f"{r['mdd']:.1%}")
-                    m3.metric("Sharpe", f"{r['sharpe']:.2f}")
-                    m4.metric("현재 포지션", pos_str(r.get("current") or {}))
-
-                    bt_start = r["equity"].index[0].strftime("%Y-%m")
-                    bt_end = r["equity"].index[-1].strftime("%Y-%m")
-                    note = _STRAT_DATA_NOTES.get(pick)
-                    st.caption(f"백테스트 구간: {bt_start} ~ {bt_end}"
-                               + (f" · ⚠️ {note}" if note else ""))
-
-                    if pick == "변동성 변형 듀얼모멘텀":
-                        with st.expander("데이터 출처 상세 (총수익 여부 · backfill/proxy 구간)"):
-                            meta_rows = []
-                            for key, ticker in VOLDM_TICKERS.items():
-                                meta = VOLDM_ASSET_META.get(key, {})
-                                meta_rows.append({
-                                    "자산": key, "사용 컬럼": ticker,
-                                    "총수익 반영": "O" if meta.get("total_return") else "X(가격 기준)",
-                                    "비고": meta.get("note", ""),
-                                })
-                            st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
-
-                            fn = STRATEGIES[pick]
-                            # run_all_strategies는 ctx를 반환하지 않는다 — 캐시된 build_ctx로 다시 얻는다.
-                            ctx = build_ctx(list(mp.index))
-                            n_months = n_proxy_months = 0
-                            proxy_by_key = {}
-                            for t in range(len(mp) - 1):
-                                w = fn(mp, t, ctx)
-                                if not w:
-                                    continue
-                                n_months += 1
-                                flagged = False
-                                for key, ticker in VOLDM_TICKERS.items():
-                                    if ticker not in w:
-                                        continue
-                                    st_type = voldm_source_type(mp, key, t)
-                                    if st_type in ("benchmark_index", "proxy"):
-                                        flagged = True
-                                        proxy_by_key[key] = proxy_by_key.get(key, 0) + 1
-                                if flagged:
-                                    n_proxy_months += 1
-                            pct = (n_proxy_months / n_months * 100) if n_months else 0.0
-                            st.caption(
-                                f"전체 {n_months}개월 중 benchmark_index/proxy 자산이 선택된 달: "
-                                f"{n_proxy_months}개월({pct:.0f}%)"
-                            )
-                            if proxy_by_key:
-                                breakdown = " · ".join(f"{k}: {v}개월" for k, v in proxy_by_key.items())
-                                st.caption(f"자산별 내역 — {breakdown}")
-
-                    recent_positions = r.get("recent_positions") or []
-                    recent_rows = [
-                        {"기준월": d.strftime("%Y-%m"), "포지션": pos_str(w)}
-                        for d, w in recent_positions
-                    ]
-                    st.markdown("##### 최근 3개월 포지션")
-                    if recent_rows:
-                        st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("표시할 포지션 이력이 없습니다.")
-
-                    spy_eq = (1 + mp["SPY"].pct_change().reindex(r["equity"].index).fillna(0)).cumprod()
-                    cfig = go.Figure()
-                    cfig.add_trace(go.Scatter(x=r["equity"].index, y=r["equity"],
-                                              name="내 전략", line=dict(color="#e03131")))
-                    cfig.add_trace(go.Scatter(x=spy_eq.index, y=spy_eq,
-                                              name="SPY", line=dict(color="#1971c2", dash="dot")))
-                    cfig.update_layout(
-                        height=340, margin=dict(l=0, r=0, t=10, b=0), yaxis_type="log",
-                        legend=dict(orientation="h", y=1.02, x=0),
-                        title="누적 수익률 (로그 스케일)",
-                    )
-                    cfig.update_xaxes(fixedrange=True)
-                    cfig.update_yaxes(fixedrange=True)
-                    st.plotly_chart(cfig, use_container_width=True,
-                                    config={"scrollZoom": False, "displayModeBar": False})
-
-                    mr = r["mret"]
-                    heat = mr.groupby([mr.index.year, mr.index.month]).first().unstack() * 100
-                    heat.columns = [f"{m}월" for m in heat.columns]
-                    annual = (
-                        mr.groupby(mr.index.year)
-                          .apply(lambda x: (1 + x).prod() - 1) * 100
-                    ).rename("연간")
-                    heat_full = heat.join(annual)
-                    st.markdown("##### 연월별 수익률 (%)")
-                    fn_h = lambda v: _color_scale_zero(v, 10)
-                    styled_heat = _apply_bg(heat_full.style.format("{:+.1f}", na_rep="—"), fn_h)
-                    st.markdown(
-                        f'<div style="overflow-x:auto;font-size:0.85rem">'
-                        f'{styled_heat.to_html()}'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
+                    yield
                 except Exception as _de:
-                    st.error(f"'{pick}' 전략 상세 표시 중 오류가 발생했습니다: {_de}")
+                    tb = traceback.format_exc()
+                    print(f"[taa] '{pick}' 상세 '{section}' 실패:\n{tb}")
+                    st.error(f"'{pick}' 전략 — '{section}' 표시 중 오류: {type(_de).__name__}: {_de}")
+                    with st.expander("오류 상세(트레이스백)"):
+                        st.code(tb)
+
+            with _detail_section("요약 지표"):
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("CAGR", f"{r['cagr']:+.1%}")
+                m2.metric("MDD",  f"{r['mdd']:.1%}")
+                m3.metric("Sharpe", f"{r['sharpe']:.2f}")
+                m4.metric("현재 포지션", pos_str(r.get("current") or {}))
+
+                bt_start = r["equity"].index[0].strftime("%Y-%m")
+                bt_end = r["equity"].index[-1].strftime("%Y-%m")
+                note = _STRAT_DATA_NOTES.get(pick)
+                st.caption(f"백테스트 구간: {bt_start} ~ {bt_end}"
+                           + (f" · ⚠️ {note}" if note else ""))
+
+            if pick == "변동성 변형 듀얼모멘텀":
+                with _detail_section("데이터 출처 상세"):
+                    with st.expander("데이터 출처 상세 (총수익 여부 · backfill/proxy 구간)"):
+                        meta_rows = []
+                        for key, ticker in VOLDM_TICKERS.items():
+                            meta = VOLDM_ASSET_META.get(key, {})
+                            meta_rows.append({
+                                "자산": key, "사용 컬럼": ticker,
+                                "총수익 반영": "O" if meta.get("total_return") else "X(가격 기준)",
+                                "비고": meta.get("note", ""),
+                            })
+                        st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
+
+                        fn = STRATEGIES[pick]
+                        # run_all_strategies는 ctx를 반환하지 않는다 — 캐시된 build_ctx로 다시 얻는다.
+                        ctx = build_ctx(list(mp.index))
+                        n_months = n_proxy_months = 0
+                        proxy_by_key = {}
+                        for t in range(len(mp) - 1):
+                            w = fn(mp, t, ctx)
+                            if not w:
+                                continue
+                            n_months += 1
+                            flagged = False
+                            for key, ticker in VOLDM_TICKERS.items():
+                                if ticker not in w:
+                                    continue
+                                st_type = voldm_source_type(mp, key, t)
+                                if st_type in ("benchmark_index", "proxy"):
+                                    flagged = True
+                                    proxy_by_key[key] = proxy_by_key.get(key, 0) + 1
+                            if flagged:
+                                n_proxy_months += 1
+                        pct = (n_proxy_months / n_months * 100) if n_months else 0.0
+                        st.caption(
+                            f"전체 {n_months}개월 중 benchmark_index/proxy 자산이 선택된 달: "
+                            f"{n_proxy_months}개월({pct:.0f}%)"
+                        )
+                        if proxy_by_key:
+                            breakdown = " · ".join(f"{k}: {v}개월" for k, v in proxy_by_key.items())
+                            st.caption(f"자산별 내역 — {breakdown}")
+
+            with _detail_section("최근 3개월 포지션"):
+                # 신호는 월말에 확정되고 그 비중을 다음 달에 보유한다 — 히트맵 툴팁(보유월 기준)과
+                # 대조할 수 있게 두 달을 나란히 적는다.
+                recent_rows = [
+                    {"신호 기준월": d.strftime("%Y-%m"),
+                     "보유월": (d + pd.offsets.MonthEnd(1)).strftime("%Y-%m"),
+                     "포지션": pos_str(w)}
+                    for d, w in (r.get("recent_positions") or [])
+                ]
+                st.markdown("##### 최근 3개월 포지션")
+                if recent_rows:
+                    st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("표시할 포지션 이력이 없습니다.")
+
+            with _detail_section("누적 수익률 차트"):
+                spy_eq = (1 + mp["SPY"].pct_change().reindex(r["equity"].index).fillna(0)).cumprod()
+                cfig = go.Figure()
+                cfig.add_trace(go.Scatter(x=r["equity"].index, y=r["equity"],
+                                          name="내 전략", line=dict(color="#e03131")))
+                cfig.add_trace(go.Scatter(x=spy_eq.index, y=spy_eq,
+                                          name="SPY", line=dict(color="#1971c2", dash="dot")))
+                cfig.update_layout(
+                    height=340, margin=dict(l=0, r=0, t=10, b=0), yaxis_type="log",
+                    legend=dict(orientation="h", y=1.02, x=0),
+                    title="누적 수익률 (로그 스케일)",
+                )
+                cfig.update_xaxes(fixedrange=True)
+                cfig.update_yaxes(fixedrange=True)
+                st.plotly_chart(cfig, use_container_width=True,
+                                config={"scrollZoom": False, "displayModeBar": False})
+
+            with _detail_section("연월별 수익률 히트맵"):
+                mr = r["mret"]
+                heat = mr.groupby([mr.index.year, mr.index.month]).first().unstack() * 100
+                heat.columns = [f"{m}월" for m in heat.columns]
+                annual = (
+                    mr.groupby(mr.index.year)
+                      .apply(lambda x: (1 + x).prod() - 1) * 100
+                ).rename("연간")
+                heat_full = heat.join(annual)
+                # held는 mret과 같은 날짜(보유월)로 색인돼 있어 셀과 1:1로 대응한다.
+                held = r.get("held")
+                tips = pd.DataFrame("", index=heat_full.index, columns=heat_full.columns)
+                if held is not None:
+                    for d, h in held.items():
+                        tips.loc[d.year, f"{d.month}월"] = f"{d:%Y-%m}: {pos_str(h['weights'])}"
+                st.markdown("##### 연월별 수익률 (%)")
+                st.caption("월 칸에 커서를 올리면 그 달에 보유한 포지션(전월 말 신호)이 표시됩니다.")
+                fn_h = lambda v: _color_scale_zero(v, 10)
+                styled_heat = _apply_bg(heat_full.style.format("{:+.1f}", na_rep="—"), fn_h)
+                styled_heat = styled_heat.set_tooltips(tips, as_title_attribute=True)
+                st.markdown(
+                    f'<div style="overflow-x:auto;font-size:0.85rem">'
+                    f'{styled_heat.to_html()}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                if held is not None and len(held):
+                    # 터치 기기에서는 호버가 안 되므로 같은 내용을 표로도 제공
+                    with st.expander("월별 보유 포지션 표 (모바일용 · 최신순)"):
+                        held_rows = [
+                            {"보유월": d.strftime("%Y-%m"),
+                             "신호 기준월": h["signal"].strftime("%Y-%m"),
+                             "포지션": pos_str(h["weights"]),
+                             "수익률(%)": mr.loc[d] * 100}
+                            for d, h in held.iloc[::-1].items()
+                        ]
+                        st.dataframe(
+                            _apply_bg(pd.DataFrame(held_rows).style.format({"수익률(%)": "{:+.1f}"}),
+                                      fn_h, subset=["수익률(%)"]),
+                            use_container_width=True, hide_index=True, height=420,
+                        )
 
 # =====================  프리미엄  ==========================================
 with tab4:
