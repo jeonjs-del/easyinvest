@@ -54,6 +54,9 @@ DEFAULT_MA_INDICES = [
     {"symbol": "NDX", "label": "나스닥100"},
     {"symbol": "BTC/USD", "label": "BTCUSD"},
 ]
+# Yahoo가 "NDX"를 404로 돌려주기 시작해(2026-10 확인) "^NDX"로 조회해야 한다. Gist/로컬에
+# 이미 "NDX"로 저장된 목록이 있어 저장값은 그대로 두고 조회 직전에만 치환한다.
+MA_SYMBOL_ALIASES = {"NDX": "^NDX"}
 DEFAULT_MA_PERIODS = [5, 10, 20, 50, 120, 200]
 MA_PERIOD_MIN, MA_PERIOD_MAX = 1, 500
 MA_GAP_COLOR_CAP = 0.20   # 이격도 색상 진하기의 절대값 상한 (±20%, 이상은 최대 진하기로 클립)
@@ -391,8 +394,9 @@ def _fetch_ma_row(symbol, periods):
     max_p = max(periods)
     start = (pd.Timestamp.today() - pd.Timedelta(days=max(400, max_p * 3))).strftime("%Y-%m-%d")
     try:
-        df = fdr.DataReader(symbol, start)
-    except Exception:
+        df = fdr.DataReader(MA_SYMBOL_ALIASES.get(symbol, symbol), start)
+    except Exception as e:
+        print(f"[ma] 조회 실패: {symbol} {type(e).__name__}: {e}")
         return None
     if df is None or df.empty or "Close" not in df.columns:
         return None
@@ -1644,6 +1648,8 @@ with tab3:
                             st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
 
                             fn = STRATEGIES[pick]
+                            # run_all_strategies는 ctx를 반환하지 않는다 — 캐시된 build_ctx로 다시 얻는다.
+                            ctx = build_ctx(list(mp.index))
                             n_months = n_proxy_months = 0
                             proxy_by_key = {}
                             for t in range(len(mp) - 1):
