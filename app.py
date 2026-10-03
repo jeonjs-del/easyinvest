@@ -937,21 +937,28 @@ def backtest(fn, mp, ctx):
     cagr = equity.iloc[-1] ** (1 / yrs) - 1 if yrs > 0 else np.nan
     mdd = (equity / equity.cummax() - 1).min()
     sharpe = (mr.mean() * 12) / (mr.std() * np.sqrt(12)) if mr.std() > 0 else np.nan
+    # 패널의 마지막 행이 아직 끝나지 않은 이번 달이면 그 행은 월중 가격이라 신호가 매일
+    # 바뀐다 — 현재 포지션은 마지막으로 "마감된" 월말 신호로 고정해 다음 달 1일까지 유지한다.
+    # (Cloud는 UTC라 한국 날짜 기준으로 판정)
+    now_kst = pd.Timestamp.now(tz="Asia/Seoul")
+    last = mp.index[-1]
+    last_sig = n - 2 if (last.year, last.month) == (now_kst.year, now_kst.month) else n - 1
     recent_positions = []
     for i in range(3):
-        idx = n - 1 - i
+        idx = last_sig - i
         if idx < 0:
             break
         recent_positions.append((mp.index[idx], fn(mp, idx, ctx) or {}))
     return {"equity": equity, "mret": mr, "cagr": cagr, "mdd": mdd,
-            "sharpe": sharpe, "current": fn(mp, n - 1, ctx) or {},
+            "sharpe": sharpe,
+            "current": (fn(mp, last_sig, ctx) or {}) if last_sig >= 0 else {},
             "recent_positions": recent_positions,
             "held": pd.Series(held, index=dates, dtype=object)}
 
 
 # 결과 딕셔너리 구조(backtest()의 반환 키)가 바뀌면 이 값을 올려서
 # st.cache_data에 남아있는 구버전 캐시를 무효화한다.
-TAA_RESULTS_VERSION = 4
+TAA_RESULTS_VERSION = 5
 
 
 @st.cache_data(ttl=60 * 60 * 4)
@@ -1542,7 +1549,8 @@ with tab2:
 
 # =====================  동적자산배분  ======================================
 with tab3:
-    st.caption("모멘텀 기반 월별 리밸런싱 · 백테스트는 사용 ETF가 모두 상장된 이후 구간만 계산됩니다.")
+    st.caption("모멘텀 기반 월별 리밸런싱 · 백테스트는 사용 ETF가 모두 상장된 이후 구간만 계산됩니다. "
+               "현재 포지션은 전월 말 종가로 확정되며 다음 달 1일까지 바뀌지 않습니다.")
 
     # [1] 버튼 없이 자동 계산. 미계산 상태면 spinner 표시 후 실행 (캐시 있으면 즉시)
     if st.session_state.taa_results is None:
