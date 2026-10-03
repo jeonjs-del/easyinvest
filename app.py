@@ -913,6 +913,37 @@ def _ret(s, t, k):
     return None if (pd.isna(a) or pd.isna(b) or b == 0) else a / b - 1.0
 
 
+def _month_diff(a, b):
+    return (b.year - a.year) * 12 + (b.month - a.month)
+
+
+def _mdd_detail(mr):
+    """월간 수익률 시리즈 → MDD 구간(전고점·저점·회복월). 월말 기준이라 월중 낙폭은 안 잡힌다.
+    첫 달부터 하락하는 경우도 잡히도록 시작 직전 월말을 1.0으로 두고 계산한다."""
+    if mr is None or len(mr) == 0:
+        return None
+    start = mr.index[0] - pd.offsets.MonthEnd(1)
+    eq = pd.concat([pd.Series([1.0], index=[start]), (1 + mr).cumprod()])
+    dd = eq / eq.cummax() - 1
+    trough = dd.idxmin()
+    if dd.loc[trough] >= 0:
+        return {"mdd": 0.0, "peak": None, "trough": None, "recovery": None}
+    peak = eq.loc[:trough].idxmax()
+    after = eq.loc[trough:]
+    rec = after[after >= eq.loc[peak]]
+    return {"mdd": float(dd.loc[trough]), "peak": peak, "trough": trough,
+            "recovery": rec.index[0] if len(rec) else None, "last": eq.index[-1]}
+
+
+def _ytd_stats(mr):
+    """올해 들어 현재까지의 누적 수익률과 그 구간의 MDD (연환산하지 않음)."""
+    year = pd.Timestamp.now(tz="Asia/Seoul").year
+    y = mr[mr.index.year == year] if mr is not None else None
+    if y is None or len(y) == 0:
+        return None, None
+    return float((1 + y).prod() - 1), _mdd_detail(y)["mdd"]
+
+
 def backtest(fn, mp, ctx):
     n = len(mp)
     rets, dates, held = [], [], []
@@ -1608,6 +1639,8 @@ with tab3:
                 "전략명": nm, "현재 포지션": pos_str(r.get("current") or {}),
                 "직전월 포지션": _prev_pos_str(r),
                 "CAGR": r.get("cagr"), "MDD": r.get("mdd"), "Sharpe": r.get("sharpe"),
+                "올해 수익률": _ytd_stats(r.get("mret"))[0],
+                "올해 MDD": _ytd_stats(r.get("mret"))[1],
             })
 
         if failed_strats:
@@ -1638,7 +1671,8 @@ with tab3:
             st.caption("전략명(행의 아무 칸)을 클릭하면 아래에 상세가 표시됩니다.")
             try:
                 st.dataframe(
-                    tdf.style.format({"CAGR": "{:+.1%}", "MDD": "{:.1%}", "Sharpe": "{:.2f}"},
+                    tdf.style.format({"CAGR": "{:+.1%}", "MDD": "{:.1%}", "Sharpe": "{:.2f}",
+                                      "올해 수익률": "{:+.1%}", "올해 MDD": "{:.1%}"},
                                      na_rep="—").apply(_hl_pick, axis=1),
                     use_container_width=True, hide_index=True,
                     height=min(60 + 35 * len(tdf), 600),
@@ -1674,7 +1708,28 @@ with tab3:
                 m3.metric("Sharpe", f"{r['sharpe']:.2f}")
                 m4.metric("현재 포지션", pos_str(r.get("current") or {}))
 
-                bt_start = r["equity"].index[0].strftime("%Y-%m")
+                ytd_ret, ytd_mdd = _ytd_stats(r["mret"])
+                md = _mdd_detail(r["mret"])
+                y1, y2, y3, y4 = st.columns(4)
+                y1.metric("올해 수익률", "—" if ytd_ret is None else f"{ytd_ret:+.1%}")
+                y2.metric("올해 MDD", "—" if ytd_mdd is None else f"{ytd_mdd:.1%}")
+                if md and md["peak"] is not None:
+                    y3.metric("MDD 발생 기간",
+                              f"{md['peak']:%Y-%m} ~ {md['trough']:%Y-%m}",
+                              f"{_month_diff(md['peak'], md['trough'])}개월 하락", delta_color="off")
+                    if md["recovery"] is not None:
+                        y4.metric("전고점 회복", f"{md['recovery']:%Y-%m}",
+                                  f"저점 후 {_month_diff(md['trough'], md['recovery'])}개월", delta_color="off")
+                    else:
+                        y4.metric("전고점 회복", "미회복",
+                                  f"저점 후 {_month_diff(md['trough'], md['last'])}개월 경과", delta_color="off")
+                else:
+                    y3.metric("MDD 발생 기간", "—")
+                    y4.metric("전고점 회복", "—")
+                st.caption("MDD 구간은 월말 기준 전고점 → 저점이며, 회복 기간은 저점 이후 전고점을 "
+                           "다시 넘어선 첫 월말까지의 개월 수입니다. 올해 수익률은 연환산하지 않은 누적값입니다.")
+
+                bt_start =r["equity"].index[0].strftime("%Y-%m")
                 bt_end = r["equity"].index[-1].strftime("%Y-%m")
                 note = _STRAT_DATA_NOTES.get(pick)
                 st.caption(f"백테스트 구간: {bt_start} ~ {bt_end}"
