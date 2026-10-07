@@ -15,6 +15,10 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
   파일에 있다(1300줄+, 대용량 단일 파일 — 새 탭도 이 파일에 이어서 추가하는 게 기존 관례).
 - `strategies.py` — 동적자산배분 17개 전략. `STRATEGIES` dict(표시명→함수), 각 전략은
   `strat_*(mp, t, ctx) -> {티커: 비중}` 형태.
+- `wealth.py` — 은퇴 탭(총자산·경제적 자유)의 순수 계산 로직(금액 표시, 문서 정규화, 확정 종가
+  선택, 실거래가 파싱·매칭, 자산 기록, 은퇴 계산). Streamlit·네트워크 비의존 — 화면/저장/외부
+  조회는 `app.py`의 `_render_wealth_tab` 등이 맡는다. 은퇴 탭 계산을 고칠 땐 여기에 두고
+  `tests/test_wealth.py`에 케이스를 추가할 것.
 - `lwc_local.py` — `streamlit-lightweight-charts-ntf` 패치 래퍼(줌 상태 복원 + dblclick
   지원). 건드릴 일 거의 없음.
 - `scanner/` — 오프라인 배치 스캐너(로컬에서만 수동 실행, Cloud에서는 실행 안 됨):
@@ -29,6 +33,10 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
   재계산하지 않는다. git에 커밋해야 Cloud에 반영됨.
 - `tests/test_calibration.py` — 추세추종 신호 계산을 원사이트 공개 수치와 대조하는
   캘리브레이션 테스트(unittest, 실가격 네트워크 조회 필요, 로컬 전용, CI에는 없음).
+- `tests/test_wealth.py` — 은퇴 탭 계산 로직 검증(unittest, 오프라인, 수 ms).
+- `wealth.json` — 은퇴 탭 자산 데이터의 로컬 폴백. **개인 자산 정보라 `.gitignore`에 등록돼
+  있고 커밋 금지**(이 저장소는 공개 저장소다). 주소·금액 같은 개인 값을 소스·테스트·문서에
+  하드코딩하지 말 것.
 - `watchlist.json`, `ma_tab_indices.json`, `ma_tab_periods.json` — Gist 미설정 시 로컬
   폴백 저장 파일. Cloud는 재시작마다 파일시스템이 초기화되므로 이것만으로는 영구저장 안 됨.
 - `.streamlit/secrets.toml` — Gist 토큰 등 비밀값(`.gitignore`에 등록, 커밋 금지).
@@ -52,7 +60,8 @@ python scanner/seasonality_scan.py
 
 테스트:
 ```
-python -m unittest tests.test_calibration -v
+python -m unittest tests.test_calibration -v   # 네트워크 필요
+python -m unittest tests.test_wealth -v        # 오프라인
 ```
 
 ## 4. 탭 구성
@@ -66,6 +75,39 @@ python -m unittest tests.test_calibration -v
    가능(Gist 저장).
 7. **코인** — 하위탭 3개: 랭킹(CoinGecko 시세 + 다중소스 과거일봉으로 RS 계산) · 글로벌
    24-7(Hyperliquid `xyz` 퍼프 DEX의 24시간 거래 전통자산) · 온체인(미구현, "준비 중").
+8. **은퇴** — 총자산·부채·순자산 요약, 부동산(국토교통부 실거래가 자동 반영), 금융자산
+   5항목(예금·퇴직연금·개인연금·주식·암호화폐, 항목별 현금+보유 종목), 자산 변화(월말 기록·
+   월별/연별 추이), 경제적 자유 계산기, 데이터 내보내기·가져오기. 각 구역은 접힌 expander.
+
+### 은퇴 탭 규칙 (바꾸기 전에 읽을 것)
+- **금액 단위**: 내부 계산·저장은 전부 원, 입력칸만 만원. 입력→저장은
+  `wealth.apply_man_input`을 거친다(입력이 저장값과 같은 만원이면 저장값을 그대로 유지해
+  변환이 반복 적용되지 않게 함). 표시는 `wealth.format_krw`(1억원 이상 억원, 미만 만원).
+- **저장**: Gist의 `wealth.json`(비공개 Gist) + 로컬 `wealth.json` 폴백. 값이 바뀌면 즉시
+  저장한다. `load_wealth`는 관심목록과 달리 Gist 조회 실패 시 기본값으로 넘어가지 않고 탭을
+  열지 않는다 — 빈 화면에서 저장해 실제 데이터를 덮어쓰는 사고 방지. 문서에 없는 키만
+  기본값으로 채우고(`wealth.normalize_doc`) 사용자가 넣은 0·빈 목록은 그대로 둔다.
+- **입력칸 key**: 전부 `w{rev}_...` 형태. 화면 밖에서 값이 바뀌는 경우(실거래가 반영, 가져오기,
+  종목 추가)엔 `wealth_rev`를 올려 입력칸을 새 값으로 다시 만든다. expander key는 고정이라
+  라벨의 요약 금액이 바뀌어도 접힘 상태가 유지된다.
+- **종목 가격**: 실시간이 아니라 한국 시간 기준 전일까지 마감된 일봉의 원본 종가(`Close`,
+  수정주가 아님). 진행 중인 봉 제외 기준은 국내=한국 당일, 미국=한국 07시 이전이면 전날 봉도
+  제외, 코인=UTC 당일. 달러 종목은 종가 기준일 이전의 가장 최근 확정 USD/KRW로 환산.
+  조회 실패 시 문서의 `last_quotes`(마지막 정상 시세)로 평가하되 stale로 표시하고, stale·
+  평가 미완료가 하나라도 있으면 현재 금액 기록 저장을 막는다.
+- **암호화폐 allowlist**: `wealth.CRYPTO_CATALOG`. HYPE는 Yahoo 코드가 `HYPE32196-USD`다
+  (`HYPE-USD`는 다른 자산). 코인을 추가할 땐 Yahoo 일별 응답을 직접 확인하고 넣을 것.
+- **자산 기록**: 저장 시점의 금액 숫자 4개(부동산·금융자산·부동산 부채·금융 부채)를 그대로
+  보관한다. 종목 목록으로 과거를 재평가하지 않고, 빈 기간을 추정해 채우지 않는다.
+- **실거래가**: `secrets`의 `MOLIT_SERVICE_KEY`(최상위 키)가 있어야 동작. 최근 12개월을
+  월별로 조회(일별 캐시)해 단지·법정동·전용면적 ±1㎡ 매칭, 취소·미래 거래 제외, 최근 계약일의
+  중앙값. 취득일·평가 기준일보다 이전 거래로는 되돌리지 않고, 한 달이라도 조회에 실패하면
+  기존 평가액을 유지한다. **요청 예외 메시지에는 인증키가 든 URL이 들어 있으니 그대로
+  `print`하지 말 것**(`_molit_month`가 예외 종류·상태코드만 남기는 이유).
+- **잠금**: `secrets`의 `[wealth] password`가 있으면 비밀번호를 물어본다. 없으면 누구나 볼 수
+  있다는 안내만 띄운다.
+- **미검증/미구현**: 실거래가 조회는 인증키가 없어 실제 응답으로는 검증하지 못했다(파서는
+  합성 XML로만 테스트). "화면이 열린 동안 주기적 재조회"는 없고 화면이 다시 그려질 때만 확인한다.
 
 ## 5. 데이터 소스 & 함정 (반드시 읽을 것)
 - **FinanceDataReader** — 국내/미국 주식·ETF·지수 기본 소스.

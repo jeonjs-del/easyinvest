@@ -18,6 +18,7 @@ streamlit run app.py
 - **관심목록**: 등록 종목을 선택 기간(1일~1년) 수익률로 순위화. "디폴트"는 전세계 주요 지수 순위.
 - **동적자산배분**: 15개 TAA 전략의 현재 포지션·CAGR·MDD·Sharpe 목록 + 전략 상세(누적수익률 vs SPY, 연월별 히트맵).
 - **프리미엄**: 김치프리미엄(업비트 BTC vs 코인베이스 BTC × USD/KRW) · 금치프리미엄(ACE KRX금현물 ETF vs GLD × USD/KRW) 실시간 카드 + 최대 3년 시계열 차트.
+- **은퇴**: 총자산(부동산 + 예금·퇴직연금·개인연금·주식·암호화폐)·부채·순자산 요약, 국토교통부 실거래가 기반 부동산 평가, 월말 자산 기록과 월별·연별 추이, 경제적 자유 계산기. 자산 데이터는 비공개 Gist(`wealth.json`)에 저장되며, `secrets.toml`의 `[wealth] password`로 탭을 잠글 수 있습니다. 계산 로직은 `wealth.py`, 검증은 `python -m unittest tests.test_wealth`.
 
 ## 동적자산배분 15개 전략
 BAA 공격형/중도형, 변형·오리지널·가속·종합 듀얼모멘텀, VAA, HAA, DAA, PAA, LAA, RAA, NLX HAA, GTAA, Novell 채권. 규칙은 `strategies.py` 상단 주석과 각 함수 참고. 규칙을 바꾸려면 해당 `strat_*` 함수만 수정하면 됩니다.

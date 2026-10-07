@@ -24,3 +24,7 @@ Thumbs.db
 
 # Claude Code memory (project-local)
 .claude/
+
+# 은퇴 탭 개인 자산 데이터(로컬 폴백) ? 커밋 금지
+wealth.json
+wealth_*.json

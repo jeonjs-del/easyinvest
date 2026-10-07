@@ -4,12 +4,15 @@
 실행:  streamlit run app.py   (같은 폴더에 strategies.py 필요)
 """
 import contextlib
+import hmac
 import json
 import math
 import os
+import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
@@ -21,6 +24,7 @@ import yfinance as yf
 # 로컬 패치 래퍼: 줌 상태 복원 + dblclick 지원
 from lwc_local import renderLightweightCharts
 
+import wealth as W
 from strategies import (STRATEGIES, TAA_TICKERS, augment_panel,
                          VOLDM_TICKERS, VOLDM_ASSET_META, voldm_source_type)
 
@@ -45,6 +49,10 @@ RET_COLOR_CAP = 0.30  # 수익률 색상 진하기의 절대값 상한 (±30%, �
 MA_TAB_INDICES_FILE = "ma_tab_indices.json"
 MA_TAB_INDICES_GIST_FILENAME = "ma_tab_indices.json"
 MA_TAB_PERIODS_FILE = "ma_tab_periods.json"
+# 은퇴 탭 자산 데이터. 개인 자산이라 로컬 폴백 파일은 .gitignore에 등록돼 있다(커밋 금지).
+WEALTH_FILE = "wealth.json"
+WEALTH_GIST_FILENAME = "wealth.json"
+MOLIT_APT_TRADE_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
 MA_TAB_PERIODS_GIST_FILENAME = "ma_tab_periods.json"
 # 심볼은 scanner/seasonality_scan.py 재스캔 때와 별개로 이 자리에서 직접 fdr.DataReader로
 # 확인한 것 — NDX(나스닥100)·US500·KS11·KQ11은 FDR이 그대로 지원하고, BTCUSD는
@@ -1209,6 +1217,617 @@ def _krw_abbrev(x):
 
 
 # ============================================================================
+#  은퇴 탭 (총자산 · 경제적 자유) — 계산은 wealth.py, 여기는 저장·외부조회·화면
+# ============================================================================
+def load_wealth():
+    """(doc, mode, error) 반환. 관심목록과 달리 조회 실패 시 기본값으로 넘어가지 않고 error를
+    돌려준다 — 빈 화면을 열어 둔 채 저장해서 실제 자산 데이터를 덮어쓰는 사고를 막기 위해서다."""
+    local = None
+    if os.path.exists(WEALTH_FILE):
+        try:
+            with open(WEALTH_FILE, encoding="utf-8") as f:
+                local = json.load(f)
+        except Exception as e:
+            return None, "local", f"로컬 저장 파일({WEALTH_FILE})을 읽지 못했습니다: {type(e).__name__}"
+    if _gist_configured():
+        token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
+        try:
+            content = _gist_fetch_content(token, gist_id, WEALTH_GIST_FILENAME)
+        except Exception as e:
+            print(f"[wealth] Gist 조회 실패: {type(e).__name__}")
+            return None, "gist", "저장소(Gist) 조회에 실패했습니다."
+        if content and content.strip():
+            try:
+                return W.normalize_doc(json.loads(content)), "gist", None
+            except Exception:
+                return None, "gist", "저장된 데이터 형식이 올바르지 않습니다."
+        # Gist에 아직 저장된 적 없음 → 로컬 파일이 있으면 그걸 초기값으로 쓴다
+        return W.normalize_doc(local), "gist", None
+    return W.normalize_doc(local), "local", None
+
+
+def save_wealth(doc, mode):
+    """저장 성공 여부 반환. 자산 데이터는 저장 실패를 조용히 넘기지 않는다."""
+    body = json.dumps(doc, ensure_ascii=False, indent=2)
+    if mode == "gist":
+        try:
+            token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
+            r = requests.patch(f"https://api.github.com/gists/{gist_id}",
+                               headers=_gist_headers(token),
+                               json={"files": {WEALTH_GIST_FILENAME: {"content": body}}}, timeout=15)
+            r.raise_for_status()
+            _gist_fetch_content.clear()
+            return True
+        except Exception as e:
+            print(f"[wealth] Gist 저장 실패: {type(e).__name__}")
+            return False
+    try:
+        with open(WEALTH_FILE, "w", encoding="utf-8") as f:
+            f.write(body)
+        return True
+    except Exception as e:
+        print(f"[wealth] 로컬 저장 실패: {type(e).__name__}: {e}")
+        return False
+
+
+def _wealth_secret(section, key):
+    try:
+        v = st.secrets.get(section)
+        return (v.get(key) if hasattr(v, "get") else v) or ""
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def get_kr_etf_options():
+    try:
+        df = fdr.StockListing("ETF/KR")
+        return sorted(f"{n} ({str(c).zfill(6)})" for c, n in zip(df["Symbol"], df["Name"]))
+    except Exception as e:
+        print(f"[wealth] ETF 목록 조회 실패: {type(e).__name__}: {e}")
+        return []
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def _wealth_price_rows(market, symbol):
+    """최근 일봉의 (날짜, 원본 종가) 목록. 보유수량 평가용이라 수정주가(Adj Close)가 아니라
+    Close를 쓴다. allowlist(형식 검증)를 통과한 심볼만 조회한다. 실패 시 None."""
+    if not W.valid_symbol(market, symbol):
+        return None
+    try:
+        if market == "CRYPTO":
+            df = yf.download(W.CRYPTO_CATALOG[symbol][1], period="1mo",
+                             auto_adjust=False, progress=False)
+            close = df["Close"] if not df.empty else pd.Series(dtype=float)
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+        else:
+            start = (datetime.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+            close = fdr.DataReader(symbol, start)["Close"]
+    except Exception as e:
+        print(f"[wealth] 가격 조회 실패: {market}:{symbol} {type(e).__name__}: {e}")
+        return None
+    rows = [(d.date(), float(c)) for d, c in close.items()]
+    return rows or None
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def _wealth_fx_rows():
+    try:
+        start = (datetime.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+        close = fdr.DataReader("USD/KRW", start)["Close"]
+        return [(d.date(), float(c)) for d, c in close.items()]
+    except Exception as e:
+        print(f"[wealth] 환율 조회 실패: {type(e).__name__}: {e}")
+        return []
+
+
+def _wealth_quotes(doc):
+    """보유 종목 전체의 확정 종가 시세. (quotes, 저장된 정상 시세가 갱신됐는지)."""
+    now_kst = pd.Timestamp.now(tz="Asia/Seoul")
+    today = now_kst.date()
+    # 진행 중인 봉 제외: 국내는 한국 당일, 미국은 한국 시각 오전 7시 전이면 전날 봉도 아직
+    # 장중(미 동부 16시 마감 = 한국 05~06시), 코인은 UTC 일봉이라 UTC 당일.
+    cutoffs = {"KR": today, "US": (now_kst - pd.Timedelta(hours=7)).date(),
+               "CRYPTO": pd.Timestamp.now(tz="UTC").date()}
+    keys = {(h["market"], h["symbol"])
+            for sec, _, kind in W.SECTIONS if kind
+            for h in doc["financial"][sec]["holdings"]}
+    if not keys:
+        return {}, False
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rows_by_key = dict(zip(keys, ex.map(lambda k: _wealth_price_rows(*k), keys)))
+    fx_rows = _wealth_fx_rows() if any(m != "KR" for m, _ in keys) else []
+    quotes, changed = {}, False
+    for (market, symbol), rows in rows_by_key.items():
+        qk = W.quote_key(market, symbol)
+        currency = "KRW" if market == "KR" else "USD"
+        picked = W.pick_confirmed_close(rows or [], cutoffs[market])
+        fx = W.pick_fx(fx_rows, picked[0], today) if (picked and currency == "USD") else None
+        if picked and (currency == "KRW" or fx):
+            q = {"close": picked[1], "date": picked[0].isoformat(), "currency": currency,
+                 "fx": fx[1] if fx else None, "fx_date": fx[0].isoformat() if fx else None}
+            if doc["last_quotes"].get(qk) != q:
+                doc["last_quotes"][qk] = dict(q)
+                changed = True
+            quotes[qk] = dict(q, status="ok")
+        elif qk in doc["last_quotes"]:
+            quotes[qk] = dict(doc["last_quotes"][qk], status="stale")
+        else:
+            quotes[qk] = {"close": picked[1] if picked else None,
+                          "date": picked[0].isoformat() if picked else None,
+                          "currency": currency, "fx": None, "fx_date": None, "status": "missing"}
+    return quotes, changed
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def _molit_month(lawd_cd, ym, _day):
+    """국토교통부 아파트 매매 실거래가 한 달치(일별 캐시). 실패는 예외로 올려 캐시에 남기지 않는다.
+    인증키는 인자로 받지 않고(캐시 키·로그 노출 방지) 여기서만 읽으며, 요청 예외 메시지에는
+    키가 든 URL이 들어 있으므로 그대로 출력하지 않는다."""
+    key = _wealth_secret("MOLIT_SERVICE_KEY", "")
+    trades, page = [], 1
+    while True:
+        try:
+            r = requests.get(MOLIT_APT_TRADE_URL, timeout=20, params={
+                "serviceKey": unquote(key), "LAWD_CD": lawd_cd, "DEAL_YMD": ym,
+                "pageNo": page, "numOfRows": 1000})
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"{ym} 요청 실패({type(e).__name__})") from None
+        if r.status_code != 200:
+            raise RuntimeError(f"{ym} HTTP {r.status_code}")
+        got, err = W.parse_molit_xml(r.text)
+        if err:
+            raise RuntimeError(f"{ym} {err}")
+        trades += got
+        if len(got) < 1000 or page >= 5:
+            return trades
+        page += 1
+
+
+def _wealth_property_trades(prop, today):
+    """최근 12개월 실거래 매칭 결과. {'configured','match','errors'}"""
+    if not _wealth_secret("MOLIT_SERVICE_KEY", ""):
+        return {"configured": False, "match": None, "errors": []}
+    lawd = str(prop.get("lawd_cd") or "").strip()
+    if not (re.fullmatch(r"\d{5}", lawd) and prop.get("trade_complex") and prop.get("dong")
+            and float(prop.get("area_m2") or 0) > 0):
+        return {"configured": True, "match": None,
+                "errors": ["지역코드(5자리)·실거래가 조회 단지명·법정동·전용면적을 입력해야 조회합니다."]}
+
+    def _one(ym):
+        try:
+            return _molit_month(lawd, ym, today.isoformat()), None
+        except Exception as e:
+            print(f"[wealth] 실거래가 조회 실패: {e}")
+            return [], str(e)
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(_one, W.recent_months(today, 12)))
+    trades = [t for got, _ in results for t in got]
+    errors = [e for _, e in results if e]
+    match = W.match_trades(trades, prop["trade_complex"], prop["dong"], prop["area_m2"], today)
+    return {"configured": True, "match": match, "errors": errors}
+
+
+def _render_wealth_tab():
+    fmt = W.format_krw
+    st.caption("총자산 · 경제적 자유 — 다른 탭의 관심목록과는 별도로 관리하는 자산 목록입니다. "
+               "금액은 만원 단위로 입력하고 원 단위로 저장합니다. 바꾼 값은 바로 저장됩니다.")
+
+    pw = _wealth_secret("wealth", "password")
+    if pw and not st.session_state.get("wealth_unlocked"):
+        entered = st.text_input("은퇴 탭 비밀번호", type="password", key="wealth_pw")
+        if entered:
+            if hmac.compare_digest(entered.encode(), str(pw).encode()):
+                st.session_state.wealth_unlocked = True
+                st.rerun()
+            st.error("비밀번호가 맞지 않습니다.")
+        return
+
+    if "wealth_doc" not in st.session_state:
+        loaded, load_mode, load_err = load_wealth()
+        if load_err:
+            st.error(f"{load_err} 기존 데이터를 덮어쓰지 않도록 이 탭을 열지 않았습니다.")
+            if st.button("다시 시도", key="wealth_retry"):
+                _gist_fetch_content.clear()
+                st.rerun()
+            return
+        st.session_state.wealth_doc, st.session_state.wealth_mode = loaded, load_mode
+        st.session_state.wealth_rev = 0
+    doc, mode = st.session_state.wealth_doc, st.session_state.wealth_mode
+    rev = st.session_state.wealth_rev
+    prop, fin, fire = doc["property"], doc["financial"], doc["fire"]
+    today = pd.Timestamp.now(tz="Asia/Seoul").date()
+
+    def K(name):
+        # 가져오기·실거래가 반영처럼 화면 밖에서 값이 바뀌면 rev를 올려 입력칸을 새 값으로 다시 만든다
+        return f"w{rev}_{name}"
+
+    def commit(reset_inputs=False):
+        ok = save_wealth(doc, mode)
+        st.session_state.wealth_save_err = not ok
+        st.session_state.wealth_saved_at = pd.Timestamp.now(tz="Asia/Seoul").strftime("%H:%M:%S")
+        if reset_inputs:
+            st.session_state.wealth_rev = rev + 1
+        st.rerun()
+
+    def won_input(label, name, won, help=None):
+        man = st.number_input(f"{label} (만원)", min_value=0, value=W.won_to_man(won), step=100,
+                              key=K(name), help=help)
+        st.caption(W.korean_amount(W.man_to_won(man)))
+        return W.apply_man_input(won, man)
+
+    if not pw:
+        st.caption("🔓 비밀번호 미설정 — 이 앱 주소를 아는 사람은 누구나 이 탭을 보고 수정할 수 있습니다. "
+                   "secrets에 `[wealth] password = \"...\"`를 넣으면 잠깁니다.")
+    if st.session_state.get("wealth_save_err"):
+        st.error("저장에 실패했습니다. 화면의 값이 저장소에 반영되지 않았을 수 있습니다.")
+    elif st.session_state.get("wealth_saved_at"):
+        st.caption(f"💾 마지막 저장 {st.session_state.wealth_saved_at}"
+                   + (" · Gist" if mode == "gist" else " · 이 기기(로컬 파일)"))
+
+    # ---- 시세·실거래가 ----------------------------------------------------
+    quotes, quotes_changed = _wealth_quotes(doc)
+    trade_info = _wealth_property_trades(prop, today)
+    tm = trade_info["match"]
+    if (tm and not trade_info["errors"]
+            and W.should_apply_trade(tm["date"], prop.get("acquired_on"), prop.get("value_asof"))
+            and (tm["price"] != int(prop.get("value") or 0)
+                 or tm["date"].isoformat() != prop.get("value_asof"))):
+        prop.update(value=tm["price"], value_asof=tm["date"].isoformat(), value_source="molit")
+        commit(reset_inputs=True)
+    if quotes_changed:
+        save_wealth(doc, mode)   # 장애 때 쓸 정상 시세 보관(종목당 하루 한 번꼴)
+
+    s = W.summarize(doc, quotes)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("총자산", fmt(s["total"]))
+    c2.metric("총부채", fmt(s["debt"]))
+    c3.metric("순자산", fmt(s["net"]))
+    c4.metric("금융 순자산", fmt(s["financial_net"]))
+    if s["status"] == "incomplete":
+        st.warning("가격 또는 환율을 받지 못한 종목이 있어 평가가 미완료입니다. 해당 종목은 합계에서 "
+                   "빠져 있으며, 현재 금액 기록 저장은 막혀 있습니다.")
+    elif s["status"] == "stale":
+        st.warning("일부 종목은 시세 조회에 실패해 이전에 저장된 가격으로 평가했습니다(stale). "
+                   "현재 금액 기록 저장은 막혀 있습니다.")
+
+    dirty = False
+
+    # ---- 부동산 -----------------------------------------------------------
+    with st.expander(f"🏠 부동산 · 평가액 {fmt(s['property'])} · 부채 {fmt(s['property_debt'])}",
+                     key="wealth_exp_property"):
+        new = dict(prop)
+        a1, a2 = st.columns(2)
+        new["address"] = a1.text_input("주소", prop.get("address") or "", key=K("p_address"))
+        new["complex"] = a2.text_input("단지", prop.get("complex") or "", key=K("p_complex"))
+        b1, b2, b3, b4 = st.columns(4)
+        new["pyeong"] = b1.text_input("평형", str(prop.get("pyeong") or ""), key=K("p_pyeong"))
+        new["area_m2"] = b2.number_input("전용면적 (㎡)", min_value=0.0, step=1.0, format="%.2f",
+                                          value=float(prop.get("area_m2") or 0), key=K("p_area"))
+        new["acquired_on"] = b3.date_input("취득일", W.to_date(prop.get("acquired_on")),
+                                            max_value=today, key=K("p_acq_on"))
+        new["value_asof"] = b4.date_input("평가 기준일", W.to_date(prop.get("value_asof")),
+                                           max_value=today, key=K("p_asof"))
+        m1, m2 = st.columns(2)
+        with m1:
+            new["acquired_price"] = won_input("취득금액", "p_acq_price", prop.get("acquired_price"))
+            new["mortgage"] = won_input("담보대출", "p_mortgage", prop.get("mortgage"))
+        with m2:
+            new["value"] = won_input("현재 평가액", "p_value", prop.get("value"))
+            new["private_loan"] = won_input("사적대출", "p_private", prop.get("private_loan"))
+        for dk in ("acquired_on", "value_asof"):
+            new[dk] = new[dk].isoformat() if new[dk] else None
+
+        diff, pct, cagr = W.property_change(new["acquired_price"], new["value"],
+                                             new["acquired_on"], new["value_asof"])
+        g1, g2, g3 = st.columns(3)
+        g1.metric("취득 대비 증감액", "계산 불가" if diff is None else fmt(diff),
+                  None if pct is None else f"{pct:+.2f}%")
+        g2.metric("증감률", "계산 불가" if pct is None else f"{pct:+.2f}%")
+        g3.metric("CAGR", "계산 불가" if cagr is None else f"{cagr:+.2f}%")
+
+        st.markdown("###### 국토교통부 실거래가")
+        t1, t2, t3 = st.columns(3)
+        new["trade_complex"] = t1.text_input("실거래가 조회 단지명", prop.get("trade_complex") or "",
+                                              key=K("p_trade_complex"))
+        new["dong"] = t2.text_input("법정동", prop.get("dong") or "", key=K("p_dong"))
+        new["lawd_cd"] = t3.text_input("지역코드(5자리)", str(prop.get("lawd_cd") or ""),
+                                        key=K("p_lawd")).strip()
+        if not trade_info["configured"]:
+            st.info("실거래가 자동 조회가 꺼져 있습니다 — secrets에 `MOLIT_SERVICE_KEY`(공공데이터포털 "
+                    "아파트 매매 실거래가 인증키)를 넣으면 최근 12개월 거래로 평가액을 갱신합니다.")
+        else:
+            if trade_info["errors"]:
+                st.warning("실거래가 조회가 일부 실패해 기존 평가액을 유지했습니다: "
+                           + " / ".join(trade_info["errors"][:3]))
+            if tm:
+                floors = ", ".join(f"{t['floor']}층" for t in tm["trades"] if t["floor"])
+                areas = ", ".join(sorted({f"{t['area']:g}㎡" for t in tm["trades"]}))
+                st.caption(
+                    f"출처: 국토교통부 아파트 매매 실거래가 · 계약일 {tm['date']:%Y-%m-%d} · 전용 {areas}"
+                    f" · {floors or '층 정보 없음'} · 매매가 {fmt(tm['price'])}"
+                    + (f" (같은 날 {tm['count']}건의 중앙값)" if tm["count"] > 1 else "")
+                    + " — 같은 단지·면적의 최근 거래이며, 개별 동·호수의 감정가와는 다를 수 있습니다.")
+            elif not trade_info["errors"]:
+                st.caption("최근 12개월 안에 조건(단지·법정동·전용면적 ±1㎡)에 맞는 거래가 없어 "
+                           "기존 평가액을 유지합니다.")
+        if prop.get("value_source") == "molit":
+            st.caption("현재 평가액은 실거래가로 자동 반영된 값입니다. 직접 고치면 수동 입력값으로 바뀝니다.")
+
+        if new != prop:
+            asof_moved = False
+            if new["value"] != prop.get("value"):
+                new["value_source"] = "manual"
+                if new["value_asof"] == prop.get("value_asof"):
+                    new["value_asof"] = today.isoformat()   # 평가액만 고쳤으면 기준일은 오늘
+                    asof_moved = True
+            doc["property"] = new
+            commit(reset_inputs=asof_moved)
+
+    # ---- 금융자산 ---------------------------------------------------------
+    with st.expander(f"💵 금융자산 · 평가액 {fmt(s['financial'])} · 부채 {fmt(s['financial_debt'])}",
+                     key="wealth_exp_financial"):
+        st.caption("현금 잔액과 종목 평가액은 겹치지 않게 입력하세요(종목으로 넣은 금액을 현금에 또 넣지 않기). "
+                   "종목 가격은 한국 시간 기준 전일까지 마감된 일봉의 실제 종가이며 실시간 시세가 아닙니다.")
+        for sec, title, kind in W.SECTIONS:
+            sub, sub_status = s["sections"][sec]
+            badge = {"ok": "", "stale": " · ⚠️ stale", "incomplete": " · ⚠️ 평가 미완료"}[sub_status]
+            with st.expander(f"{title} · 소계 {fmt(sub)}{badge}", key=f"wealth_exp_{sec}"):
+                section = fin[sec]
+                cash = won_input("잔액" if kind is None else "현금·미투자 잔액", f"{sec}_cash",
+                                 section.get("cash"))
+                if cash != int(section.get("cash") or 0):
+                    section["cash"] = cash
+                    dirty = True
+                if kind is None:
+                    continue
+
+                for h in list(section["holdings"]):
+                    hid = f"{sec}_{h['market']}_{h['symbol']}"
+                    q = quotes.get(W.quote_key(h["market"], h["symbol"])) or {}
+                    val = W.value_holding(h.get("qty") or 0, q)
+                    h1, h2, h3, h4 = st.columns([4, 3, 4, 1])
+                    h1.markdown(f"**{h.get('name') or h['symbol']}**  \n`{h['symbol']}`")
+                    qty = h2.number_input("수량", min_value=0.0, value=float(h.get("qty") or 0),
+                                          format="%.8g", key=K(f"{hid}_qty"))
+                    if q.get("close") is None:
+                        price_txt = "종가 없음"
+                    elif q["currency"] == "USD":
+                        price_txt = (f"${q['close']:,.4g} ({q['date']})"
+                                     + (f" · 환율 {q['fx']:,.2f} ({q['fx_date']})" if q.get("fx") else " · 환율 없음"))
+                    else:
+                        price_txt = f"{q['close']:,.0f}원 ({q['date']})"
+                    state = {"ok": "", "stale": " · ⚠️ stale(저장된 가격)", "missing": " · ⚠️ 평가 미완료"}[
+                        q.get("status", "missing")]
+                    h3.markdown(f"{price_txt}{state}  \n평가액 **{fmt(val) if val is not None else '—'}**")
+                    if h4.button("삭제", key=K(f"{hid}_del")):
+                        section["holdings"] = [x for x in section["holdings"] if x is not h]
+                        dirty = True
+                    elif abs(qty - float(h.get("qty") or 0)) > 1e-12:
+                        h["qty"] = qty
+                        dirty = True
+
+                st.markdown("###### 종목 추가")
+                add_market, add_symbol, add_name = None, None, None
+                if kind == "crypto":
+                    pick = st.selectbox(
+                        "코인 검색", list(W.CRYPTO_CATALOG), index=None, key=K(f"{sec}_pick"),
+                        placeholder="코인 선택 (한글명·심볼 검색)",
+                        format_func=lambda c: f"{W.CRYPTO_CATALOG[c][0]} ({c})")
+                    if pick:
+                        add_market, add_symbol = "CRYPTO", pick
+                        add_name = f"{W.CRYPTO_CATALOG[pick][0]} ({pick})"
+                else:
+                    us = False
+                    if kind == "stock":
+                        us = st.radio("시장", ["국내", "미국"], horizontal=True,
+                                      key=K(f"{sec}_mkt")) == "미국"
+                    if us:
+                        tkr = st.text_input("미국 티커", key=K(f"{sec}_us"),
+                                            placeholder="예: SPY, AAPL").strip().upper()
+                        if tkr:
+                            add_market, add_symbol, add_name = "US", tkr, tkr
+                    else:
+                        options = get_kr_etf_options() if kind == "etf" else _stock_options
+                        pick = st.selectbox(
+                            "ETF 검색" if kind == "etf" else "종목·ETF 검색", options, index=None,
+                            key=K(f"{sec}_pick"), placeholder="이름·코드 검색")
+                        if pick:
+                            add_market = "KR"
+                            add_symbol = pick.rsplit("(", 1)[-1].rstrip(")")
+                            add_name = pick.rsplit(" (", 1)[0]
+                add_qty = st.number_input("수량", min_value=0.0, value=0.0, format="%.8g",
+                                          key=K(f"{sec}_addqty"))
+                if st.button("추가", key=K(f"{sec}_add")):
+                    if not add_symbol or not W.valid_symbol(add_market, add_symbol):
+                        st.error("종목을 선택(입력)하세요. 등록할 수 없는 심볼입니다.")
+                    elif add_qty <= 0:
+                        st.error("수량을 0보다 크게 입력하세요.")
+                    elif add_market == "US" and not _wealth_price_rows("US", add_symbol):
+                        st.error(f"'{add_symbol}' 가격을 조회할 수 없어 추가하지 않았습니다.")
+                    else:
+                        section["holdings"] = W.upsert_holding(
+                            section["holdings"], add_market, add_symbol, add_name, add_qty)
+                        commit(reset_inputs=True)
+
+        debt = won_input("금융 부채(신용대출·마이너스통장 등)", "fin_debt", fin.get("debt"))
+        if debt != int(fin.get("debt") or 0):
+            fin["debt"] = debt
+            dirty = True
+
+    # ---- 자산 변화 --------------------------------------------------------
+    records = doc["records"]
+    with st.expander(f"📈 자산 변화 · 기록 {len(records)}건"
+                     + (f" · 최근 {records[-1]['date']}" if records else ""),
+                     key="wealth_exp_records"):
+        st.caption("기록은 저장하는 순간의 금액 숫자를 그대로 보관합니다. 이후 종목·수량·시세·환율이 바뀌어도 "
+                   "과거 기록은 바뀌지 않고, 입력하지 않은 기간을 추정해 채우지 않습니다.")
+        blocked = s["status"] != "ok"
+
+        def record_now(d):
+            doc["records"] = W.upsert_record(records, W.make_record(
+                d, s["property"], s["financial"], s["property_debt"], s["financial_debt"]))
+            commit()
+
+        r1, r2 = st.columns(2)
+        with r1:
+            if st.button("오늘 자산 기록 저장", key=K("rec_today"), disabled=blocked):
+                record_now(today)
+        with r2:
+            months, (my, mm) = [], (today.year, today.month)
+            for _ in range(36):
+                months.append(f"{my}-{mm:02d}")
+                my, mm = (my - 1, 12) if mm == 1 else (my, mm - 1)
+            sel_month = st.selectbox("월말 기록할 월", months, index=1, key=K("rec_month"))
+            me = W.month_end(int(sel_month[:4]), int(sel_month[5:]))
+            future = not W.can_record_on(me, today)
+            if st.button("현재 금액으로 월말 기록 저장", key=K("rec_month_btn"),
+                         disabled=blocked or future):
+                record_now(me)
+            if future:
+                st.caption(f"{me:%Y-%m-%d}은 아직 오지 않은 날짜라 저장할 수 없습니다(월말부터 가능).")
+        if blocked:
+            st.caption("⚠️ 평가 미완료 또는 stale 자산이 있어 현재 금액 기록 저장이 막혀 있습니다.")
+
+        if records:
+            period = st.radio("단위", ["월별", "연별"], horizontal=True, key=K("rec_period"))
+            pts = W.period_last(records, "M" if period == "월별" else "Y")
+            totals = [W.record_totals(r) for _, r in pts]
+            big = max(abs(v) for t in totals for v in t.values()) >= W.EOK
+            unit, unit_label = (W.EOK, "억원") if big else (W.MAN, "만원")
+            rfig = go.Figure()
+            for name, field, color in (("총자산", "total", "#1971c2"), ("순자산", "net", "#2f9e44"),
+                                        ("부동산", "property", "#e8590c"), ("금융자산", "financial", "#9c36b5")):
+                rfig.add_trace(go.Scatter(
+                    x=[k for k, _ in pts], y=[t[field] / unit for t in totals], name=name,
+                    mode="lines+markers", line=dict(color=color),
+                    customdata=[fmt(t[field]) for t in totals],
+                    hovertemplate="%{x} · " + name + " %{customdata}<extra></extra>"))
+            rfig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0),
+                               legend=dict(orientation="h", y=1.12, x=0),
+                               yaxis=dict(ticksuffix=unit_label, tickformat=",.4~g"))
+            rfig.update_xaxes(type="category", fixedrange=True)
+            rfig.update_yaxes(fixedrange=True)
+            st.plotly_chart(rfig, use_container_width=True, key=K("rec_chart"),
+                            config={"scrollZoom": False, "displayModeBar": False})
+            st.dataframe(pd.DataFrame([
+                {"기록일": r["date"], "총자산": fmt(W.record_totals(r)["total"]),
+                 "순자산": fmt(W.record_totals(r)["net"]), "부동산": fmt(r["property"]),
+                 "금융자산": fmt(r["financial"]), "부동산 부채": fmt(r["property_debt"]),
+                 "금융 부채": fmt(r["financial_debt"])} for r in reversed(records)]),
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("저장된 기록이 없습니다.")
+
+        st.markdown("###### 과거 기록 추가·수정")
+        target = st.selectbox("대상", ["새 기록"] + [r["date"] for r in reversed(records)],
+                              key=K("rec_target"))
+        base = next((r for r in records if r["date"] == target), None)
+        tag = target if base else "new"
+        rec_date = st.date_input("기록일", W.to_date(base["date"]) if base else today,
+                                 max_value=today, key=K(f"rec_{tag}_date"), disabled=bool(base))
+        e1, e2 = st.columns(2)
+        with e1:
+            e_prop = won_input("부동산 평가액", f"rec_{tag}_prop", base["property"] if base else 0)
+            e_pdebt = won_input("부동산 부채", f"rec_{tag}_pdebt", base["property_debt"] if base else 0)
+        with e2:
+            e_fin = won_input("금융자산 총액", f"rec_{tag}_fin", base["financial"] if base else 0)
+            e_fdebt = won_input("금융 부채", f"rec_{tag}_fdebt", base["financial_debt"] if base else 0)
+        s1, s2 = st.columns(2)
+        if s1.button("기록 저장", key=K(f"rec_{tag}_save")):
+            doc["records"] = W.upsert_record(records, W.make_record(rec_date, e_prop, e_fin, e_pdebt, e_fdebt))
+            commit(reset_inputs=True)
+        if base and s2.button("이 기록 삭제", key=K(f"rec_{tag}_del")):
+            doc["records"] = W.delete_record(records, base["date"])
+            commit(reset_inputs=True)
+
+    # ---- 경제적 자유 계산기 -----------------------------------------------
+    start = s["financial_net"] if fire.get("start_override") is None else fire["start_override"]
+    f_years = int(fire.get("years") or 0)
+    f_asset = W.project_assets(start, fire.get("annual_saving") or 0, fire.get("inflation") or 0,
+                               f_years, fire.get("annual_return") or 0)
+    f_monthly = W.monthly_spend(f_asset, fire.get("withdraw_rate") or 0)
+    with st.expander(f"🏖 경제적 자유 계산기 · 은퇴 후 월 사용액 {fmt(f_monthly)}",
+                     key="wealth_exp_fire"):
+        nf = dict(fire)
+        use_override = st.checkbox("시작 금액 직접 입력", value=fire.get("start_override") is not None,
+                                   key=K("f_use_override"))
+        if use_override:
+            nf["start_override"] = won_input(
+                "시작 금융 순자산", "f_start",
+                fire["start_override"] if fire.get("start_override") is not None else max(s["financial_net"], 0))
+        else:
+            nf["start_override"] = None
+            st.caption(f"시작 금융 순자산: 현재 금융 순자산 {fmt(s['financial_net'])} (부동산 제외)")
+        i1, i2 = st.columns(2)
+        with i1:
+            nf["annual_saving"] = won_input("연간 저축액", "f_saving", fire.get("annual_saving"))
+            nf["years"] = st.number_input("은퇴까지 남은 연수", 0, 100, int(fire.get("years") or 0),
+                                          key=K("f_years"))
+            nf["annual_return"] = st.number_input("연 투자수익률 (%)", -50.0, 100.0,
+                                                  float(fire.get("annual_return") or 0), 0.5, key=K("f_ret"))
+        with i2:
+            nf["target_monthly"] = won_input("목표 월 생활비(현재 구매력)", "f_target",
+                                             fire.get("target_monthly"))
+            nf["inflation"] = st.number_input("물가상승률 = 저축 증가율 (%)", -10.0, 50.0,
+                                              float(fire.get("inflation") or 0), 0.5, key=K("f_inf"))
+            nf["withdraw_rate"] = st.number_input("연 인출률 (%)", 0.0, 100.0,
+                                                  float(fire.get("withdraw_rate") or 0), 0.5, key=K("f_wd"))
+
+        o1, o2, o3 = st.columns(3)
+        o1.metric(f"{f_years}년 후 은퇴 금융자산", fmt(f_asset))
+        o2.metric("은퇴 첫해 월 사용액", fmt(f_monthly))
+        o3.metric("현재 구매력 기준 월 사용액",
+                  fmt(W.real_value(f_monthly, fire.get("inflation") or 0, f_years)))
+        target = fire.get("target_monthly") or 0
+        if target > 0:
+            n = W.years_to_target(start, fire.get("annual_saving") or 0, fire.get("inflation") or 0,
+                                  fire.get("annual_return") or 0, fire.get("withdraw_rate") or 0, target)
+            if n == 0:
+                st.success(f"목표 월 생활비 {fmt(target)}: 지금 가능합니다.")
+            elif n is not None:
+                st.info(f"목표 월 생활비 {fmt(target)}: {n}년 후 가능합니다.")
+            else:
+                st.warning(f"목표 월 생활비 {fmt(target)}: 100년 내 도달할 수 없습니다.")
+        else:
+            st.caption("목표 월 생활비를 입력하면 도달 시점을 계산합니다.")
+        st.caption("연금 수령 가능 시점·중도인출 제한·세금·수수료는 반영하지 않은 별도 사항입니다. "
+                   "인출률(기본 4%)은 입력한 가정일 뿐이며 자산이 영구히 유지된다는 보장이 아닙니다.")
+        if nf != fire:
+            doc["fire"] = nf
+            dirty = True
+
+    # ---- 내보내기·가져오기 ------------------------------------------------
+    with st.expander("🗂 데이터 내보내기 · 가져오기", key="wealth_exp_io"):
+        st.download_button("현재 데이터 내보내기(JSON)", json.dumps(doc, ensure_ascii=False, indent=2),
+                           file_name=f"wealth_{today:%Y%m%d}.json", mime="application/json",
+                           key=K("io_export"))
+        up = st.file_uploader("가져올 JSON 파일(이 탭에서 내보낸 형식)", type="json", key=K("io_upload"))
+        if up is not None:
+            try:
+                incoming = json.loads(up.getvalue().decode("utf-8"))
+                if not isinstance(incoming, dict) or "financial" not in incoming:
+                    raise ValueError("형식 불일치")
+                imported = W.normalize_doc(incoming)
+            except Exception as e:
+                st.error(f"가져올 수 없는 파일입니다: {type(e).__name__}")
+            else:
+                isum = W.summarize(imported, {})
+                st.caption(f"가져올 내용 — 부동산 {fmt(isum['property'])} · 기록 {len(imported['records'])}건 · "
+                           "보유 종목 "
+                           f"{sum(len(imported['financial'][k]['holdings']) for k, _, kd in W.SECTIONS if kd)}개")
+                if st.button("현재 데이터를 이 파일로 교체", key=K("io_apply")):
+                    st.session_state.wealth_doc = imported
+                    doc = imported
+                    commit(reset_inputs=True)
+
+    if dirty:
+        commit()
+
+
+# ============================================================================
 _names_raw, _stock_options = get_krx_listings()
 # 지수 항목을 names dict에 병합 (캐시 결과를 직접 변경하지 않기 위해 복사)
 names = dict(_names_raw)
@@ -1245,8 +1864,8 @@ if st.session_state.storage_mode == "local":
 
 watchlist = st.session_state.watchlist
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수", "📏 이동평균", "🪙 코인"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수", "📏 이동평균", "🪙 코인", "🏖 은퇴"])
 
 # =====================  차트  ==============================================
 with tab1:
@@ -2779,3 +3398,7 @@ st.divider()
 st.caption("※ 규칙 기반 계산기이며 투자 자문이 아닙니다. "
            "배당 미반영 종가 기반이라 실제 성과와 차이가 날 수 있습니다. "
            "투자 판단과 책임은 본인에게 있습니다.")
+
+# =====================  은퇴 (총자산 · 경제적 자유)  ========================
+with tab8:
+    _render_wealth_tab()
