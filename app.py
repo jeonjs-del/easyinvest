@@ -1761,10 +1761,11 @@ def _render_wealth_tab():
     f_years = int(fire.get("years") or 0)
     f_asset = W.project_assets(start, fire.get("annual_saving") or 0, fire.get("inflation") or 0,
                                f_years, fire.get("annual_return") or 0)
-    f_monthly = W.monthly_spend(f_asset, fire.get("withdraw_rate") or 0)
+    f_monthly = W.monthly_spend(f_asset, fire.get("annual_return") or 0)
     with st.expander(f"🏖 경제적 자유 계산기 · 은퇴 후 월 사용액 {fmt(f_monthly)}",
                      key="wealth_exp_fire"):
         nf = dict(fire)
+        nf.pop("withdraw_rate", None)   # 인출률 입력을 없애기 전에 저장된 문서에 남아 있는 값
         use_override = st.checkbox("시작 금액 직접 입력", value=fire.get("start_override") is not None,
                                    key=K("f_use_override"))
         if use_override:
@@ -1786,18 +1787,16 @@ def _render_wealth_tab():
                                              fire.get("target_monthly"))
             nf["inflation"] = st.number_input("물가상승률 = 저축 증가율 (%)", -10.0, 50.0,
                                               float(fire.get("inflation") or 0), 0.5, key=K("f_inf"))
-            nf["withdraw_rate"] = st.number_input("연 인출률 (%)", 0.0, 100.0,
-                                                  float(fire.get("withdraw_rate") or 0), 0.5, key=K("f_wd"))
 
         o1, o2, o3 = st.columns(3)
         o1.metric(f"{f_years}년 후 은퇴 금융자산", fmt(f_asset))
-        o2.metric("은퇴 첫해 월 사용액", fmt(f_monthly))
+        o2.metric("은퇴 후 월 사용액(원금 유지)", fmt(f_monthly))
         o3.metric("현재 구매력 기준 월 사용액",
                   fmt(W.real_value(f_monthly, fire.get("inflation") or 0, f_years)))
         target = fire.get("target_monthly") or 0
         if target > 0:
             n = W.years_to_target(start, fire.get("annual_saving") or 0, fire.get("inflation") or 0,
-                                  fire.get("annual_return") or 0, fire.get("withdraw_rate") or 0, target)
+                                  fire.get("annual_return") or 0, target)
             if n == 0:
                 st.success(f"목표 월 생활비 {fmt(target)}: 지금 가능합니다.")
             elif n is not None:
@@ -1806,8 +1805,10 @@ def _render_wealth_tab():
                 st.warning(f"목표 월 생활비 {fmt(target)}: 100년 내 도달할 수 없습니다.")
         else:
             st.caption("목표 월 생활비를 입력하면 도달 시점을 계산합니다.")
-        st.caption("연금 수령 가능 시점·중도인출 제한·세금·수수료는 반영하지 않은 별도 사항입니다. "
-                   "인출률(기본 4%)은 입력한 가정일 뿐이며 자산이 영구히 유지된다는 보장이 아닙니다.")
+        st.caption("월 사용액은 은퇴 후에도 연 투자수익률로 계속 투자한다고 보고, 은퇴 시점 금융자산(원금)이 "
+                   "줄지 않도록 매달 수익만 꺼내 쓰는 금액입니다(연 수익률을 월 복리로 환산). 금액이 매년 같으므로 "
+                   "물가가 오르는 만큼 실제 구매력은 해마다 줄어듭니다. 수익률은 입력한 가정일 뿐 매년 그만큼 "
+                   "난다는 보장이 아니며, 연금 수령 가능 시점·중도인출 제한·세금·수수료는 반영하지 않았습니다.")
         if nf != fire:
             doc["fire"] = nf
             dirty = True

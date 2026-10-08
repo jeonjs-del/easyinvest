@@ -51,7 +51,7 @@ class DocTest(unittest.TestCase):
         doc = W.normalize_doc(raw)
         self.assertEqual(doc["fire"]["years"], 0)
         self.assertEqual(doc["financial"]["retirement"]["holdings"], [])
-        self.assertEqual(doc["fire"]["withdraw_rate"], 4.0)   # 없는 키만 기본값
+        self.assertEqual(doc["fire"]["annual_return"], 5.0)   # 없는 키만 기본값
 
     def test_pension_accounts_hold_same_etf_independently(self):
         doc = W.default_doc()
@@ -210,16 +210,28 @@ class FireTest(unittest.TestCase):
         # 1년차: 1000*1.1+100=1200 / 2년차: 1200*1.1+100*1.02=1422
         self.assertAlmostEqual(W.project_assets(1000, 100, 2, 2, 10), 1422.0)
         self.assertEqual(W.project_assets(1000, 100, 2, 0, 10), 1000)
-        self.assertAlmostEqual(W.monthly_spend(1_200_000_000, 4), 4_000_000)
         self.assertAlmostEqual(W.real_value(1.02 ** 3, 2, 3), 1.0)
 
+    def test_monthly_spend_keeps_principal(self):
+        # 매달 수익률만큼 불어난 뒤 그 달 인출액을 빼면 원금이 그대로여야 한다
+        asset, pct = 1_200_000_000, 6
+        spend = W.monthly_spend(asset, pct)
+        monthly_rate = (1 + pct / 100) ** (1 / 12) - 1
+        left = asset
+        for _ in range(120):
+            left = left * (1 + monthly_rate) - spend
+        self.assertAlmostEqual(left, asset, delta=1)
+        self.assertLess(spend, asset * pct / 100 / 12)      # 단순 12등분은 원금을 깎는다
+        self.assertEqual(W.monthly_spend(asset, 0), 0)
+        self.assertEqual(W.monthly_spend(asset, -3), 0)     # 손실 가정이면 꺼낼 수익이 없다
+
     def test_years_to_target(self):
-        self.assertEqual(W.years_to_target(1_200_000_000, 0, 2, 5, 4, 4_000_000), 0)      # 지금 가능
-        n = W.years_to_target(600_000_000, 30_000_000, 2, 6, 4, 4_000_000)
+        self.assertEqual(W.years_to_target(1_200_000_000, 0, 2, 5, 4_000_000), 0)         # 지금 가능
+        n = W.years_to_target(600_000_000, 30_000_000, 2, 6, 4_000_000)
         self.assertTrue(0 < n < 100)
-        prev = W.real_value(W.monthly_spend(W.project_assets(600_000_000, 30_000_000, 2, n - 1, 6), 4), 2, n - 1)
+        prev = W.real_value(W.monthly_spend(W.project_assets(600_000_000, 30_000_000, 2, n - 1, 6), 6), 2, n - 1)
         self.assertLess(prev, 4_000_000)                                                  # 처음 도달하는 해
-        self.assertIsNone(W.years_to_target(1_000_000, 0, 3, 1, 4, 4_000_000))            # 100년 내 불가
+        self.assertIsNone(W.years_to_target(1_000_000, 0, 3, 1, 4_000_000))               # 100년 내 불가
 
 
 if __name__ == "__main__":

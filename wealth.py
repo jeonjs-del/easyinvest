@@ -46,7 +46,6 @@ DEFAULT_FIRE = {
     "inflation": 2.0,
     "years": 10,
     "annual_return": 5.0,
-    "withdraw_rate": 4.0,
     "target_monthly": 0,
 }
 
@@ -466,21 +465,25 @@ def project_assets(start, annual_saving, inflation_pct, years, return_pct):
     return asset
 
 
-def monthly_spend(asset, withdraw_pct):
-    return asset * withdraw_pct / 100 / 12
+def monthly_spend(asset, return_pct):
+    """은퇴 후에도 같은 수익률로 계속 투자할 때 원금(은퇴 시점 자산)이 줄지 않는 월 인출액 —
+    매달 수익만 꺼내 쓴다. 연 수익률을 월 복리로 환산하므로 자산×수익률/12보다 조금 작다
+    (그만큼 꺼내면 한 해 뒤 원금이 줄어든다). 수익률이 0 이하이면 꺼낼 수익이 없어 0."""
+    if return_pct <= 0:
+        return 0.0
+    return asset * ((1 + return_pct / 100) ** (1 / 12) - 1)
 
 
 def real_value(amount, inflation_pct, years):
     return amount / (1 + inflation_pct / 100) ** int(years)
 
 
-def years_to_target(start, annual_saving, inflation_pct, return_pct, withdraw_pct,
-                    target_monthly, max_years=100):
+def years_to_target(start, annual_saving, inflation_pct, return_pct, target_monthly, max_years=100):
     """현재 구매력 기준 월 사용액이 목표에 처음 도달하는 은퇴 시점(0~max_years년). 없으면 None."""
     if target_monthly is None or target_monthly <= 0:
         return None
     for n in range(max_years + 1):
         asset = project_assets(start, annual_saving, inflation_pct, n, return_pct)
-        if real_value(monthly_spend(asset, withdraw_pct), inflation_pct, n) >= target_monthly:
+        if real_value(monthly_spend(asset, return_pct), inflation_pct, n) >= target_monthly:
             return n
     return None
