@@ -66,6 +66,16 @@ class DocTest(unittest.TestCase):
         self.assertEqual(s["sections"]["retirement"][0], 1_000_000)
         self.assertEqual(s["sections"]["personal"][0], 300_000)
 
+    def test_duplicate_holdings_in_a_section_are_merged(self):
+        # 직접 편집한 파일에 같은 종목이 두 줄이면 화면 입력칸 key가 겹친다
+        raw = {"financial": {"stock": {"cash": 0, "holdings": [
+            {"market": "US", "symbol": "SPY", "name": "SPY", "qty": 10},
+            {"market": "KR", "symbol": "005930", "name": "삼성전자", "qty": 5},
+            {"market": "US", "symbol": "SPY", "name": "SPY", "qty": 2.5},
+        ]}}}
+        holdings = W.normalize_doc(raw)["financial"]["stock"]["holdings"]
+        self.assertEqual([(h["symbol"], h["qty"]) for h in holdings], [("SPY", 12.5), ("005930", 5)])
+
     def test_summary_formulas(self):
         doc = W.default_doc()
         doc["property"].update(value=2_000_000_000, mortgage=500_000_000, private_loan=100_000_000)

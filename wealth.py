@@ -169,6 +169,20 @@ def default_doc():
             "records": [], "fire": dict(DEFAULT_FIRE), "last_quotes": {}}
 
 
+def _merge_holdings(holdings):
+    """같은 항목 안의 같은 종목은 한 줄로 합친다(수량 합산). 화면의 입력칸 key가
+    항목·시장·심볼로 만들어져, 직접 편집한 파일에 중복 줄이 있으면 key 충돌로 탭이 죽는다."""
+    out, seen = [], {}
+    for h in holdings:
+        k = (h["market"], h["symbol"])
+        if k in seen:
+            seen[k]["qty"] = float(seen[k].get("qty") or 0) + float(h.get("qty") or 0)
+        else:
+            seen[k] = h
+            out.append(h)
+    return out
+
+
 def normalize_doc(raw):
     """저장된 문서에 없는 키만 기본값으로 채운다. 사용자가 넣은 0이나 비운 목록은 그대로 둔다."""
     doc = default_doc()
@@ -187,10 +201,10 @@ def normalize_doc(raw):
         if "cash" in sec:
             doc["financial"][key]["cash"] = sec["cash"]
         if kind is not None and isinstance(sec.get("holdings"), list):
-            doc["financial"][key]["holdings"] = [
+            doc["financial"][key]["holdings"] = _merge_holdings(
                 h for h in sec["holdings"]
                 if isinstance(h, dict) and h.get("symbol") and h.get("market") in ("KR", "US", "CRYPTO")
-            ]
+            )
     if isinstance(raw.get("records"), list):
         doc["records"] = sorted(
             (r for r in raw["records"] if isinstance(r, dict) and to_date(r.get("date"))),
