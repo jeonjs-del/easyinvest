@@ -455,17 +455,19 @@ def period_last(records, period):
 # ---------------------------------------------------------------------------
 #  경제적 자유
 # ---------------------------------------------------------------------------
-# 계산기는 전부 현재 구매력(오늘의 돈 가치) 기준이다. 수익률 자리에 실질수익률을 넣으므로
-# 결과 금액을 물가로 다시 깎지 않고, 저축액은 물가만큼 늘려 붓는다고 보아 매년 같은 값이다.
+# 은퇴까지는 명목수익률로 불려 그때 실제로 손에 쥘 금액을 구하고, 은퇴 후 인출액만
+# 실질수익률로 잡는다 — 수익 중 물가 몫을 원금에 남겨야 원금의 구매력이 유지되기 때문이다.
 def real_return(return_pct, inflation_pct):
     return float(return_pct) - float(inflation_pct)
 
 
-def project_assets(start, annual_saving, years, rate_pct):
-    """매년 기존 자산에 수익률을 적용한 뒤 연말 저축액을 더한다."""
-    asset, r = float(start), rate_pct / 100
+def project_assets(start, annual_saving, inflation_pct, years, return_pct):
+    """매년 기존 자산에 수익률을 적용한 뒤 연말 저축액을 더한다. 저축액은 물가상승률만큼 증가."""
+    asset, saving = float(start), float(annual_saving)
+    r, g = return_pct / 100, inflation_pct / 100
     for _ in range(int(years)):
-        asset = asset * (1 + r) + float(annual_saving)
+        asset = asset * (1 + r) + saving
+        saving *= 1 + g
     return asset
 
 
@@ -478,11 +480,17 @@ def monthly_spend(asset, rate_pct):
     return asset * ((1 + rate_pct / 100) ** (1 / 12) - 1)
 
 
-def years_to_target(start, annual_saving, rate_pct, target_monthly, max_years=100):
-    """월 사용액이 목표에 처음 도달하는 은퇴 시점(0~max_years년). 없으면 None."""
+def real_value(amount, inflation_pct, years):
+    return amount / (1 + inflation_pct / 100) ** int(years)
+
+
+def years_to_target(start, annual_saving, inflation_pct, return_pct, target_monthly, max_years=100):
+    """현재 가치 기준 월 사용액이 목표에 처음 도달하는 은퇴 시점(0~max_years년). 없으면 None."""
     if target_monthly is None or target_monthly <= 0:
         return None
+    rr = real_return(return_pct, inflation_pct)
     for n in range(max_years + 1):
-        if monthly_spend(project_assets(start, annual_saving, n, rate_pct), rate_pct) >= target_monthly:
+        asset = project_assets(start, annual_saving, inflation_pct, n, return_pct)
+        if real_value(monthly_spend(asset, rr), inflation_pct, n) >= target_monthly:
             return n
     return None
