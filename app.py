@@ -1877,8 +1877,18 @@ if st.session_state.storage_mode == "local":
 
 watchlist = st.session_state.watchlist
 
+# 탭을 떠나 있는 동안엔 그 탭의 위젯이 그려지지 않아 Streamlit이 값을 지운다 — 선택했을 때만
+# 그리는 탭(동적자산배분·코인)의 필터 값은 다시 대입해 두어야 돌아왔을 때 유지된다.
+for _k in ("coin_tier", "coin_rank_n", "coin_mcap_min", "coin_col_weekrs", "coin_col_weekret",
+           "coin_col_monthret", "coin_rank_period", "coin_rank_iv", "g247_cat", "coin_g247_iv"):
+    if _k in st.session_state:
+        st.session_state[_k] = st.session_state[_k]
+
+# on_change="rerun"이어야 탭의 .open이 채워진다. 동적자산배분·코인은 계산이 무거워(처음 열 때
+# 각각 10초·40초 안팎) 선택됐을 때만 실행한다 — 안 그러면 어느 탭을 보든 매번 이 계산을 기다린다.
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수", "📏 이동평균", "🪙 코인", "🏖 은퇴"])
+    ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수", "📏 이동평균", "🪙 코인", "🏖 은퇴"],
+    key="main_tab", on_change="rerun")
 
 # =====================  차트  ==============================================
 with tab1:
@@ -2212,276 +2222,277 @@ with tab2:
 
 # =====================  동적자산배분  ======================================
 with tab3:
-    st.caption("모멘텀 기반 월별 리밸런싱 · 백테스트는 사용 ETF가 모두 상장된 이후 구간만 계산됩니다. "
-               "현재 포지션은 전월 말 종가로 확정되며 다음 달 1일까지 바뀌지 않습니다.")
+    if tab3.open:
+        st.caption("모멘텀 기반 월별 리밸런싱 · 백테스트는 사용 ETF가 모두 상장된 이후 구간만 계산됩니다. "
+                   "현재 포지션은 전월 말 종가로 확정되며 다음 달 1일까지 바뀌지 않습니다.")
 
-    # [1] 버튼 없이 자동 계산. 미계산 상태면 spinner 표시 후 실행 (캐시 있으면 즉시)
-    if st.session_state.taa_results is None:
-        with st.spinner("미국 ETF 25종 병렬 로딩 및 전략 계산 중 (최초 1~2분)..."):
-            st.session_state.taa_results = run_all_strategies()
+        # [1] 버튼 없이 자동 계산. 미계산 상태면 spinner 표시 후 실행 (캐시 있으면 즉시)
+        if st.session_state.taa_results is None:
+            with st.spinner("미국 ETF 25종 병렬 로딩 및 전략 계산 중 (최초 1~2분)..."):
+                st.session_state.taa_results = run_all_strategies()
 
-    results, mp, ue_ok = st.session_state.taa_results
+        results, mp, ue_ok = st.session_state.taa_results
 
-    if not results:
-        st.warning("전략 데이터를 불러오지 못했습니다. (미국 ETF 데이터 조회 실패)")
-    else:
-        if not ue_ok:
-            st.caption("⚠️ FRED 실업률 미조회 → LAA/RAA는 시장신호만으로 계산되었습니다.")
-
-        _KR_ETF_LABEL = {
-            "069500": "KODEX200(069500)",
-            "278530": "KODEX200TR(278530)",
-            "KOSPI_BF": "KOSPI200(278530, 2017-11~ / KS200 소급)",
-            "363580": "KODEX200IT TR(363580)",
-            "114260": "국고채3년(114260)",
-            "148070": "국고채10년(148070)",
-            "439870": "국고채30년(439870)",
-            "US_BOND_SHORT_KRW": "미국단기국채환노출(SHY합성)",
-            "US_BOND_MID_KRW": "미국10년국채환노출(IEF합성)",
-            "US_BOND_LONG_KRW": "미국장기국채환노출(TLT합성)",
-            "CASH": "현금",
-        }
-
-        _STRAT_DATA_NOTES = {
-            "변동성 변형 듀얼모멘텀":
-                "안전자산 6종 중 국고채3/10/30년(114260/148070/439870)은 Close 가격만 사용 — "
-                "연 1회(12월) 분배금을 지급하는데 총수익 반영이 안 돼 있어 미국채(환노출 합성,"
-                " 총수익)와의 1개월 모멘텀 비교가 구조적으로 유리/불리할 수 있음. "
-                "KOSPI200은 2017-11-21 이전을 KS200 가격지수로 소급(배당 미반영). "
-                "KOSPI200 IT 오버레이는 2020-09-25 이후만 적용(그 전엔 KOSPI200 100%). "
-                "국고채30년은 2022-08-23 이전엔 안전자산 후보에서 제외.",
-        }
-
-        def pos_str(w):
-            return " / ".join(
-                f"{_KR_ETF_LABEL.get(k, k)} {v*100:.0f}%"
-                for k, v in sorted(w.items(), key=lambda x: -x[1])
-            )
-
-        def _prev_pos_str(r):
-            rp = r.get("recent_positions") or []
-            return pos_str(rp[1][1]) if len(rp) > 1 else "—"
-
-        table, failed_strats = [], []
-        for nm, r in results.items():
-            if not r or "error" in r:
-                failed_strats.append(f"{nm}({r['error']})" if r else f"{nm}(계산 가능한 구간 없음)")
-                continue
-            table.append({
-                "전략명": nm, "현재 포지션": pos_str(r.get("current") or {}),
-                "직전월 포지션": _prev_pos_str(r),
-                "CAGR": r.get("cagr"), "MDD": r.get("mdd"), "Sharpe": r.get("sharpe"),
-                "올해 수익률": _ytd_stats(r.get("mret"))[0],
-                "올해 MDD": _ytd_stats(r.get("mret"))[1],
-            })
-
-        if failed_strats:
-            st.caption(f"⚠️ 계산 실패로 제외된 전략: {', '.join(failed_strats)}")
-
-        if not table:
-            st.warning("표시할 전략이 없습니다.")
+        if not results:
+            st.warning("전략 데이터를 불러오지 못했습니다. (미국 ETF 데이터 조회 실패)")
         else:
-            tdf = (pd.DataFrame(table)
-                   .sort_values("CAGR", ascending=False)
-                   .reset_index(drop=True))
-            tdf.insert(0, "순위", tdf.index + 1)
+            if not ue_ok:
+                st.caption("⚠️ FRED 실업률 미조회 → LAA/RAA는 시장신호만으로 계산되었습니다.")
 
-            strat_names = list(tdf["전략명"])
-            # 클릭한 셀은 위젯 상태로만 넘어온다 — 선택 행 하이라이트를 표에 입히려면
-            # 표를 그리기 전에 미리 읽어야 한다.
-            _cells = ((st.session_state.get("strat_table") or {}).get("selection") or {}).get("cells") or []
-            if _cells and 0 <= _cells[0][0] < len(strat_names):
-                st.session_state.taa_pick = strat_names[_cells[0][0]]
-            pick = st.session_state.get("taa_pick")
-            if pick not in strat_names:
-                pick = strat_names[0]  # 선택이 없으면 CAGR 1위
+            _KR_ETF_LABEL = {
+                "069500": "KODEX200(069500)",
+                "278530": "KODEX200TR(278530)",
+                "KOSPI_BF": "KOSPI200(278530, 2017-11~ / KS200 소급)",
+                "363580": "KODEX200IT TR(363580)",
+                "114260": "국고채3년(114260)",
+                "148070": "국고채10년(148070)",
+                "439870": "국고채30년(439870)",
+                "US_BOND_SHORT_KRW": "미국단기국채환노출(SHY합성)",
+                "US_BOND_MID_KRW": "미국10년국채환노출(IEF합성)",
+                "US_BOND_LONG_KRW": "미국장기국채환노출(TLT합성)",
+                "CASH": "현금",
+            }
 
-            def _hl_pick(row):
-                css = "background-color: rgba(255,212,59,0.35); font-weight: 700"
-                return [css if row["전략명"] == pick else ""] * len(row)
+            _STRAT_DATA_NOTES = {
+                "변동성 변형 듀얼모멘텀":
+                    "안전자산 6종 중 국고채3/10/30년(114260/148070/439870)은 Close 가격만 사용 — "
+                    "연 1회(12월) 분배금을 지급하는데 총수익 반영이 안 돼 있어 미국채(환노출 합성,"
+                    " 총수익)와의 1개월 모멘텀 비교가 구조적으로 유리/불리할 수 있음. "
+                    "KOSPI200은 2017-11-21 이전을 KS200 가격지수로 소급(배당 미반영). "
+                    "KOSPI200 IT 오버레이는 2020-09-25 이후만 적용(그 전엔 KOSPI200 100%). "
+                    "국고채30년은 2022-08-23 이전엔 안전자산 후보에서 제외.",
+            }
 
-            st.caption("전략명(행의 아무 칸)을 클릭하면 아래에 상세가 표시됩니다.")
-            try:
-                st.dataframe(
-                    tdf.style.format({"CAGR": "{:+.1%}", "MDD": "{:.1%}", "Sharpe": "{:.2f}",
-                                      "올해 수익률": "{:+.1%}", "올해 MDD": "{:.1%}"},
-                                     na_rep="—").apply(_hl_pick, axis=1),
-                    use_container_width=True, hide_index=True,
-                    height=min(60 + 35 * len(tdf), 600),
-                    on_select="rerun", selection_mode="single-cell", key="strat_table",
+            def pos_str(w):
+                return " / ".join(
+                    f"{_KR_ETF_LABEL.get(k, k)} {v*100:.0f}%"
+                    for k, v in sorted(w.items(), key=lambda x: -x[1])
                 )
-            except Exception as _se:
-                # 셀 선택 미지원 Streamlit 버전 → 전략명 버튼 목록으로 대체
-                print(f"[taa] 셀 선택 미지원, 버튼 목록으로 대체: {type(_se).__name__}: {_se}")
-                for _nm in strat_names:
-                    if st.button(("▶ " if _nm == pick else "") + _nm, key=f"strat_btn_{_nm}"):
-                        st.session_state.taa_pick = _nm
-                        st.rerun()
 
-            r = results[pick]
-            st.markdown(f"#### 전략 상세 — {pick}")
+            def _prev_pos_str(r):
+                rp = r.get("recent_positions") or []
+                return pos_str(rp[1][1]) if len(rp) > 1 else "—"
 
-            @contextlib.contextmanager
-            def _detail_section(section):
-                """상세 화면을 구역별로 격리 — 한 구역이 실패해도 나머지는 그대로 표시한다."""
+            table, failed_strats = [], []
+            for nm, r in results.items():
+                if not r or "error" in r:
+                    failed_strats.append(f"{nm}({r['error']})" if r else f"{nm}(계산 가능한 구간 없음)")
+                    continue
+                table.append({
+                    "전략명": nm, "현재 포지션": pos_str(r.get("current") or {}),
+                    "직전월 포지션": _prev_pos_str(r),
+                    "CAGR": r.get("cagr"), "MDD": r.get("mdd"), "Sharpe": r.get("sharpe"),
+                    "올해 수익률": _ytd_stats(r.get("mret"))[0],
+                    "올해 MDD": _ytd_stats(r.get("mret"))[1],
+                })
+
+            if failed_strats:
+                st.caption(f"⚠️ 계산 실패로 제외된 전략: {', '.join(failed_strats)}")
+
+            if not table:
+                st.warning("표시할 전략이 없습니다.")
+            else:
+                tdf = (pd.DataFrame(table)
+                       .sort_values("CAGR", ascending=False)
+                       .reset_index(drop=True))
+                tdf.insert(0, "순위", tdf.index + 1)
+
+                strat_names = list(tdf["전략명"])
+                # 클릭한 셀은 위젯 상태로만 넘어온다 — 선택 행 하이라이트를 표에 입히려면
+                # 표를 그리기 전에 미리 읽어야 한다.
+                _cells = ((st.session_state.get("strat_table") or {}).get("selection") or {}).get("cells") or []
+                if _cells and 0 <= _cells[0][0] < len(strat_names):
+                    st.session_state.taa_pick = strat_names[_cells[0][0]]
+                pick = st.session_state.get("taa_pick")
+                if pick not in strat_names:
+                    pick = strat_names[0]  # 선택이 없으면 CAGR 1위
+
+                def _hl_pick(row):
+                    css = "background-color: rgba(255,212,59,0.35); font-weight: 700"
+                    return [css if row["전략명"] == pick else ""] * len(row)
+
+                st.caption("전략명(행의 아무 칸)을 클릭하면 아래에 상세가 표시됩니다.")
                 try:
-                    yield
-                except Exception as _de:
-                    tb = traceback.format_exc()
-                    print(f"[taa] '{pick}' 상세 '{section}' 실패:\n{tb}")
-                    st.error(f"'{pick}' 전략 — '{section}' 표시 중 오류: {type(_de).__name__}: {_de}")
-                    with st.expander("오류 상세(트레이스백)"):
-                        st.code(tb)
+                    st.dataframe(
+                        tdf.style.format({"CAGR": "{:+.1%}", "MDD": "{:.1%}", "Sharpe": "{:.2f}",
+                                          "올해 수익률": "{:+.1%}", "올해 MDD": "{:.1%}"},
+                                         na_rep="—").apply(_hl_pick, axis=1),
+                        use_container_width=True, hide_index=True,
+                        height=min(60 + 35 * len(tdf), 600),
+                        on_select="rerun", selection_mode="single-cell", key="strat_table",
+                    )
+                except Exception as _se:
+                    # 셀 선택 미지원 Streamlit 버전 → 전략명 버튼 목록으로 대체
+                    print(f"[taa] 셀 선택 미지원, 버튼 목록으로 대체: {type(_se).__name__}: {_se}")
+                    for _nm in strat_names:
+                        if st.button(("▶ " if _nm == pick else "") + _nm, key=f"strat_btn_{_nm}"):
+                            st.session_state.taa_pick = _nm
+                            st.rerun()
 
-            with _detail_section("요약 지표"):
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("CAGR", f"{r['cagr']:+.1%}")
-                m2.metric("MDD",  f"{r['mdd']:.1%}")
-                m3.metric("Sharpe", f"{r['sharpe']:.2f}")
-                m4.metric("현재 포지션", pos_str(r.get("current") or {}))
+                r = results[pick]
+                st.markdown(f"#### 전략 상세 — {pick}")
 
-                ytd_ret, ytd_mdd = _ytd_stats(r["mret"])
-                md = _mdd_detail(r["mret"])
-                y1, y2, y3, y4 = st.columns(4)
-                y1.metric("올해 수익률", "—" if ytd_ret is None else f"{ytd_ret:+.1%}")
-                y2.metric("올해 MDD", "—" if ytd_mdd is None else f"{ytd_mdd:.1%}")
-                if md and md["peak"] is not None:
-                    y3.metric("MDD 발생 기간",
-                              f"{md['peak']:%Y-%m} ~ {md['trough']:%Y-%m}",
-                              f"{_month_diff(md['peak'], md['trough'])}개월 하락", delta_color="off")
-                    if md["recovery"] is not None:
-                        y4.metric("전고점 회복", f"{md['recovery']:%Y-%m}",
-                                  f"저점 후 {_month_diff(md['trough'], md['recovery'])}개월", delta_color="off")
+                @contextlib.contextmanager
+                def _detail_section(section):
+                    """상세 화면을 구역별로 격리 — 한 구역이 실패해도 나머지는 그대로 표시한다."""
+                    try:
+                        yield
+                    except Exception as _de:
+                        tb = traceback.format_exc()
+                        print(f"[taa] '{pick}' 상세 '{section}' 실패:\n{tb}")
+                        st.error(f"'{pick}' 전략 — '{section}' 표시 중 오류: {type(_de).__name__}: {_de}")
+                        with st.expander("오류 상세(트레이스백)"):
+                            st.code(tb)
+
+                with _detail_section("요약 지표"):
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("CAGR", f"{r['cagr']:+.1%}")
+                    m2.metric("MDD",  f"{r['mdd']:.1%}")
+                    m3.metric("Sharpe", f"{r['sharpe']:.2f}")
+                    m4.metric("현재 포지션", pos_str(r.get("current") or {}))
+
+                    ytd_ret, ytd_mdd = _ytd_stats(r["mret"])
+                    md = _mdd_detail(r["mret"])
+                    y1, y2, y3, y4 = st.columns(4)
+                    y1.metric("올해 수익률", "—" if ytd_ret is None else f"{ytd_ret:+.1%}")
+                    y2.metric("올해 MDD", "—" if ytd_mdd is None else f"{ytd_mdd:.1%}")
+                    if md and md["peak"] is not None:
+                        y3.metric("MDD 발생 기간",
+                                  f"{md['peak']:%Y-%m} ~ {md['trough']:%Y-%m}",
+                                  f"{_month_diff(md['peak'], md['trough'])}개월 하락", delta_color="off")
+                        if md["recovery"] is not None:
+                            y4.metric("전고점 회복", f"{md['recovery']:%Y-%m}",
+                                      f"저점 후 {_month_diff(md['trough'], md['recovery'])}개월", delta_color="off")
+                        else:
+                            y4.metric("전고점 회복", "미회복",
+                                      f"저점 후 {_month_diff(md['trough'], md['last'])}개월 경과", delta_color="off")
                     else:
-                        y4.metric("전고점 회복", "미회복",
-                                  f"저점 후 {_month_diff(md['trough'], md['last'])}개월 경과", delta_color="off")
-                else:
-                    y3.metric("MDD 발생 기간", "—")
-                    y4.metric("전고점 회복", "—")
-                st.caption("MDD 구간은 월말 기준 전고점 → 저점이며, 회복 기간은 저점 이후 전고점을 "
-                           "다시 넘어선 첫 월말까지의 개월 수입니다. 올해 수익률은 연환산하지 않은 누적값입니다.")
+                        y3.metric("MDD 발생 기간", "—")
+                        y4.metric("전고점 회복", "—")
+                    st.caption("MDD 구간은 월말 기준 전고점 → 저점이며, 회복 기간은 저점 이후 전고점을 "
+                               "다시 넘어선 첫 월말까지의 개월 수입니다. 올해 수익률은 연환산하지 않은 누적값입니다.")
 
-                bt_start =r["equity"].index[0].strftime("%Y-%m")
-                bt_end = r["equity"].index[-1].strftime("%Y-%m")
-                note = _STRAT_DATA_NOTES.get(pick)
-                st.caption(f"백테스트 구간: {bt_start} ~ {bt_end}"
-                           + (f" · ⚠️ {note}" if note else ""))
+                    bt_start =r["equity"].index[0].strftime("%Y-%m")
+                    bt_end = r["equity"].index[-1].strftime("%Y-%m")
+                    note = _STRAT_DATA_NOTES.get(pick)
+                    st.caption(f"백테스트 구간: {bt_start} ~ {bt_end}"
+                               + (f" · ⚠️ {note}" if note else ""))
 
-            if pick == "변동성 변형 듀얼모멘텀":
-                with _detail_section("데이터 출처 상세"):
-                    with st.expander("데이터 출처 상세 (총수익 여부 · backfill/proxy 구간)"):
-                        meta_rows = []
-                        for key, ticker in VOLDM_TICKERS.items():
-                            meta = VOLDM_ASSET_META.get(key, {})
-                            meta_rows.append({
-                                "자산": key, "사용 컬럼": ticker,
-                                "총수익 반영": "O" if meta.get("total_return") else "X(가격 기준)",
-                                "비고": meta.get("note", ""),
-                            })
-                        st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
-
-                        fn = STRATEGIES[pick]
-                        # run_all_strategies는 ctx를 반환하지 않는다 — 캐시된 build_ctx로 다시 얻는다.
-                        ctx = build_ctx(list(mp.index))
-                        n_months = n_proxy_months = 0
-                        proxy_by_key = {}
-                        for t in range(len(mp) - 1):
-                            w = fn(mp, t, ctx)
-                            if not w:
-                                continue
-                            n_months += 1
-                            flagged = False
+                if pick == "변동성 변형 듀얼모멘텀":
+                    with _detail_section("데이터 출처 상세"):
+                        with st.expander("데이터 출처 상세 (총수익 여부 · backfill/proxy 구간)"):
+                            meta_rows = []
                             for key, ticker in VOLDM_TICKERS.items():
-                                if ticker not in w:
+                                meta = VOLDM_ASSET_META.get(key, {})
+                                meta_rows.append({
+                                    "자산": key, "사용 컬럼": ticker,
+                                    "총수익 반영": "O" if meta.get("total_return") else "X(가격 기준)",
+                                    "비고": meta.get("note", ""),
+                                })
+                            st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
+
+                            fn = STRATEGIES[pick]
+                            # run_all_strategies는 ctx를 반환하지 않는다 — 캐시된 build_ctx로 다시 얻는다.
+                            ctx = build_ctx(list(mp.index))
+                            n_months = n_proxy_months = 0
+                            proxy_by_key = {}
+                            for t in range(len(mp) - 1):
+                                w = fn(mp, t, ctx)
+                                if not w:
                                     continue
-                                st_type = voldm_source_type(mp, key, t)
-                                if st_type in ("benchmark_index", "proxy"):
-                                    flagged = True
-                                    proxy_by_key[key] = proxy_by_key.get(key, 0) + 1
-                            if flagged:
-                                n_proxy_months += 1
-                        pct = (n_proxy_months / n_months * 100) if n_months else 0.0
-                        st.caption(
-                            f"전체 {n_months}개월 중 benchmark_index/proxy 자산이 선택된 달: "
-                            f"{n_proxy_months}개월({pct:.0f}%)"
-                        )
-                        if proxy_by_key:
-                            breakdown = " · ".join(f"{k}: {v}개월" for k, v in proxy_by_key.items())
-                            st.caption(f"자산별 내역 — {breakdown}")
+                                n_months += 1
+                                flagged = False
+                                for key, ticker in VOLDM_TICKERS.items():
+                                    if ticker not in w:
+                                        continue
+                                    st_type = voldm_source_type(mp, key, t)
+                                    if st_type in ("benchmark_index", "proxy"):
+                                        flagged = True
+                                        proxy_by_key[key] = proxy_by_key.get(key, 0) + 1
+                                if flagged:
+                                    n_proxy_months += 1
+                            pct = (n_proxy_months / n_months * 100) if n_months else 0.0
+                            st.caption(
+                                f"전체 {n_months}개월 중 benchmark_index/proxy 자산이 선택된 달: "
+                                f"{n_proxy_months}개월({pct:.0f}%)"
+                            )
+                            if proxy_by_key:
+                                breakdown = " · ".join(f"{k}: {v}개월" for k, v in proxy_by_key.items())
+                                st.caption(f"자산별 내역 — {breakdown}")
 
-            with _detail_section("최근 3개월 포지션"):
-                # 신호는 월말에 확정되고 그 비중을 다음 달에 보유한다 — 히트맵 툴팁(보유월 기준)과
-                # 대조할 수 있게 두 달을 나란히 적는다.
-                recent_rows = [
-                    {"신호 기준월": d.strftime("%Y-%m"),
-                     "보유월": (d + pd.offsets.MonthEnd(1)).strftime("%Y-%m"),
-                     "포지션": pos_str(w)}
-                    for d, w in (r.get("recent_positions") or [])
-                ]
-                st.markdown("##### 최근 3개월 포지션")
-                if recent_rows:
-                    st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
-                else:
-                    st.caption("표시할 포지션 이력이 없습니다.")
+                with _detail_section("최근 3개월 포지션"):
+                    # 신호는 월말에 확정되고 그 비중을 다음 달에 보유한다 — 히트맵 툴팁(보유월 기준)과
+                    # 대조할 수 있게 두 달을 나란히 적는다.
+                    recent_rows = [
+                        {"신호 기준월": d.strftime("%Y-%m"),
+                         "보유월": (d + pd.offsets.MonthEnd(1)).strftime("%Y-%m"),
+                         "포지션": pos_str(w)}
+                        for d, w in (r.get("recent_positions") or [])
+                    ]
+                    st.markdown("##### 최근 3개월 포지션")
+                    if recent_rows:
+                        st.dataframe(pd.DataFrame(recent_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("표시할 포지션 이력이 없습니다.")
 
-            with _detail_section("누적 수익률 차트"):
-                spy_eq = (1 + mp["SPY"].pct_change().reindex(r["equity"].index).fillna(0)).cumprod()
-                cfig = go.Figure()
-                cfig.add_trace(go.Scatter(x=r["equity"].index, y=r["equity"],
-                                          name="내 전략", line=dict(color="#e03131")))
-                cfig.add_trace(go.Scatter(x=spy_eq.index, y=spy_eq,
-                                          name="SPY", line=dict(color="#1971c2", dash="dot")))
-                cfig.update_layout(
-                    height=340, margin=dict(l=0, r=0, t=10, b=0), yaxis_type="log",
-                    legend=dict(orientation="h", y=1.02, x=0),
-                    title="누적 수익률 (로그 스케일)",
-                )
-                cfig.update_xaxes(fixedrange=True)
-                cfig.update_yaxes(fixedrange=True)
-                st.plotly_chart(cfig, use_container_width=True,
-                                config={"scrollZoom": False, "displayModeBar": False})
+                with _detail_section("누적 수익률 차트"):
+                    spy_eq = (1 + mp["SPY"].pct_change().reindex(r["equity"].index).fillna(0)).cumprod()
+                    cfig = go.Figure()
+                    cfig.add_trace(go.Scatter(x=r["equity"].index, y=r["equity"],
+                                              name="내 전략", line=dict(color="#e03131")))
+                    cfig.add_trace(go.Scatter(x=spy_eq.index, y=spy_eq,
+                                              name="SPY", line=dict(color="#1971c2", dash="dot")))
+                    cfig.update_layout(
+                        height=340, margin=dict(l=0, r=0, t=10, b=0), yaxis_type="log",
+                        legend=dict(orientation="h", y=1.02, x=0),
+                        title="누적 수익률 (로그 스케일)",
+                    )
+                    cfig.update_xaxes(fixedrange=True)
+                    cfig.update_yaxes(fixedrange=True)
+                    st.plotly_chart(cfig, use_container_width=True,
+                                    config={"scrollZoom": False, "displayModeBar": False})
 
-            with _detail_section("연월별 수익률 히트맵"):
-                mr = r["mret"]
-                heat = mr.groupby([mr.index.year, mr.index.month]).first().unstack() * 100
-                heat.columns = [f"{m}월" for m in heat.columns]
-                annual = (
-                    mr.groupby(mr.index.year)
-                      .apply(lambda x: (1 + x).prod() - 1) * 100
-                ).rename("연간")
-                heat_full = heat.join(annual)
-                # held는 mret과 같은 날짜(보유월)로 색인돼 있어 셀과 1:1로 대응한다.
-                held = r.get("held")
-                tips = pd.DataFrame("", index=heat_full.index, columns=heat_full.columns)
-                if held is not None:
-                    for d, h in held.items():
-                        tips.loc[d.year, f"{d.month}월"] = f"{d:%Y-%m}: {pos_str(h['weights'])}"
-                st.markdown("##### 연월별 수익률 (%)")
-                st.caption("월 칸에 커서를 올리면 그 달에 보유한 포지션(전월 말 신호)이 표시됩니다.")
-                fn_h = lambda v: _color_scale_zero(v, 10)
-                styled_heat = _apply_bg(heat_full.style.format("{:+.1f}", na_rep="—"), fn_h)
-                styled_heat = styled_heat.set_tooltips(tips, as_title_attribute=True)
-                st.markdown(
-                    f'<div style="overflow-x:auto;font-size:0.85rem">'
-                    f'{styled_heat.to_html()}'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-                if held is not None and len(held):
-                    # 터치 기기에서는 호버가 안 되므로 같은 내용을 표로도 제공
-                    with st.expander("월별 보유 포지션 표 (모바일용 · 최신순)"):
-                        held_rows = [
-                            {"보유월": d.strftime("%Y-%m"),
-                             "신호 기준월": h["signal"].strftime("%Y-%m"),
-                             "포지션": pos_str(h["weights"]),
-                             "수익률(%)": mr.loc[d] * 100}
-                            for d, h in held.iloc[::-1].items()
-                        ]
-                        st.dataframe(
-                            _apply_bg(pd.DataFrame(held_rows).style.format({"수익률(%)": "{:+.1f}"}),
-                                      fn_h, subset=["수익률(%)"]),
-                            use_container_width=True, hide_index=True, height=420,
-                        )
+                with _detail_section("연월별 수익률 히트맵"):
+                    mr = r["mret"]
+                    heat = mr.groupby([mr.index.year, mr.index.month]).first().unstack() * 100
+                    heat.columns = [f"{m}월" for m in heat.columns]
+                    annual = (
+                        mr.groupby(mr.index.year)
+                          .apply(lambda x: (1 + x).prod() - 1) * 100
+                    ).rename("연간")
+                    heat_full = heat.join(annual)
+                    # held는 mret과 같은 날짜(보유월)로 색인돼 있어 셀과 1:1로 대응한다.
+                    held = r.get("held")
+                    tips = pd.DataFrame("", index=heat_full.index, columns=heat_full.columns)
+                    if held is not None:
+                        for d, h in held.items():
+                            tips.loc[d.year, f"{d.month}월"] = f"{d:%Y-%m}: {pos_str(h['weights'])}"
+                    st.markdown("##### 연월별 수익률 (%)")
+                    st.caption("월 칸에 커서를 올리면 그 달에 보유한 포지션(전월 말 신호)이 표시됩니다.")
+                    fn_h = lambda v: _color_scale_zero(v, 10)
+                    styled_heat = _apply_bg(heat_full.style.format("{:+.1f}", na_rep="—"), fn_h)
+                    styled_heat = styled_heat.set_tooltips(tips, as_title_attribute=True)
+                    st.markdown(
+                        f'<div style="overflow-x:auto;font-size:0.85rem">'
+                        f'{styled_heat.to_html()}'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if held is not None and len(held):
+                        # 터치 기기에서는 호버가 안 되므로 같은 내용을 표로도 제공
+                        with st.expander("월별 보유 포지션 표 (모바일용 · 최신순)"):
+                            held_rows = [
+                                {"보유월": d.strftime("%Y-%m"),
+                                 "신호 기준월": h["signal"].strftime("%Y-%m"),
+                                 "포지션": pos_str(h["weights"]),
+                                 "수익률(%)": mr.loc[d] * 100}
+                                for d, h in held.iloc[::-1].items()
+                            ]
+                            st.dataframe(
+                                _apply_bg(pd.DataFrame(held_rows).style.format({"수익률(%)": "{:+.1f}"}),
+                                          fn_h, subset=["수익률(%)"]),
+                                use_container_width=True, hide_index=True, height=420,
+                            )
 
 # =====================  프리미엄  ==========================================
 with tab4:
@@ -3165,252 +3176,253 @@ with tab6:
 
 # =====================  코인  ================================================
 with tab7:
-    sub_rank, sub_g247, sub_onchain = st.tabs(["🏆 랭킹", "🌐 글로벌 24-7", "⛓️ 온체인"])
+    if tab7.open:
+        sub_rank, sub_g247, sub_onchain = st.tabs(["🏆 랭킹", "🌐 글로벌 24-7", "⛓️ 온체인"])
 
-    # ---- 랭킹 ---------------------------------------------------------------
-    with sub_rank:
-        st.caption("데이터: CoinGecko(시세·시총·스파크라인). 과거 일봉(RS·주간/월간 수익률용)은 "
-                   "Binance→data-api.binance.vision→Coinbase→Bybit→OKX→CoinGecko 순으로 첫 성공한 "
-                   "소스를 씀(지역 차단·장애 대비 다중소스 폴백 — 아래 표 하단 출처 참고). "
-                   "시세는 5분, 과거 일봉은 1시간 캐시.")
+        # ---- 랭킹 ---------------------------------------------------------------
+        with sub_rank:
+            st.caption("데이터: CoinGecko(시세·시총·스파크라인). 과거 일봉(RS·주간/월간 수익률용)은 "
+                       "Binance→data-api.binance.vision→Coinbase→Bybit→OKX→CoinGecko 순으로 첫 성공한 "
+                       "소스를 씀(지역 차단·장애 대비 다중소스 폴백 — 아래 표 하단 출처 참고). "
+                       "시세는 5분, 과거 일봉은 1시간 캐시.")
 
-        fc1, fc2, fc3, fc4, fc5, fc6 = st.columns([1.1, 1, 1.3, 1, 1, 1.2])
-        tier_label = fc1.selectbox("시총 구간", ["top10", "top20", "top50", "top100", "전체"],
-                                    index=4, key="coin_tier")
-        rank_n = fc2.number_input("순위 ≤ (0=미적용)", min_value=0, value=0, step=10, key="coin_rank_n")
-        mcap_min_m = fc3.number_input("시총 ≥ 백만$ (0=미적용)", min_value=0.0, value=0.0, step=100.0,
-                                       key="coin_mcap_min")
-        show_week_rs = fc4.checkbox("+주간RS", key="coin_col_weekrs")
-        show_week_ret = fc5.checkbox("+주간수익", key="coin_col_weekret")
-        show_month_ret = fc6.checkbox("+3·6·12개월", key="coin_col_monthret")
+            fc1, fc2, fc3, fc4, fc5, fc6 = st.columns([1.1, 1, 1.3, 1, 1, 1.2])
+            tier_label = fc1.selectbox("시총 구간", ["top10", "top20", "top50", "top100", "전체"],
+                                        index=4, key="coin_tier")
+            rank_n = fc2.number_input("순위 ≤ (0=미적용)", min_value=0, value=0, step=10, key="coin_rank_n")
+            mcap_min_m = fc3.number_input("시총 ≥ 백만$ (0=미적용)", min_value=0.0, value=0.0, step=100.0,
+                                           key="coin_mcap_min")
+            show_week_rs = fc4.checkbox("+주간RS", key="coin_col_weekrs")
+            show_week_ret = fc5.checkbox("+주간수익", key="coin_col_weekret")
+            show_month_ret = fc6.checkbox("+3·6·12개월", key="coin_col_monthret")
 
-        with st.spinner("코인 시세·RS 조회 중..."):
-            rank_df, rank_status, source_counts = build_coin_ranking(COIN_UNIVERSE_POOL)
+            with st.spinner("코인 시세·RS 조회 중..."):
+                rank_df, rank_status, source_counts = build_coin_ranking(COIN_UNIVERSE_POOL)
 
-        if rank_status == "coingecko_fail":
-            st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요.")
-        elif rank_df.empty:
-            st.info("표시할 코인 데이터가 없습니다.")
-        else:
-            work = rank_df.copy()
-            _tier_map = {"top10": 10, "top20": 20, "top50": 50, "top100": 100, "전체": None}
-            _tier_n = _tier_map[tier_label]
-            if _tier_n is not None:
-                work = work[work["market_cap_rank"] <= _tier_n]
-            if rank_n > 0:
-                work = work[work["market_cap_rank"] <= rank_n]
-            if mcap_min_m > 0:
-                work = work[work["market_cap"] >= mcap_min_m * 1e6]
-            work = work.reset_index(drop=True)
-
-            if work.empty:
-                st.info("조건에 맞는 코인이 없습니다.")
+            if rank_status == "coingecko_fail":
+                st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요.")
+            elif rank_df.empty:
+                st.info("표시할 코인 데이터가 없습니다.")
             else:
-                st.caption(f"{len(work)}개 코인 · 기본 정렬: 시총순 (표 헤더 클릭으로 재정렬 가능, "
-                           "'#'열은 항상 시총 순위 고정)")
+                work = rank_df.copy()
+                _tier_map = {"top10": 10, "top20": 20, "top50": 50, "top100": 100, "전체": None}
+                _tier_n = _tier_map[tier_label]
+                if _tier_n is not None:
+                    work = work[work["market_cap_rank"] <= _tier_n]
+                if rank_n > 0:
+                    work = work[work["market_cap_rank"] <= rank_n]
+                if mcap_min_m > 0:
+                    work = work[work["market_cap"] >= mcap_min_m * 1e6]
+                work = work.reset_index(drop=True)
 
-                col_data = {
-                    "#": work["#"], "이름": work["symbol"] + " · " + work["name"],
-                    "가격": work["price"], "24h": work["chg_24h"], "7일": work["chg_7d"],
-                    "30일": work["chg_30d"], "종합RS": work["rs_total"],
-                    "시총": work["market_cap"], "거래량": work["volume"],
-                    "7일 스파크라인": work["sparkline"],
-                }
-                if show_week_rs:
-                    for w in (1, 2, 3, 4):
-                        col_data[f"{w}주RS"] = work[f"rs_{w}w"]
-                if show_week_ret:
-                    for w in (1, 2, 3, 4):
-                        col_data[f"{w}주수익"] = work[f"ret_{w}w"]
-                if show_month_ret:
-                    col_data["3개월"] = work["ret_3m"]
-                    col_data["6개월"] = work["ret_6m"]
-                    col_data["12개월"] = work["ret_12m"]
-
-                disp = pd.DataFrame(col_data)
-                pct_cols = [c for c in ["24h", "7일", "30일"]
-                            + ([f"{w}주수익" for w in (1, 2, 3, 4)] if show_week_ret else [])
-                            + (["3개월", "6개월", "12개월"] if show_month_ret else [])]
-
-                styled = disp.style
-                for c in pct_cols:
-                    _cap = _abs_cap(disp[c], COIN_RET_COLOR_CAP)
-                    styled = _apply_bg(styled, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
-
-                col_config = {
-                    "#": st.column_config.NumberColumn(width="small"),
-                    "가격": st.column_config.NumberColumn(format="$%.6g"),
-                    "24h": st.column_config.NumberColumn(format="percent"),
-                    "7일": st.column_config.NumberColumn(format="percent"),
-                    "30일": st.column_config.NumberColumn(format="percent"),
-                    "종합RS": st.column_config.NumberColumn(format="%.0f"),
-                    "시총": st.column_config.NumberColumn(format="compact"),
-                    "거래량": st.column_config.NumberColumn(format="compact"),
-                    "7일 스파크라인": st.column_config.LineChartColumn(width="medium"),
-                }
-                for w in (1, 2, 3, 4):
-                    col_config[f"{w}주RS"] = st.column_config.NumberColumn(format="%.0f")
-                    col_config[f"{w}주수익"] = st.column_config.NumberColumn(format="percent")
-                for c in ("3개월", "6개월", "12개월"):
-                    col_config[c] = st.column_config.NumberColumn(format="percent")
-
-                rank_ev = st.dataframe(
-                    styled, use_container_width=True, hide_index=True, column_config=col_config,
-                    height=min(60 + 35 * len(disp), 600),
-                    on_select="rerun", selection_mode="single-row", key="coin_rank_table",
-                )
-                _src_label = " · ".join(f"{k} {v}개" for k, v in source_counts.items())
-                st.caption(f"과거 일봉 출처: {_src_label}")
-
-                _sel_rows = rank_ev.selection.rows if rank_ev and rank_ev.selection else []
-                if _sel_rows:
-                    _sel_sym = work.iloc[_sel_rows[0]]["symbol"]
-                    if _sel_sym != st.session_state.coin_rank_symbol:
-                        st.session_state.coin_rank_symbol = _sel_sym
-                        st.rerun()
-
-                chart_base = st.session_state.coin_rank_symbol or work.iloc[0]["symbol"]
-                chart_row = work[work["symbol"] == chart_base]
-                chart_sym = chart_base + "USDT"
-                chart_label = (chart_row.iloc[0]["symbol"] + " · " + chart_row.iloc[0]["name"]
-                               if not chart_row.empty else chart_base)
-                st.markdown(f"#### {chart_label}")
-                cc1, cc2 = st.columns(2)
-                chart_period = cc1.radio("기간", list(COIN_CHART_PERIOD_DAYS), index=0,
-                                          horizontal=True, key="coin_rank_period")
-                chart_iv_label = cc2.radio("봉", list(COIN_CHART_INTERVAL_MAP), index=0,
-                                            horizontal=True, key="coin_rank_iv")
-                _iv = COIN_CHART_INTERVAL_MAP[chart_iv_label]
-                _bars_needed = {"1d": 366, "1w": 53, "1M": 13}[_iv] \
-                    if chart_period == "1년" else \
-                    ({"1d": 1096, "1w": 157, "1M": 37} if chart_period == "3년"
-                     else {"1d": 1000, "1w": 1000, "1M": 1000})[_iv]
-                candles = _fetch_binance_klines(chart_sym, _iv, _bars_needed)
-                if not candles:
-                    st.warning("차트 데이터를 불러오지 못했습니다.")
+                if work.empty:
+                    st.info("조건에 맞는 코인이 없습니다.")
                 else:
-                    _render_price_chart(candles, key=f"lwc_coin_rank_{chart_sym}_{_iv}", intraday=False)
+                    st.caption(f"{len(work)}개 코인 · 기본 정렬: 시총순 (표 헤더 클릭으로 재정렬 가능, "
+                               "'#'열은 항상 시총 순위 고정)")
 
-    # ---- 글로벌 24-7 ----------------------------------------------------------
-    with sub_g247:
-        st.info("ℹ️ 이 가격은 코인거래소(Hyperliquid)에서 형성되는 시세이며, 정규 거래소의 "
-                "공식 가격이 아닌 참고용입니다. 유동성이 낮아 실제 거래소 가격과 괴리가 있을 수 있습니다.")
-        st.caption("데이터: Hyperliquid 공개 API(xyz 퍼프 DEX — 주식·지수·원자재·환율 등 전통자산을 "
-                   "24시간 거래). 5분 캐시.")
+                    col_data = {
+                        "#": work["#"], "이름": work["symbol"] + " · " + work["name"],
+                        "가격": work["price"], "24h": work["chg_24h"], "7일": work["chg_7d"],
+                        "30일": work["chg_30d"], "종합RS": work["rs_total"],
+                        "시총": work["market_cap"], "거래량": work["volume"],
+                        "7일 스파크라인": work["sparkline"],
+                    }
+                    if show_week_rs:
+                        for w in (1, 2, 3, 4):
+                            col_data[f"{w}주RS"] = work[f"rs_{w}w"]
+                    if show_week_ret:
+                        for w in (1, 2, 3, 4):
+                            col_data[f"{w}주수익"] = work[f"ret_{w}w"]
+                    if show_month_ret:
+                        col_data["3개월"] = work["ret_3m"]
+                        col_data["6개월"] = work["ret_6m"]
+                        col_data["12개월"] = work["ret_12m"]
 
-        cat_filter = st.selectbox("카테고리", HL_CATEGORIES, index=0, key="g247_cat")
+                    disp = pd.DataFrame(col_data)
+                    pct_cols = [c for c in ["24h", "7일", "30일"]
+                                + ([f"{w}주수익" for w in (1, 2, 3, 4)] if show_week_ret else [])
+                                + (["3개월", "6개월", "12개월"] if show_month_ret else [])]
 
-        with st.spinner("Hyperliquid 시세 조회 중..."):
-            g247_df, g247_status = build_global247()
+                    styled = disp.style
+                    for c in pct_cols:
+                        _cap = _abs_cap(disp[c], COIN_RET_COLOR_CAP)
+                        styled = _apply_bg(styled, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
 
-        _g247_errors = {
-            "hl_fail": "Hyperliquid 유니버스 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
-            "no_data": "표시할 데이터가 없습니다(전 종목 캔들 조회 실패).",
-        }
-        if g247_status in _g247_errors:
-            st.warning(f"⚠️ {_g247_errors[g247_status]}")
-        elif g247_df.empty:
-            st.info("표시할 데이터가 없습니다.")
-        else:
-            work247 = g247_df.copy()
-            if cat_filter != "전체":
-                work247 = work247[work247["category"] == cat_filter]
-            work247 = work247.reset_index(drop=True)
-
-            if work247.empty:
-                st.info("이 카테고리에 해당하는 자산이 없습니다.")
-            else:
-                st.caption(f"{len(work247)}개 자산 · 24h 변동률 기준 정렬(표 헤더 클릭으로 재정렬 가능)")
-
-                kr_name = work247["symbol"].map(lambda s: HL_SYMBOL_KOREAN_NAME.get(s))
-                disp247 = pd.DataFrame({
-                    "이름": [f"{s} · {k}" if k else s for s, k in zip(work247["symbol"], kr_name)],
-                    "현재가": work247["price"], "1h": work247["chg_1h"], "24h": work247["chg_24h"],
-                    "7일": work247["chg_7d"], "30일": work247["chg_30d"], "카테고리": work247["category"],
-                })
-                styled247 = disp247.style
-                for c in ["1h", "24h", "7일", "30일"]:
-                    _cap = _abs_cap(disp247[c], COIN_RET_COLOR_CAP)
-                    styled247 = _apply_bg(styled247, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
-
-                g247_ev = st.dataframe(
-                    styled247, use_container_width=True, hide_index=True,
-                    column_config={
-                        "현재가": st.column_config.NumberColumn(format="$%.6g"),
-                        "1h": st.column_config.NumberColumn(format="percent"),
+                    col_config = {
+                        "#": st.column_config.NumberColumn(width="small"),
+                        "가격": st.column_config.NumberColumn(format="$%.6g"),
                         "24h": st.column_config.NumberColumn(format="percent"),
                         "7일": st.column_config.NumberColumn(format="percent"),
                         "30일": st.column_config.NumberColumn(format="percent"),
-                    },
-                    height=min(60 + 35 * len(disp247), 600),
-                    on_select="rerun", selection_mode="single-row", key="coin_g247_table",
-                )
-                _sel247 = g247_ev.selection.rows if g247_ev and g247_ev.selection else []
-                if _sel247:
-                    _sel_hl = work247.iloc[_sel247[0]]["hl_symbol"]
-                    if _sel_hl != st.session_state.coin_g247_symbol:
-                        st.session_state.coin_g247_symbol = _sel_hl
-                        st.rerun()
+                        "종합RS": st.column_config.NumberColumn(format="%.0f"),
+                        "시총": st.column_config.NumberColumn(format="compact"),
+                        "거래량": st.column_config.NumberColumn(format="compact"),
+                        "7일 스파크라인": st.column_config.LineChartColumn(width="medium"),
+                    }
+                    for w in (1, 2, 3, 4):
+                        col_config[f"{w}주RS"] = st.column_config.NumberColumn(format="%.0f")
+                        col_config[f"{w}주수익"] = st.column_config.NumberColumn(format="percent")
+                    for c in ("3개월", "6개월", "12개월"):
+                        col_config[c] = st.column_config.NumberColumn(format="percent")
 
-                g247_sym = st.session_state.coin_g247_symbol or work247.iloc[0]["hl_symbol"]
-                g247_row = work247[work247["hl_symbol"] == g247_sym]
-                g247_sym_short = g247_row.iloc[0]["symbol"] if not g247_row.empty else g247_sym
-                g247_kr = HL_SYMBOL_KOREAN_NAME.get(g247_sym_short)
-                st.markdown(f"#### {g247_sym_short}" + (f" · {g247_kr}" if g247_kr else ""))
+                    rank_ev = st.dataframe(
+                        styled, use_container_width=True, hide_index=True, column_config=col_config,
+                        height=min(60 + 35 * len(disp), 600),
+                        on_select="rerun", selection_mode="single-row", key="coin_rank_table",
+                    )
+                    _src_label = " · ".join(f"{k} {v}개" for k, v in source_counts.items())
+                    st.caption(f"과거 일봉 출처: {_src_label}")
 
-                iv_label = st.radio("인터벌", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3,
-                                     horizontal=True, key="coin_g247_iv")
-                _lookback_ms = {
-                    "1m": 6 * 3600 * 1000, "5m": 24 * 3600 * 1000, "15m": 3 * 24 * 3600 * 1000,
-                    "1h": 14 * 24 * 3600 * 1000, "4h": 45 * 24 * 3600 * 1000,
-                    "1d": 365 * 24 * 3600 * 1000,
-                }[iv_label]
-                g247_candles = _fetch_hl_candles(g247_sym, iv_label, _lookback_ms)
-                if not g247_candles:
-                    st.warning("차트 데이터를 불러오지 못했습니다.")
+                    _sel_rows = rank_ev.selection.rows if rank_ev and rank_ev.selection else []
+                    if _sel_rows:
+                        _sel_sym = work.iloc[_sel_rows[0]]["symbol"]
+                        if _sel_sym != st.session_state.coin_rank_symbol:
+                            st.session_state.coin_rank_symbol = _sel_sym
+                            st.rerun()
+
+                    chart_base = st.session_state.coin_rank_symbol or work.iloc[0]["symbol"]
+                    chart_row = work[work["symbol"] == chart_base]
+                    chart_sym = chart_base + "USDT"
+                    chart_label = (chart_row.iloc[0]["symbol"] + " · " + chart_row.iloc[0]["name"]
+                                   if not chart_row.empty else chart_base)
+                    st.markdown(f"#### {chart_label}")
+                    cc1, cc2 = st.columns(2)
+                    chart_period = cc1.radio("기간", list(COIN_CHART_PERIOD_DAYS), index=0,
+                                              horizontal=True, key="coin_rank_period")
+                    chart_iv_label = cc2.radio("봉", list(COIN_CHART_INTERVAL_MAP), index=0,
+                                                horizontal=True, key="coin_rank_iv")
+                    _iv = COIN_CHART_INTERVAL_MAP[chart_iv_label]
+                    _bars_needed = {"1d": 366, "1w": 53, "1M": 13}[_iv] \
+                        if chart_period == "1년" else \
+                        ({"1d": 1096, "1w": 157, "1M": 37} if chart_period == "3년"
+                         else {"1d": 1000, "1w": 1000, "1M": 1000})[_iv]
+                    candles = _fetch_binance_klines(chart_sym, _iv, _bars_needed)
+                    if not candles:
+                        st.warning("차트 데이터를 불러오지 못했습니다.")
+                    else:
+                        _render_price_chart(candles, key=f"lwc_coin_rank_{chart_sym}_{_iv}", intraday=False)
+
+        # ---- 글로벌 24-7 ----------------------------------------------------------
+        with sub_g247:
+            st.info("ℹ️ 이 가격은 코인거래소(Hyperliquid)에서 형성되는 시세이며, 정규 거래소의 "
+                    "공식 가격이 아닌 참고용입니다. 유동성이 낮아 실제 거래소 가격과 괴리가 있을 수 있습니다.")
+            st.caption("데이터: Hyperliquid 공개 API(xyz 퍼프 DEX — 주식·지수·원자재·환율 등 전통자산을 "
+                       "24시간 거래). 5분 캐시.")
+
+            cat_filter = st.selectbox("카테고리", HL_CATEGORIES, index=0, key="g247_cat")
+
+            with st.spinner("Hyperliquid 시세 조회 중..."):
+                g247_df, g247_status = build_global247()
+
+            _g247_errors = {
+                "hl_fail": "Hyperliquid 유니버스 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
+                "no_data": "표시할 데이터가 없습니다(전 종목 캔들 조회 실패).",
+            }
+            if g247_status in _g247_errors:
+                st.warning(f"⚠️ {_g247_errors[g247_status]}")
+            elif g247_df.empty:
+                st.info("표시할 데이터가 없습니다.")
+            else:
+                work247 = g247_df.copy()
+                if cat_filter != "전체":
+                    work247 = work247[work247["category"] == cat_filter]
+                work247 = work247.reset_index(drop=True)
+
+                if work247.empty:
+                    st.info("이 카테고리에 해당하는 자산이 없습니다.")
                 else:
-                    _closed_mask = _us_market_closed_mask([c["time"] for c in g247_candles])
-                    _render_price_chart(g247_candles, key=f"lwc_g247_{g247_sym}_{iv_label}",
-                                         intraday=True, closed_mask=_closed_mask)
-                    st.caption("회색 배경 = 미국 정규장(09:30~16:00 ET, 평일) 휴장 구간(공휴일 미반영 근사치)")
+                    st.caption(f"{len(work247)}개 자산 · 24h 변동률 기준 정렬(표 헤더 클릭으로 재정렬 가능)")
 
-    # ---- 온체인 ---------------------------------------------------------------
-    with sub_onchain:
-        st.info("⛓️ 온체인 지표 탭은 준비 중입니다. 아래는 각 지표를 무료 API로 구할 수 있는지 "
-                "조사한 결과입니다.")
-        onchain_survey = pd.DataFrame([
-            {"지표": "MVRV", "가능여부": "가능", "소스": "bitcoin-data.com (무료, 무인증)"},
-            {"지표": "NUPL", "가능여부": "가능", "소스": "bitcoin-data.com"},
-            {"지표": "SOPR", "가능여부": "가능", "소스": "bitcoin-data.com"},
-            {"지표": "장기보유자 SOPR(LTH-SOPR)", "가능여부": "가능", "소스": "bitcoin-data.com"},
-            {"지표": "푸엘 멀티플(Puell Multiple)", "가능여부": "가능", "소스": "bitcoin-data.com"},
-            {"지표": "실현가격(Realized Price)", "가능여부": "가능", "소스": "bitcoin-data.com"},
-            {"지표": "MVRV Z-Score", "가능여부": "가능", "소스": "bitcoin-data.com"},
-            {"지표": "Pi Cycle Top", "가능여부": "자체계산", "소스": "가격(일봉)만으로 계산 가능 — 111일 SMA vs 350일 SMA×2"},
-            {"지표": "Mayer Multiple", "가능여부": "자체계산", "소스": "가격 ÷ 200일 SMA, 가격만으로 계산 가능"},
-            {"지표": "200주 이평(200W MA)", "가능여부": "자체계산", "소스": "가격(주봉)만으로 계산 가능"},
-            {"지표": "해시레이트", "가능여부": "가능", "소스": "Blockchain.com Charts API(무료, 무인증)"},
-            {"지표": "해시리본(Hash Ribbons)", "가능여부": "자체계산", "소스": "해시레이트의 30일/60일 SMA — Blockchain.com 원자료로 직접 계산"},
-            {"지표": "활성주소(Active Addresses)", "가능여부": "가능", "소스": "Blockchain.com Charts API(n-unique-addresses)"},
-            {"지표": "공포탐욕지수", "가능여부": "가능", "소스": "alternative.me Fear & Greed Index API(무료, 무인증)"},
-            {"지표": "펀딩비(Funding Rate)", "가능여부": "가능", "소스": "Binance/Hyperliquid 공개 API(fundingRate) — 이미 이 앱이 쓰는 소스 재사용 가능"},
-            {"지표": "미결제약정(Open Interest)", "가능여부": "가능", "소스": "Binance futures 공개 API(openInterest) — 무료, 무인증"},
-            {"지표": "ETF 흐름(BTC ETF Flow)", "가능여부": "부분", "소스": "Farside Investors — 공식 API는 없고 웹페이지 스크레이핑 필요(구조 변경에 취약)"},
-            {"지표": "김치프리미엄", "가능여부": "가능", "소스": "이미 프리미엄 탭에서 계산 중인 로직 재사용"},
-            {"지표": "글로벌 M2", "가능여부": "가능", "소스": "FRED(M2SL 등, 무료 API키 필요·무료 발급) — 국가별 M2 합산은 직접 구성 필요"},
-            {"지표": "CoinGlass 계열 지표 전반(청산맵 등)", "가능여부": "불가(무료로는)", "소스": "CoinGlass 공식 API는 유료 플랜부터 제공, 무료 티어는 웹 화면만"},
-        ])
-        st.dataframe(onchain_survey, use_container_width=True, hide_index=True,
-                     height=min(60 + 35 * len(onchain_survey), 760))
-        st.caption("가능=무료·무인증 API로 직접 조회 / 자체계산=가격 등 원자료만으로 이 앱에서 "
-                   "계산 가능 / 부분=공식 API 없이 우회 방법(스크레이핑 등)만 존재 / 불가=무료로는 "
-                   "확인한 방법이 없음. 구현은 아직 하지 않았고, 다음 라운드에서 우선순위를 정해 "
-                   "진행하면 됩니다.")
+                    kr_name = work247["symbol"].map(lambda s: HL_SYMBOL_KOREAN_NAME.get(s))
+                    disp247 = pd.DataFrame({
+                        "이름": [f"{s} · {k}" if k else s for s, k in zip(work247["symbol"], kr_name)],
+                        "현재가": work247["price"], "1h": work247["chg_1h"], "24h": work247["chg_24h"],
+                        "7일": work247["chg_7d"], "30일": work247["chg_30d"], "카테고리": work247["category"],
+                    })
+                    styled247 = disp247.style
+                    for c in ["1h", "24h", "7일", "30일"]:
+                        _cap = _abs_cap(disp247[c], COIN_RET_COLOR_CAP)
+                        styled247 = _apply_bg(styled247, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
 
-st.divider()
-st.caption("※ 규칙 기반 계산기이며 투자 자문이 아닙니다. "
-           "배당 미반영 종가 기반이라 실제 성과와 차이가 날 수 있습니다. "
-           "투자 판단과 책임은 본인에게 있습니다.")
+                    g247_ev = st.dataframe(
+                        styled247, use_container_width=True, hide_index=True,
+                        column_config={
+                            "현재가": st.column_config.NumberColumn(format="$%.6g"),
+                            "1h": st.column_config.NumberColumn(format="percent"),
+                            "24h": st.column_config.NumberColumn(format="percent"),
+                            "7일": st.column_config.NumberColumn(format="percent"),
+                            "30일": st.column_config.NumberColumn(format="percent"),
+                        },
+                        height=min(60 + 35 * len(disp247), 600),
+                        on_select="rerun", selection_mode="single-row", key="coin_g247_table",
+                    )
+                    _sel247 = g247_ev.selection.rows if g247_ev and g247_ev.selection else []
+                    if _sel247:
+                        _sel_hl = work247.iloc[_sel247[0]]["hl_symbol"]
+                        if _sel_hl != st.session_state.coin_g247_symbol:
+                            st.session_state.coin_g247_symbol = _sel_hl
+                            st.rerun()
+
+                    g247_sym = st.session_state.coin_g247_symbol or work247.iloc[0]["hl_symbol"]
+                    g247_row = work247[work247["hl_symbol"] == g247_sym]
+                    g247_sym_short = g247_row.iloc[0]["symbol"] if not g247_row.empty else g247_sym
+                    g247_kr = HL_SYMBOL_KOREAN_NAME.get(g247_sym_short)
+                    st.markdown(f"#### {g247_sym_short}" + (f" · {g247_kr}" if g247_kr else ""))
+
+                    iv_label = st.radio("인터벌", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3,
+                                         horizontal=True, key="coin_g247_iv")
+                    _lookback_ms = {
+                        "1m": 6 * 3600 * 1000, "5m": 24 * 3600 * 1000, "15m": 3 * 24 * 3600 * 1000,
+                        "1h": 14 * 24 * 3600 * 1000, "4h": 45 * 24 * 3600 * 1000,
+                        "1d": 365 * 24 * 3600 * 1000,
+                    }[iv_label]
+                    g247_candles = _fetch_hl_candles(g247_sym, iv_label, _lookback_ms)
+                    if not g247_candles:
+                        st.warning("차트 데이터를 불러오지 못했습니다.")
+                    else:
+                        _closed_mask = _us_market_closed_mask([c["time"] for c in g247_candles])
+                        _render_price_chart(g247_candles, key=f"lwc_g247_{g247_sym}_{iv_label}",
+                                             intraday=True, closed_mask=_closed_mask)
+                        st.caption("회색 배경 = 미국 정규장(09:30~16:00 ET, 평일) 휴장 구간(공휴일 미반영 근사치)")
+
+        # ---- 온체인 ---------------------------------------------------------------
+        with sub_onchain:
+            st.info("⛓️ 온체인 지표 탭은 준비 중입니다. 아래는 각 지표를 무료 API로 구할 수 있는지 "
+                    "조사한 결과입니다.")
+            onchain_survey = pd.DataFrame([
+                {"지표": "MVRV", "가능여부": "가능", "소스": "bitcoin-data.com (무료, 무인증)"},
+                {"지표": "NUPL", "가능여부": "가능", "소스": "bitcoin-data.com"},
+                {"지표": "SOPR", "가능여부": "가능", "소스": "bitcoin-data.com"},
+                {"지표": "장기보유자 SOPR(LTH-SOPR)", "가능여부": "가능", "소스": "bitcoin-data.com"},
+                {"지표": "푸엘 멀티플(Puell Multiple)", "가능여부": "가능", "소스": "bitcoin-data.com"},
+                {"지표": "실현가격(Realized Price)", "가능여부": "가능", "소스": "bitcoin-data.com"},
+                {"지표": "MVRV Z-Score", "가능여부": "가능", "소스": "bitcoin-data.com"},
+                {"지표": "Pi Cycle Top", "가능여부": "자체계산", "소스": "가격(일봉)만으로 계산 가능 — 111일 SMA vs 350일 SMA×2"},
+                {"지표": "Mayer Multiple", "가능여부": "자체계산", "소스": "가격 ÷ 200일 SMA, 가격만으로 계산 가능"},
+                {"지표": "200주 이평(200W MA)", "가능여부": "자체계산", "소스": "가격(주봉)만으로 계산 가능"},
+                {"지표": "해시레이트", "가능여부": "가능", "소스": "Blockchain.com Charts API(무료, 무인증)"},
+                {"지표": "해시리본(Hash Ribbons)", "가능여부": "자체계산", "소스": "해시레이트의 30일/60일 SMA — Blockchain.com 원자료로 직접 계산"},
+                {"지표": "활성주소(Active Addresses)", "가능여부": "가능", "소스": "Blockchain.com Charts API(n-unique-addresses)"},
+                {"지표": "공포탐욕지수", "가능여부": "가능", "소스": "alternative.me Fear & Greed Index API(무료, 무인증)"},
+                {"지표": "펀딩비(Funding Rate)", "가능여부": "가능", "소스": "Binance/Hyperliquid 공개 API(fundingRate) — 이미 이 앱이 쓰는 소스 재사용 가능"},
+                {"지표": "미결제약정(Open Interest)", "가능여부": "가능", "소스": "Binance futures 공개 API(openInterest) — 무료, 무인증"},
+                {"지표": "ETF 흐름(BTC ETF Flow)", "가능여부": "부분", "소스": "Farside Investors — 공식 API는 없고 웹페이지 스크레이핑 필요(구조 변경에 취약)"},
+                {"지표": "김치프리미엄", "가능여부": "가능", "소스": "이미 프리미엄 탭에서 계산 중인 로직 재사용"},
+                {"지표": "글로벌 M2", "가능여부": "가능", "소스": "FRED(M2SL 등, 무료 API키 필요·무료 발급) — 국가별 M2 합산은 직접 구성 필요"},
+                {"지표": "CoinGlass 계열 지표 전반(청산맵 등)", "가능여부": "불가(무료로는)", "소스": "CoinGlass 공식 API는 유료 플랜부터 제공, 무료 티어는 웹 화면만"},
+            ])
+            st.dataframe(onchain_survey, use_container_width=True, hide_index=True,
+                         height=min(60 + 35 * len(onchain_survey), 760))
+            st.caption("가능=무료·무인증 API로 직접 조회 / 자체계산=가격 등 원자료만으로 이 앱에서 "
+                       "계산 가능 / 부분=공식 API 없이 우회 방법(스크레이핑 등)만 존재 / 불가=무료로는 "
+                       "확인한 방법이 없음. 구현은 아직 하지 않았고, 다음 라운드에서 우선순위를 정해 "
+                       "진행하면 됩니다.")
+
+    st.divider()
+    st.caption("※ 규칙 기반 계산기이며 투자 자문이 아닙니다. "
+               "배당 미반영 종가 기반이라 실제 성과와 차이가 날 수 있습니다. "
+               "투자 판단과 책임은 본인에게 있습니다.")
 
 # =====================  은퇴 (총자산 · 경제적 자유)  ========================
 with tab8:

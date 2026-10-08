@@ -261,6 +261,11 @@ python -m unittest tests.test_wealth -v        # 오프라인
   대비 절대값 비율.
 - 외부 API 호출은 `@st.cache_data(ttl=...)`로 캐시하고, 여러 종목/코인 조회는
   `ThreadPoolExecutor`로 병렬화한다.
+- **탭 지연 실행**: 최상위 `st.tabs`는 `key="main_tab", on_change="rerun"`이고, 무거운 탭
+  (동적자산배분·코인)은 `if tabN.open:` 안에서만 그린다(첫 로딩 65초→15초). 이런 탭에 값이
+  유지돼야 하는 위젯을 추가하면 `st.tabs` 바로 위의 key 목록에도 넣을 것 — 탭을 떠나 있는
+  동안 그려지지 않은 위젯 값은 Streamlit이 지운다. `AppTest`는 탭 선택 상태를 다음 실행에
+  넘기지 않으므로 탭 전환 검증은 매 실행 전에 `session_state["main_tab"]`을 직접 넣어야 한다.
 - 외부 호출 실패는 **그 영역만** 안내 문구를 띄우고 넘어가야 한다 — 앱 전체가 죽으면 안 됨.
   실패 원인(HTTP 상태코드·응답 본문 등)은 `print()`로 남겨 Cloud "Manage app" 로그에서
   진단 가능하게 한다.
