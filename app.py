@@ -1759,9 +1759,9 @@ def _render_wealth_tab():
     # ---- 경제적 자유 계산기 -----------------------------------------------
     start = s["financial_net"] if fire.get("start_override") is None else fire["start_override"]
     f_years = int(fire.get("years") or 0)
-    f_asset = W.project_assets(start, fire.get("annual_saving") or 0, fire.get("inflation") or 0,
-                               f_years, fire.get("annual_return") or 0)
-    f_monthly = W.monthly_spend(f_asset, fire.get("annual_return") or 0)
+    f_real = W.real_return(fire.get("annual_return") or 0, fire.get("inflation") or 0)
+    f_asset = W.project_assets(start, fire.get("annual_saving") or 0, f_years, f_real)
+    f_monthly = W.monthly_spend(f_asset, f_real)
     with st.expander(f"🏖 경제적 자유 계산기 · 은퇴 후 월 사용액 {fmt(f_monthly)}",
                      key="wealth_exp_fire"):
         nf = dict(fire)
@@ -1777,7 +1777,7 @@ def _render_wealth_tab():
             st.caption(f"시작 금융 순자산: 현재 금융 순자산 {fmt(s['financial_net'])} (부동산 제외)")
         i1, i2 = st.columns(2)
         with i1:
-            nf["annual_saving"] = won_input("연간 저축액", "f_saving", fire.get("annual_saving"))
+            nf["annual_saving"] = won_input("연간 저축액(현재 구매력)", "f_saving", fire.get("annual_saving"))
             nf["years"] = st.number_input("은퇴까지 남은 연수", 0, 100, int(fire.get("years") or 0),
                                           key=K("f_years"))
             nf["annual_return"] = st.number_input("연 투자수익률 (%)", -50.0, 100.0,
@@ -1785,18 +1785,18 @@ def _render_wealth_tab():
         with i2:
             nf["target_monthly"] = won_input("목표 월 생활비(현재 구매력)", "f_target",
                                              fire.get("target_monthly"))
-            nf["inflation"] = st.number_input("물가상승률 = 저축 증가율 (%)", -10.0, 50.0,
+            nf["inflation"] = st.number_input("물가상승률 (%)", -10.0, 50.0,
                                               float(fire.get("inflation") or 0), 0.5, key=K("f_inf"))
 
         o1, o2, o3 = st.columns(3)
-        o1.metric(f"{f_years}년 후 은퇴 금융자산", fmt(f_asset))
-        o2.metric("은퇴 후 월 사용액(원금 유지)", fmt(f_monthly))
-        o3.metric("현재 구매력 기준 월 사용액",
-                  fmt(W.real_value(f_monthly, fire.get("inflation") or 0, f_years)))
+        o1.metric("실질수익률(수익률 − 물가)", f"{f_real:g}%")
+        o2.metric(f"{f_years}년 후 은퇴 금융자산", fmt(f_asset))
+        o3.metric("은퇴 후 월 사용액(원금 유지)", fmt(f_monthly))
+        if f_real <= 0:
+            st.warning("실질수익률이 0% 이하라 구매력을 지키면서 꺼내 쓸 수익이 없습니다(월 사용액 0원).")
         target = fire.get("target_monthly") or 0
         if target > 0:
-            n = W.years_to_target(start, fire.get("annual_saving") or 0, fire.get("inflation") or 0,
-                                  fire.get("annual_return") or 0, target)
+            n = W.years_to_target(start, fire.get("annual_saving") or 0, f_real, target)
             if n == 0:
                 st.success(f"목표 월 생활비 {fmt(target)}: 지금 가능합니다.")
             elif n is not None:
@@ -1805,10 +1805,11 @@ def _render_wealth_tab():
                 st.warning(f"목표 월 생활비 {fmt(target)}: 100년 내 도달할 수 없습니다.")
         else:
             st.caption("목표 월 생활비를 입력하면 도달 시점을 계산합니다.")
-        st.caption("월 사용액은 은퇴 후에도 연 투자수익률로 계속 투자한다고 보고, 은퇴 시점 금융자산(원금)이 "
-                   "줄지 않도록 매달 수익만 꺼내 쓰는 금액입니다(연 수익률을 월 복리로 환산). 금액이 매년 같으므로 "
-                   "물가가 오르는 만큼 실제 구매력은 해마다 줄어듭니다. 수익률은 입력한 가정일 뿐 매년 그만큼 "
-                   "난다는 보장이 아니며, 연금 수령 가능 시점·중도인출 제한·세금·수수료는 반영하지 않았습니다.")
+        st.caption("모든 금액은 현재 구매력(오늘의 돈 가치) 기준이며, 은퇴 전·후 모두 실질수익률"
+                   "(연 투자수익률 − 물가상승률)로 계산합니다. 연간 저축액은 물가만큼 매년 늘려 붓는다고 봅니다. "
+                   "월 사용액은 은퇴 시점 금융자산(원금)의 구매력이 줄지 않도록 매달 실질 수익만 꺼내 쓰는 "
+                   "금액입니다(월 복리 환산) — 실제로 받는 금액은 해마다 물가만큼 늘어납니다. 수익률·물가는 입력한 "
+                   "가정일 뿐 보장이 아니며, 연금 수령 가능 시점·중도인출 제한·세금·수수료는 반영하지 않았습니다.")
         if nf != fire:
             doc["fire"] = nf
             dirty = True

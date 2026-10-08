@@ -455,35 +455,34 @@ def period_last(records, period):
 # ---------------------------------------------------------------------------
 #  경제적 자유
 # ---------------------------------------------------------------------------
-def project_assets(start, annual_saving, inflation_pct, years, return_pct):
-    """매년 기존 자산에 수익률을 적용한 뒤 연말 저축액을 더한다. 저축액은 물가상승률만큼 증가."""
-    asset, saving = float(start), float(annual_saving)
-    r, g = return_pct / 100, inflation_pct / 100
+# 계산기는 전부 현재 구매력(오늘의 돈 가치) 기준이다. 수익률 자리에 실질수익률을 넣으므로
+# 결과 금액을 물가로 다시 깎지 않고, 저축액은 물가만큼 늘려 붓는다고 보아 매년 같은 값이다.
+def real_return(return_pct, inflation_pct):
+    return float(return_pct) - float(inflation_pct)
+
+
+def project_assets(start, annual_saving, years, rate_pct):
+    """매년 기존 자산에 수익률을 적용한 뒤 연말 저축액을 더한다."""
+    asset, r = float(start), rate_pct / 100
     for _ in range(int(years)):
-        asset = asset * (1 + r) + saving
-        saving *= 1 + g
+        asset = asset * (1 + r) + float(annual_saving)
     return asset
 
 
-def monthly_spend(asset, return_pct):
+def monthly_spend(asset, rate_pct):
     """은퇴 후에도 같은 수익률로 계속 투자할 때 원금(은퇴 시점 자산)이 줄지 않는 월 인출액 —
     매달 수익만 꺼내 쓴다. 연 수익률을 월 복리로 환산하므로 자산×수익률/12보다 조금 작다
     (그만큼 꺼내면 한 해 뒤 원금이 줄어든다). 수익률이 0 이하이면 꺼낼 수익이 없어 0."""
-    if return_pct <= 0:
+    if rate_pct <= 0:
         return 0.0
-    return asset * ((1 + return_pct / 100) ** (1 / 12) - 1)
+    return asset * ((1 + rate_pct / 100) ** (1 / 12) - 1)
 
 
-def real_value(amount, inflation_pct, years):
-    return amount / (1 + inflation_pct / 100) ** int(years)
-
-
-def years_to_target(start, annual_saving, inflation_pct, return_pct, target_monthly, max_years=100):
-    """현재 구매력 기준 월 사용액이 목표에 처음 도달하는 은퇴 시점(0~max_years년). 없으면 None."""
+def years_to_target(start, annual_saving, rate_pct, target_monthly, max_years=100):
+    """월 사용액이 목표에 처음 도달하는 은퇴 시점(0~max_years년). 없으면 None."""
     if target_monthly is None or target_monthly <= 0:
         return None
     for n in range(max_years + 1):
-        asset = project_assets(start, annual_saving, inflation_pct, n, return_pct)
-        if real_value(monthly_spend(asset, return_pct), inflation_pct, n) >= target_monthly:
+        if monthly_spend(project_assets(start, annual_saving, n, rate_pct), rate_pct) >= target_monthly:
             return n
     return None
