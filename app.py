@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 import requests
 import FinanceDataReader as fdr
 import yfinance as yf
@@ -1410,6 +1411,18 @@ def _wealth_property_trades(prop, today):
     return {"configured": True, "match": match, "errors": errors}
 
 
+def _wealth_rerun():
+    """은퇴 탭만 다시 그린다. 탭 안의 입력으로 시작된 실행이 아니면(페이지 첫 로딩 등)
+    fragment 범위 재실행이 허용되지 않아 전체 재실행으로 넘어간다."""
+    try:
+        st.rerun(scope="fragment")
+    except StreamlitAPIException:
+        st.rerun()
+
+
+# st.tabs는 모든 탭 코드를 매번 실행하므로, fragment로 떼어 놓지 않으면 이 탭의 입력 하나가
+# 앞의 7개 탭을 전부 다시 돌린다(저장 후 재실행까지 두 번).
+@st.fragment
 def _render_wealth_tab():
     fmt = W.format_krw
     st.caption("총자산 · 경제적 자유 — 다른 탭의 관심목록과는 별도로 관리하는 자산 목록입니다. "
@@ -1421,7 +1434,7 @@ def _render_wealth_tab():
         if entered:
             if hmac.compare_digest(entered.encode(), str(pw).encode()):
                 st.session_state.wealth_unlocked = True
-                st.rerun()
+                _wealth_rerun()
             st.error("비밀번호가 맞지 않습니다.")
         return
 
@@ -1431,7 +1444,7 @@ def _render_wealth_tab():
             st.error(f"{load_err} 기존 데이터를 덮어쓰지 않도록 이 탭을 열지 않았습니다.")
             if st.button("다시 시도", key="wealth_retry"):
                 _gist_fetch_content.clear()
-                st.rerun()
+                _wealth_rerun()
             return
         st.session_state.wealth_doc, st.session_state.wealth_mode = loaded, load_mode
         st.session_state.wealth_rev = 0
@@ -1450,7 +1463,7 @@ def _render_wealth_tab():
         st.session_state.wealth_saved_at = pd.Timestamp.now(tz="Asia/Seoul").strftime("%H:%M:%S")
         if reset_inputs:
             st.session_state.wealth_rev = rev + 1
-        st.rerun()
+        _wealth_rerun()
 
     def won_input(label, name, won, help=None):
         man = st.number_input(f"{label} (만원)", min_value=0, value=W.won_to_man(won), step=100,
