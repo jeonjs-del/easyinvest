@@ -1763,6 +1763,7 @@ def _render_wealth_tab():
     f_asset = W.project_assets(start, fire.get("annual_saving") or 0, fire.get("inflation") or 0,
                                f_years, fire.get("annual_return") or 0)
     f_monthly = W.monthly_spend(f_asset, f_real)
+    f_monthly4 = W.monthly_spend(f_asset, W.CONSERVATIVE_WITHDRAW_PCT)
     with st.expander(f"🏖 경제적 자유 계산기 · 은퇴 후 월 사용액 {fmt(f_monthly)}",
                      key="wealth_exp_fire"):
         nf = dict(fire)
@@ -1790,29 +1791,36 @@ def _render_wealth_tab():
                                               float(fire.get("inflation") or 0), 0.5, key=K("f_inf"))
 
         o1, o2, o3 = st.columns(3)
+        f_inf = fire.get("inflation") or 0
         o1.metric(f"{f_years}년 후 은퇴 금융자산", fmt(f_asset))
-        o2.metric("은퇴 후 월 사용액(은퇴 첫해)", fmt(f_monthly))
-        o3.metric("현재 가치 기준 월 사용액",
-                  fmt(W.real_value(f_monthly, fire.get("inflation") or 0, f_years)))
+        o2.metric(f"월 사용액 · 실질수익률 {f_real:g}% 인출", fmt(f_monthly))
+        o3.metric("〃 현재 가치", fmt(W.real_value(f_monthly, f_inf, f_years)))
+        _, c2, c3 = st.columns(3)
+        c2.metric(f"월 사용액 · 연 {W.CONSERVATIVE_WITHDRAW_PCT:g}% 인출(보수적)", fmt(f_monthly4))
+        c3.metric("〃 현재 가치", fmt(W.real_value(f_monthly4, f_inf, f_years)))
         if f_real <= 0:
-            st.warning(f"실질수익률이 {f_real:g}%라 원금의 구매력을 지키면서 꺼내 쓸 수익이 없습니다(월 사용액 0원).")
+            st.warning(f"실질수익률이 {f_real:g}%라 원금의 구매력을 지키면서 꺼내 쓸 수익이 없습니다"
+                       "(실질수익률 인출 기준 월 사용액 0원).")
         target = fire.get("target_monthly") or 0
         if target > 0:
-            n = W.years_to_target(start, fire.get("annual_saving") or 0, fire.get("inflation") or 0,
-                                  fire.get("annual_return") or 0, target)
-            if n == 0:
-                st.success(f"목표 월 생활비 {fmt(target)}: 지금 가능합니다.")
-            elif n is not None:
-                st.info(f"목표 월 생활비 {fmt(target)}: {n}년 후 가능합니다.")
-            else:
-                st.warning(f"목표 월 생활비 {fmt(target)}: 100년 내 도달할 수 없습니다.")
+            def _when(pct):
+                n = W.years_to_target(start, fire.get("annual_saving") or 0, f_inf,
+                                      fire.get("annual_return") or 0, pct, target)
+                return n, ("지금 가능" if n == 0 else f"{n}년 후 가능" if n is not None else "100년 내 도달 불가")
+
+            n, when = _when(f_real)
+            _, when4 = _when(W.CONSERVATIVE_WITHDRAW_PCT)
+            msg = (f"목표 월 생활비 {fmt(target)}(현재 가치): 실질수익률 인출 기준 {when} · "
+                   f"연 {W.CONSERVATIVE_WITHDRAW_PCT:g}% 인출 기준 {when4}")
+            (st.success if n == 0 else st.info if n is not None else st.warning)(msg)
         else:
             st.caption("목표 월 생활비를 입력하면 도달 시점을 계산합니다.")
         st.caption(f"은퇴 금융자산은 연 투자수익률로 불린 그때의 실제 금액입니다(연간 저축액은 물가만큼 매년 증액). "
-                   f"월 사용액은 실질수익률 {f_real:g}%(연 투자수익률 − 물가상승률)만큼만 매달 꺼내 쓰는 금액으로"
-                   "(월 복리 환산), 수익 중 물가 몫을 원금에 남기므로 원금과 월 사용액이 해마다 물가만큼 늘어 "
-                   "구매력이 유지됩니다. 현재 가치는 은퇴 첫해 월 사용액을 그때까지의 물가로 나눈 오늘의 돈 가치입니다. "
-                   "수익률·물가는 입력한 가정일 뿐 보장이 아니며, 연금 수령 가능 시점·중도인출 제한·세금·수수료는 "
+                   f"월 사용액은 은퇴 금융자산에서 한 해에 실질수익률 {f_real:g}%(연 투자수익률 − 물가상승률) 또는 "
+                   f"{W.CONSERVATIVE_WITHDRAW_PCT:g}%를 인출한다고 보고 12로 나눈 은퇴 첫해 금액이며, 현재 가치는 이를 "
+                   "그때까지의 물가로 나눈 오늘의 돈 가치입니다. 실질수익률만큼만 꺼내면 수익 중 물가 몫이 원금에 남아 "
+                   "원금의 구매력이 유지되고, 인출률이 실질수익률보다 높으면 원금의 구매력이 해마다 줄어듭니다. "
+                   "수익률·물가·인출률은 가정일 뿐 보장이 아니며, 연금 수령 가능 시점·중도인출 제한·세금·수수료는 "
                    "반영하지 않았습니다.")
         if nf != fire:
             doc["fire"] = nf

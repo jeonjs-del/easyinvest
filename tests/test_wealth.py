@@ -214,23 +214,26 @@ class FireTest(unittest.TestCase):
         self.assertEqual(W.real_return(5, 2), 3)
         self.assertEqual(W.real_return(2, 3.5), -1.5)
 
-    def test_monthly_spend_keeps_principal(self):
-        # 매달 수익률만큼 불어난 뒤 그 달 인출액을 빼면 원금이 그대로여야 한다
-        asset, pct = 1_200_000_000, 3
-        spend = W.monthly_spend(asset, pct)
-        monthly_rate = (1 + pct / 100) ** (1 / 12) - 1
+    def test_monthly_spend_is_annual_withdrawal_over_12(self):
+        self.assertAlmostEqual(W.monthly_spend(1_200_000_000, 4), 4_000_000)
+        self.assertAlmostEqual(W.monthly_spend(1_200_000_000, W.real_return(5, 2)), 3_000_000)
+        self.assertEqual(W.monthly_spend(1_200_000_000, 0), 0)
+        self.assertEqual(W.monthly_spend(1_200_000_000, -3), 0)    # 실질 손실 가정이면 꺼낼 수익이 없다
+        self.assertEqual(W.CONSERVATIVE_WITHDRAW_PCT, 4.0)
+
+    def test_real_rate_withdrawal_keeps_purchasing_power(self):
+        # 한 해를 명목수익률로 굴린 뒤 연초 자산의 실질수익률만큼 꺼내면 원금이 딱 물가만큼 늘어
+        # 구매력이 그대로다 (실질수익률을 r-g 단순 차감으로 쓰는 것과 맞아떨어지는 가정)
+        asset, r, g = 1_000_000_000, 5, 2
         left = asset
-        for _ in range(120):
-            left = left * (1 + monthly_rate) - spend
-        self.assertAlmostEqual(left, asset, delta=1)
-        self.assertLess(spend, asset * pct / 100 / 12)      # 단순 12등분은 원금을 깎는다
-        self.assertEqual(W.monthly_spend(asset, 0), 0)
-        self.assertEqual(W.monthly_spend(asset, -3), 0)     # 실질 손실 가정이면 꺼낼 수익이 없다
+        for year in range(1, 31):
+            left = left * (1 + r / 100) - W.monthly_spend(left, W.real_return(r, g)) * 12
+            self.assertAlmostEqual(W.real_value(left, g, year), asset, delta=1)
 
     def test_years_to_target(self):
-        # 인수: 시작, 저축, 물가, 명목수익률, 목표. 인출은 실질수익률(명목-물가) 기준
-        self.assertEqual(W.years_to_target(1_700_000_000, 0, 2, 5, 4_000_000), 0)         # 지금 가능
-        n = W.years_to_target(600_000_000, 30_000_000, 2, 6, 4_000_000)
+        # 인수: 시작, 저축, 물가, 명목수익률, 인출률, 목표
+        self.assertEqual(W.years_to_target(1_200_000_000, 0, 2, 5, 4, 4_000_000), 0)      # 지금 가능
+        n = W.years_to_target(600_000_000, 30_000_000, 2, 6, 4, 4_000_000)
         self.assertTrue(0 < n < 100)
 
         def spend_today(years):
@@ -238,8 +241,10 @@ class FireTest(unittest.TestCase):
             return W.real_value(W.monthly_spend(asset, 4), 2, years)
         self.assertGreaterEqual(spend_today(n), 4_000_000)
         self.assertLess(spend_today(n - 1), 4_000_000)                                    # 처음 도달하는 해
-        self.assertIsNone(W.years_to_target(1_000_000, 0, 3, 4, 4_000_000))               # 100년 내 불가
-        self.assertIsNone(W.years_to_target(10_000_000_000, 0, 3, 3, 4_000_000))          # 실질수익률 0
+        # 인출률이 낮을수록 같은 목표에 늦게 도달한다
+        self.assertGreater(W.years_to_target(600_000_000, 30_000_000, 2, 6, 3, 4_000_000), n)
+        self.assertIsNone(W.years_to_target(1_000_000, 0, 3, 4, 1, 4_000_000))            # 100년 내 불가
+        self.assertIsNone(W.years_to_target(10_000_000_000, 0, 3, 3, 0, 4_000_000))       # 실질수익률 0
 
 
 if __name__ == "__main__":

@@ -455,6 +455,10 @@ def period_last(records, period):
 # ---------------------------------------------------------------------------
 #  경제적 자유
 # ---------------------------------------------------------------------------
+# 실질수익률 인출과 나란히 보여 주는 보수적 가정(흔히 쓰는 4% 규칙)
+CONSERVATIVE_WITHDRAW_PCT = 4.0
+
+
 # 은퇴까지는 명목수익률로 불려 그때 실제로 손에 쥘 금액을 구하고, 은퇴 후 인출액만
 # 실질수익률로 잡는다 — 수익 중 물가 몫을 원금에 남겨야 원금의 구매력이 유지되기 때문이다.
 def real_return(return_pct, inflation_pct):
@@ -471,26 +475,25 @@ def project_assets(start, annual_saving, inflation_pct, years, return_pct):
     return asset
 
 
-def monthly_spend(asset, rate_pct):
-    """은퇴 후에도 같은 수익률로 계속 투자할 때 원금(은퇴 시점 자산)이 줄지 않는 월 인출액 —
-    매달 수익만 꺼내 쓴다. 연 수익률을 월 복리로 환산하므로 자산×수익률/12보다 조금 작다
-    (그만큼 꺼내면 한 해 뒤 원금이 줄어든다). 수익률이 0 이하이면 꺼낼 수익이 없어 0."""
-    if rate_pct <= 0:
+def monthly_spend(asset, withdraw_pct):
+    """자산의 withdraw_pct%를 한 해 인출액으로 보고 12로 나눈 월 사용액. 인출률이 0 이하
+    (실질수익률이 마이너스인 경우 등)이면 꺼낼 몫이 없어 0."""
+    if withdraw_pct <= 0:
         return 0.0
-    return asset * ((1 + rate_pct / 100) ** (1 / 12) - 1)
+    return asset * withdraw_pct / 100 / 12
 
 
 def real_value(amount, inflation_pct, years):
     return amount / (1 + inflation_pct / 100) ** int(years)
 
 
-def years_to_target(start, annual_saving, inflation_pct, return_pct, target_monthly, max_years=100):
+def years_to_target(start, annual_saving, inflation_pct, return_pct, withdraw_pct,
+                    target_monthly, max_years=100):
     """현재 가치 기준 월 사용액이 목표에 처음 도달하는 은퇴 시점(0~max_years년). 없으면 None."""
     if target_monthly is None or target_monthly <= 0:
         return None
-    rr = real_return(return_pct, inflation_pct)
     for n in range(max_years + 1):
         asset = project_assets(start, annual_saving, inflation_pct, n, return_pct)
-        if real_value(monthly_spend(asset, rr), inflation_pct, n) >= target_monthly:
+        if real_value(monthly_spend(asset, withdraw_pct), inflation_pct, n) >= target_monthly:
             return n
     return None
