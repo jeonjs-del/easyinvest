@@ -165,7 +165,8 @@ def default_doc():
     fin = {"debt": 0}
     for key, _, kind in SECTIONS:
         fin[key] = {"cash": 0} if kind is None else {"cash": 0, "holdings": []}
-    return {"version": 1, "property": dict(_DEFAULT_PROPERTY), "financial": fin,
+    # rev: 저장할 때마다 1씩 오르는 번호. 화면이 불러온 뒤 다른 화면이 저장했는지 가려낸다.
+    return {"version": 1, "rev": 0, "property": dict(_DEFAULT_PROPERTY), "financial": fin,
             "records": [], "fire": dict(DEFAULT_FIRE), "last_quotes": {}}
 
 
@@ -189,6 +190,8 @@ def normalize_doc(raw):
     if not isinstance(raw, dict):
         return doc
     raw = copy.deepcopy(raw)
+    if isinstance(raw.get("rev"), int) and not isinstance(raw["rev"], bool):
+        doc["rev"] = raw["rev"]
     if isinstance(raw.get("property"), dict):
         doc["property"].update(raw["property"])
     fin_raw = raw.get("financial") if isinstance(raw.get("financial"), dict) else {}
@@ -391,6 +394,47 @@ def match_trades(trades, complex_name, dong, area_m2, today, area_tol=1.0):
     same = [t for t in ok if t["date"] == latest]
     return {"date": latest, "price": int(statistics.median(t["price"] for t in same)),
             "count": len(same), "trades": same}
+
+
+_SIDO_SHORT = {"충청북도": "충북", "충청남도": "충남", "경상북도": "경북", "경상남도": "경남",
+               "전라북도": "전북", "전라남도": "전남"}
+
+
+def match_sigungu(address, table):
+    """주소 문자열에서 시군구 코드(5자리)를 찾는다. table: {코드: '서울특별시 강남구'}.
+    전체 이름이 들어 있으면 그것, 아니면 시도 없이 쓴 이름('강남구', '수원시 장안구')이 하나로
+    좁혀질 때만 — '중구'처럼 여러 곳이면 앞에 쓴 시도('서울', '부산광역시')로 가린다. 없으면 None."""
+    a = " ".join(str(address or "").split())
+    if not a:
+        return None
+    full = [c for c, n in table.items() if n in a]
+    if full:
+        return max(full, key=lambda c: len(table[c]))
+    tokens = a.split()
+    cands = []
+    for c, n in table.items():
+        sido, _, rest = n.partition(" ")
+        if all(t in tokens for t in (rest or sido).split()):
+            cands.append((c, sido))
+    if len(cands) > 1:
+        cands = [(c, sido) for c, sido in cands
+                 if any(t in (sido, sido[:2], _SIDO_SHORT.get(sido)) for t in tokens)]
+    return cands[0][0] if len(cands) == 1 else None
+
+
+def complex_options(trades):
+    """실거래 목록 → {'단지명 (법정동)': {'complex','dong','areas': [(전용면적, 건수), ...]}}.
+    취소된 거래는 뺀다. 최근 거래가 없는 단지는 목록에 나오지 않는다."""
+    out = {}
+    for t in trades:
+        if t["cancelled"] or not t["complex"]:
+            continue
+        o = out.setdefault(f"{t['complex']} ({t['dong']})",
+                           {"complex": t["complex"], "dong": t["dong"], "areas": {}})
+        o["areas"][t["area"]] = o["areas"].get(t["area"], 0) + 1
+    for o in out.values():
+        o["areas"] = sorted(o["areas"].items())
+    return dict(sorted(out.items()))
 
 
 def should_apply_trade(trade_date, acquired_on, value_asof):

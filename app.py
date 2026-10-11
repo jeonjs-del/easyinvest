@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import secrets
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -1249,28 +1250,52 @@ def load_wealth():
     return W.normalize_doc(local), "local", None
 
 
-def save_wealth(doc, mode):
-    """저장 성공 여부 반환. 자산 데이터는 저장 실패를 조용히 넘기지 않는다."""
-    body = json.dumps(doc, ensure_ascii=False, indent=2)
+def _wealth_stored_rev(mode):
+    """저장소에 지금 들어 있는 문서의 rev(캐시 없이 조회). 문서가 아직 없으면 0."""
     if mode == "gist":
-        try:
+        token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
+        r = requests.get(f"https://api.github.com/gists/{gist_id}", headers=_gist_headers(token), timeout=10)
+        r.raise_for_status()
+        f = r.json().get("files", {}).get(WEALTH_GIST_FILENAME)
+        content = f.get("content", "") if f else ""
+    elif os.path.exists(WEALTH_FILE):
+        with open(WEALTH_FILE, encoding="utf-8") as f:
+            content = f.read()
+    else:
+        content = ""
+    rev = json.loads(content).get("rev") if content.strip() else 0
+    return rev if isinstance(rev, int) else 0
+
+
+def save_wealth(doc, mode):
+    """'ok' | 'conflict' | 'error'. 자산 데이터는 저장 실패를 조용히 넘기지 않는다.
+    문서를 통째로 저장하므로, 이 화면이 불러온 뒤 다른 화면(다른 기기·탭)이 저장했으면 덮어쓰지
+    않고 'conflict'를 돌려준다 — 오래 열어 둔 화면이 그 사이 입력된 값을 지워 버린 전례가 있다."""
+    rev = int(doc.get("rev") or 0)
+    try:
+        if _wealth_stored_rev(mode) != rev:
+            return "conflict"
+    except Exception as e:
+        print(f"[wealth] 저장 전 확인 실패: {type(e).__name__}")
+        return "error"
+    doc["rev"] = rev + 1
+    body = json.dumps(doc, ensure_ascii=False, indent=2)
+    try:
+        if mode == "gist":
             token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
             r = requests.patch(f"https://api.github.com/gists/{gist_id}",
                                headers=_gist_headers(token),
                                json={"files": {WEALTH_GIST_FILENAME: {"content": body}}}, timeout=15)
             r.raise_for_status()
             _gist_fetch_content.clear()
-            return True
-        except Exception as e:
-            print(f"[wealth] Gist 저장 실패: {type(e).__name__}")
-            return False
-    try:
-        with open(WEALTH_FILE, "w", encoding="utf-8") as f:
-            f.write(body)
-        return True
+        else:
+            with open(WEALTH_FILE, "w", encoding="utf-8") as f:
+                f.write(body)
+        return "ok"
     except Exception as e:
-        print(f"[wealth] 로컬 저장 실패: {type(e).__name__}: {e}")
-        return False
+        doc["rev"] = rev
+        print(f"[wealth] 저장 실패({mode}): {type(e).__name__}")
+        return "error"
 
 
 def _wealth_secret(section, key):
@@ -1388,16 +1413,20 @@ def _molit_month(lawd_cd, ym, _day):
         page += 1
 
 
-def _wealth_property_trades(prop, today):
-    """최근 12개월 실거래 매칭 결과. {'configured','match','errors'}"""
-    if not _wealth_secret("MOLIT_SERVICE_KEY", ""):
-        return {"configured": False, "match": None, "errors": []}
-    lawd = str(prop.get("lawd_cd") or "").strip()
-    if not (re.fullmatch(r"\d{5}", lawd) and prop.get("trade_complex") and prop.get("dong")
-            and float(prop.get("area_m2") or 0) > 0):
-        return {"configured": True, "match": None,
-                "errors": ["지역코드(5자리)·실거래가 조회 단지명·법정동·전용면적을 입력해야 조회합니다."]}
+@st.cache_data(ttl=60 * 60 * 24)
+def _lawd_sigungu():
+    """{시군구 코드 5자리: '서울특별시 강남구'} — 행정표준코드 법정동코드 전체자료에서 뽑아 둔 표.
+    구가 있는 시(수원시 등)는 실거래가가 구 단위로만 조회돼 시 자체는 빠져 있다."""
+    try:
+        with open(os.path.join("data", "lawd_sigungu.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[wealth] 지역코드 표 읽기 실패: {type(e).__name__}")
+        return {}
 
+
+def _wealth_lawd_trades(lawd, today):
+    """한 시군구의 최근 12개월 아파트 매매 실거래 전체. (trades, errors)"""
     def _one(ym):
         try:
             return _molit_month(lawd, ym, today.isoformat()), None
@@ -1407,10 +1436,25 @@ def _wealth_property_trades(prop, today):
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         results = list(ex.map(_one, W.recent_months(today, 12)))
-    trades = [t for got, _ in results for t in got]
-    errors = [e for _, e in results if e]
+    return [t for got, _ in results for t in got], [e for _, e in results if e]
+
+
+def _wealth_property_trades(prop, today):
+    """최근 12개월 실거래 매칭 결과. {'configured','match','errors','complexes'}
+    complexes: 그 지역에서 거래된 단지 목록(단지 입력칸의 자동 목록용)."""
+    if not _wealth_secret("MOLIT_SERVICE_KEY", ""):
+        return {"configured": False, "match": None, "errors": [], "complexes": {}}
+    lawd = str(prop.get("lawd_cd") or "").strip()
+    if not re.fullmatch(r"\d{5}", lawd):
+        return {"configured": True, "match": None, "complexes": {},
+                "errors": ["주소에서 시·군·구를 고르면(또는 지역코드 5자리를 넣으면) 조회합니다."]}
+    trades, errors = _wealth_lawd_trades(lawd, today)
+    complexes = W.complex_options(trades)
+    if not (prop.get("trade_complex") and prop.get("dong") and float(prop.get("area_m2") or 0) > 0):
+        return {"configured": True, "match": None, "complexes": complexes,
+                "errors": errors or ["단지를 목록에서 고르고 전용면적을 입력하면 평가액을 갱신합니다."]}
     match = W.match_trades(trades, prop["trade_complex"], prop["dong"], prop["area_m2"], today)
-    return {"configured": True, "match": match, "errors": errors}
+    return {"configured": True, "match": match, "errors": errors, "complexes": complexes}
 
 
 SHEET_KINDS = ("pension", "stock", "crypto", "debt")
@@ -1441,7 +1485,9 @@ def _sheet_get(kind, path, **params):
     return r.text
 
 
-@st.cache_data(ttl=60 * 10, show_spinner=False)
+# 시트를 고치면 바로 보여야 하므로 캐시는 짧게 둔다 — 입력칸을 연달아 고칠 때 매번 시트 4개를
+# 다시 받지 않게 하는 정도. 페이지를 새로 열면(_render_wealth_tab) 이 캐시도 비우고 새로 받는다.
+@st.cache_data(ttl=30, show_spinner=False)
 def _sheet_fetch(kind):
     """스프레드시트 하나에서 이름 규칙상 가장 최신 시트를 읽어 파싱한다. 실패는 예외로 올려
     캐시에 남기지 않는다. 반환: {'sheet': 시트 이름, 'data': {...}}"""
@@ -1514,6 +1560,7 @@ def _render_wealth_tab():
         return
 
     if "wealth_doc" not in st.session_state:
+        _sheet_fetch.clear()
         loaded, load_mode, load_err = load_wealth()
         if load_err:
             st.error(f"{load_err} 기존 데이터를 덮어쓰지 않도록 이 탭을 열지 않았습니다.")
@@ -1523,17 +1570,34 @@ def _render_wealth_tab():
             return
         st.session_state.wealth_doc, st.session_state.wealth_mode = loaded, load_mode
         st.session_state.wealth_rev = 0
+        # 문서를 불러올 때마다 입력칸 key를 새로 만든다. 서버가 재시작된 뒤 예전에 열어 둔 브라우저
+        # 화면이 다시 붙으면 그 화면에 남아 있던 옛 입력값을 같은 key로 보내오는데, key가 같으면
+        # 그 값이 "사용자가 방금 고친 값"으로 읽혀 저장된 데이터를 덮어쓴다(부동산·계산기 값이
+        # 통째로 초기화된 사고의 원인).
+        st.session_state.wealth_sid = secrets.token_hex(3)
     doc, mode = st.session_state.wealth_doc, st.session_state.wealth_mode
-    rev = st.session_state.wealth_rev
+    rev, sid = st.session_state.wealth_rev, st.session_state.wealth_sid
+    if st.session_state.pop("wealth_conflict", False):
+        st.warning("다른 화면(다른 기기·탭)에서 데이터가 바뀌어 최신 값을 다시 불러왔습니다. "
+                   "방금 이 화면에서 바꾼 값은 저장되지 않았으니 다시 입력해 주세요.")
     prop, fin, fire = doc["property"], doc["financial"], doc["fire"]
     today = pd.Timestamp.now(tz="Asia/Seoul").date()
 
     def K(name):
         # 가져오기·실거래가 반영처럼 화면 밖에서 값이 바뀌면 rev를 올려 입력칸을 새 값으로 다시 만든다
-        return f"w{rev}_{name}"
+        return f"w{sid}_{rev}_{name}"
+
+    def save():
+        res = save_wealth(doc, mode)
+        if res == "conflict":
+            _gist_fetch_content.clear()
+            del st.session_state["wealth_doc"]
+            st.session_state.wealth_conflict = True
+            _wealth_rerun()
+        return res == "ok"
 
     def commit(reset_inputs=False):
-        ok = save_wealth(doc, mode)
+        ok = save()
         st.session_state.wealth_save_err = not ok
         st.session_state.wealth_saved_at = pd.Timestamp.now(tz="Asia/Seoul").strftime("%H:%M:%S")
         if reset_inputs:
@@ -1583,7 +1647,7 @@ def _render_wealth_tab():
         prop.update(value=tm["price"], value_asof=tm["date"].isoformat(), value_source="molit")
         commit(reset_inputs=True)
     if quotes_changed:
-        save_wealth(doc, mode)   # 장애 때 쓸 정상 시세 보관(종목당 하루 한 번꼴)
+        save()   # 장애 때 쓸 정상 시세 보관(종목당 하루 한 번꼴)
 
     s = W.summarize(doc, quotes)
     c1, c2, c3, c4 = st.columns(4)
@@ -1605,8 +1669,19 @@ def _render_wealth_tab():
                      key="wealth_exp_property"):
         new = dict(prop)
         a1, a2 = st.columns(2)
-        new["address"] = a1.text_input("주소", prop.get("address") or "", key=K("p_address"))
-        new["complex"] = a2.text_input("단지", prop.get("complex") or "", key=K("p_complex"))
+        sigungu = _lawd_sigungu()
+        complexes = trade_info["complexes"]
+
+        def pick(col, label, options, current, name, placeholder):
+            # 목록에서 고르거나 목록에 없는 값을 그대로 입력할 수 있는 칸. 저장된 값이 목록에 없으면 맨 앞에 끼운다.
+            opts = ([current] if current and current not in options else []) + list(options)
+            return col.selectbox(label, opts, index=opts.index(current) if current else None,
+                                 accept_new_options=True, placeholder=placeholder, key=K(name)) or ""
+
+        new["address"] = pick(a1, "주소", sorted(sigungu.values()), prop.get("address") or "", "p_address",
+                              "시·군·구 입력 → 목록에서 선택 (예: 강남구)")
+        new["complex"] = pick(a2, "단지", list(complexes), prop.get("complex") or "", "p_complex",
+                              "단지명 입력 → 목록에서 선택" if complexes else "주소를 먼저 고르면 단지 목록이 나옵니다")
         b1, b2, b3, b4 = st.columns(4)
         new["pyeong"] = b1.text_input("평형", str(prop.get("pyeong") or ""), key=K("p_pyeong"))
         new["area_m2"] = b2.number_input("전용면적 (㎡)", min_value=0.0, step=1.0, format="%.2f",
@@ -1640,6 +1715,24 @@ def _render_wealth_tab():
         new["dong"] = t2.text_input("법정동", prop.get("dong") or "", key=K("p_dong"))
         new["lawd_cd"] = t3.text_input("지역코드(5자리)", str(prop.get("lawd_cd") or ""),
                                         key=K("p_lawd")).strip()
+        # 목록에서 고른 값으로 실거래가 조회 조건을 채운다 — 고른 순간(값이 바뀐 실행)에만 채워서,
+        # 그 뒤 아래 칸을 직접 고친 값을 다시 덮어쓰지 않는다.
+        auto_filled = False
+        if new["address"] != (prop.get("address") or ""):
+            code = W.match_sigungu(new["address"], sigungu)
+            if code and code != new["lawd_cd"]:
+                new["lawd_cd"], auto_filled = code, True
+        if new["complex"] != (prop.get("complex") or "") and new["complex"] in complexes:
+            picked = complexes[new["complex"]]
+            new["trade_complex"], new["dong"], auto_filled = picked["complex"], picked["dong"], True
+            if len(picked["areas"]) == 1:
+                new["area_m2"] = float(picked["areas"][0][0])
+        known = next((o for o in complexes.values()
+                      if o["complex"] == new["trade_complex"] and o["dong"] == new["dong"]), None)
+        if known:
+            st.caption("최근 12개월 거래된 전용면적: "
+                       + " · ".join(f"{a:g}㎡({n}건)" for a, n in known["areas"])
+                       + " — 위 전용면적 칸에 내 집 면적을 넣으세요.")
         if not trade_info["configured"]:
             st.info("실거래가 자동 조회가 꺼져 있습니다 — secrets에 `MOLIT_SERVICE_KEY`(공공데이터포털 "
                     "아파트 매매 실거래가 인증키)를 넣으면 최근 12개월 거래로 평가액을 갱신합니다.")
@@ -1669,7 +1762,7 @@ def _render_wealth_tab():
                     new["value_asof"] = today.isoformat()   # 평가액만 고쳤으면 기준일은 오늘
                     asof_moved = True
             doc["property"] = new
-            commit(reset_inputs=asof_moved)
+            commit(reset_inputs=asof_moved or auto_filled)
 
     # ---- 금융자산 ---------------------------------------------------------
     with st.expander(f"💵 금융자산 · 평가액 {fmt(s['financial'])} · 부채 {fmt(s['financial_debt'])}",
@@ -1677,7 +1770,7 @@ def _render_wealth_tab():
         st.caption("현금 잔액과 종목 평가액은 겹치지 않게 입력하세요(종목으로 넣은 금액을 현금에 또 넣지 않기). "
                    "종목 가격은 한국 시간 기준 전일까지 마감된 일봉의 실제 종가이며 실시간 시세가 아닙니다.")
         if sheets["managed"]:
-            st.caption("📄 Google 시트 연동 중 — 시트로 관리하는 항목은 10분마다 다시 확인합니다.")
+            st.caption("📄 Google 시트 연동 중 — 페이지를 새로 열 때와 이 탭의 값을 고칠 때(30초 간격) 시트를 다시 읽습니다.")
             if st.button("🔄 시트에서 지금 다시 가져오기", key=K("sheet_refresh")):
                 _sheet_fetch.clear()
                 _wealth_rerun()
@@ -1973,6 +2066,7 @@ def _render_wealth_tab():
                            "보유 종목 "
                            f"{sum(len(imported['financial'][k]['holdings']) for k, _, kd in W.SECTIONS if kd)}개")
                 if st.button("현재 데이터를 이 파일로 교체", key=K("io_apply")):
+                    imported["rev"] = doc["rev"]   # 가져온 파일의 번호가 아니라 지금 저장소 기준으로 이어 간다
                     st.session_state.wealth_doc = imported
                     doc = imported
                     commit(reset_inputs=True)

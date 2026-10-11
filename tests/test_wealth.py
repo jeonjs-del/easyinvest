@@ -351,5 +351,42 @@ class SheetTest(unittest.TestCase):
             W.parse_gviz_column('x({"status":"error"});')
 
 
+class SafetyTest(unittest.TestCase):
+    def test_rev_survives_roundtrip_and_defaults_to_zero(self):
+        self.assertEqual(W.default_doc()["rev"], 0)
+        self.assertEqual(W.normalize_doc({"financial": {}})["rev"], 0)          # rev가 없던 예전 문서
+        self.assertEqual(W.normalize_doc({"rev": 7})["rev"], 7)
+        self.assertEqual(W.normalize_doc({"rev": "7"})["rev"], 0)
+
+
+class AddressTest(unittest.TestCase):
+    TABLE = {"11140": "서울특별시 중구", "11680": "서울특별시 강남구", "26110": "부산광역시 중구",
+             "41111": "경기도 수원시 장안구", "36110": "세종특별자치시", "43740": "충청북도 영동군"}
+
+    def test_match_sigungu(self):
+        m = lambda a: W.match_sigungu(a, self.TABLE)
+        self.assertEqual(m("서울특별시 강남구"), "11680")
+        self.assertEqual(m("서울특별시 강남구 가나로 12, 101동"), "11680")
+        self.assertEqual(m("강남구 가나동"), "11680")                 # 시도 없이도 하나뿐이면
+        self.assertEqual(m("수원시 장안구 다라동"), "41111")
+        self.assertEqual(m("세종특별자치시 마바동"), "36110")
+        self.assertEqual(m("충북 영동군"), "43740")
+        self.assertIsNone(m("중구 사아동"))                           # 여러 곳이라 못 정함
+        self.assertEqual(m("서울 중구 사아동"), "11140")              # 시도로 가림
+        self.assertEqual(m("부산광역시 중구"), "26110")
+        self.assertIsNone(m("어디에도 없는 주소"))
+        self.assertIsNone(m(""))
+
+    def test_complex_options(self):
+        d = date(2026, 9, 1)
+        t = lambda c, dong, area, cancelled=False: {"complex": c, "dong": dong, "area": area, "date": d,
+                                                    "price": 1, "floor": "1", "cancelled": cancelled}
+        opts = W.complex_options([t("나단지", "가동", 84.9), t("가단지", "가동", 59.9), t("가단지", "가동", 59.9),
+                                  t("가단지", "가동", 84.5), t("가단지", "나동", 59.9),
+                                  t("취소단지", "가동", 59.9, cancelled=True)])
+        self.assertEqual(list(opts), ["가단지 (가동)", "가단지 (나동)", "나단지 (가동)"])   # 같은 이름도 동이 다르면 따로
+        self.assertEqual(opts["가단지 (가동)"], {"complex": "가단지", "dong": "가동", "areas": [(59.9, 2), (84.5, 1)]})
+
+
 if __name__ == "__main__":
     unittest.main()
