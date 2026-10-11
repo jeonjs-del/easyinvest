@@ -247,5 +247,109 @@ class FireTest(unittest.TestCase):
         self.assertIsNone(W.years_to_target(10_000_000_000, 0, 3, 3, 0, 4_000_000))       # 실질수익률 0
 
 
+def _grid(cells, n_rows=30, n_cols=12):
+    """{'B13': 'x', ...} → CSV를 읽은 것과 같은 2차원 목록."""
+    rows = [[""] * n_cols for _ in range(n_rows)]
+    for ref, v in cells.items():
+        rows[int(ref[1:]) - 1][ord(ref[0]) - ord("A")] = v
+    return rows
+
+
+class SheetTest(unittest.TestCase):
+    def test_latest_sheet_by_name_rule(self):
+        html = ('items.push({name: "26-09", pageUrl: "x", gid: "11"});'
+                'items.push({name: "26-10", pageUrl: "x", gid: "22"});'
+                'items.push({name: "26-05_14", pageUrl: "x", gid: "33"});'
+                'items.push({name: "9월 1일", pageUrl: "x", gid: "44"});'
+                'items.push({name: "25-전략", pageUrl: "x", gid: "55"});'
+                'items.push({name: "26-전략", pageUrl: "x", gid: "66"});'
+                'items.push({name: "25-전략_6월", pageUrl: "x", gid: "77"});'
+                'items.push({name: "2025", pageUrl: "x", gid: "88"});'
+                'items.push({name: "2026", pageUrl: "x", gid: "99"});'
+                'items.push({name: "2023_12월", pageUrl: "x", gid: "0"});')
+        tabs = W.parse_sheet_tabs(html)
+        self.assertEqual(len(tabs), 10)
+        self.assertEqual(W.pick_latest_sheet(tabs, W.SHEET_NAME_PATTERNS["pension"]), ("26-10", "22"))
+        self.assertEqual(W.pick_latest_sheet(tabs, W.SHEET_NAME_PATTERNS["crypto"]), ("26-전략", "66"))
+        self.assertEqual(W.pick_latest_sheet(tabs, W.SHEET_NAME_PATTERNS["debt"]), ("2026", "99"))
+        self.assertIsNone(W.pick_latest_sheet([("메모", "1")], W.SHEET_NAME_PATTERNS["stock"]))
+
+    def test_parse_amount(self):
+        self.assertEqual(W.parse_amount("₩12,300,000"), 12_300_000)
+        self.assertEqual(W.parse_amount(" ₩ 4,560,000 "), 4_560_000)
+        self.assertEqual(W.parse_amount("1234"), 1234)
+        for bad in ("", "#N/A", "#DIV/0!", "현재 합계", None):
+            self.assertIsNone(W.parse_amount(bad))
+
+    def test_pension_sheet_rows(self):
+        cells = {"A13": "듀얼 모멘텀", "B13": "가 ETF", "C13": "111110", "F13": "100",
+                 "A14": "듀얼모멘텀_IRP", "B14": "나 ETF", "C14": "222220", "F14": "10",
+                 "B15": "다 ETF", "C15": "333330", "F15": "20",
+                 "F16": "현재 합계", "G16": " ₩ 1,000 ",                      # 소계 행은 대상이 아님
+                 "A17": "LAA_DC계좌", "B17": "가 ETF", "C17": "111110", "F17": "1,000",
+                 "B25": "라 ETF", "C25": "0066W0", "F25": "0",                # 수량 0 → 제외
+                 "B26": "마 ETF", "C26": "0172V0", "F26": "7",
+                 "B28": "나 ETF", "C28": "222220", "F28": "5",                # 같은 종목은 합산
+                 "B29": "범위 밖", "C29": "999990", "F29": "9"}
+        got = W.parse_pension_sheet(_grid(cells))
+        personal, skipped = got["personal"]
+        self.assertEqual([(h["symbol"], h["qty"]) for h in personal], [("111110", 100)])
+        self.assertEqual(skipped, [])
+        retirement, skipped = got["retirement"]
+        self.assertEqual([(h["symbol"], h["qty"]) for h in retirement],
+                         [("222220", 15), ("333330", 20), ("111110", 1000), ("0172V0", 7)])
+        self.assertEqual(skipped, [])
+        self.assertTrue(all(h["market"] == "KR" for h in retirement))
+
+    def test_pension_sheet_detects_shifted_rows(self):
+        with self.assertRaises(ValueError):
+            W.parse_pension_sheet(_grid({"A14": "듀얼 모멘텀", "B14": "가 ETF", "C14": "111110", "F14": "1"}))
+
+    def test_stock_sheet_takes_rows_under_header(self):
+        cells = {"A7": "합계", "A9": "종목", "C9": "티커", "E9": "보유 수량",
+                 "A10": "가 주식", "C10": "5930", "E10": "166",                # 앞자리 0이 빠진 코드
+                 "A11": "나 ETF", "C11": "0172V0", "E11": "1,486",
+                 "A12": "미국 주식", "C12": "spy", "E12": "3",
+                 "A14": "코스피", "B14": "2500.12"}                           # 빈 행 뒤는 대상이 아님
+        rows = _grid(cells)
+        self.assertEqual(W.stock_rows(rows), [10, 11, 12])
+        holdings, skipped = W.parse_stock_sheet(rows)
+        self.assertEqual([(h["market"], h["symbol"], h["qty"]) for h in holdings],
+                         [("KR", "005930", 166), ("KR", "0172V0", 1486), ("US", "SPY", 3)])
+        self.assertEqual(skipped, [])
+        # 종목이 줄어들면 줄어든 만큼만
+        del cells["A11"], cells["A12"]
+        self.assertEqual(len(W.parse_stock_sheet(_grid(cells))[0]), 1)
+        with self.assertRaises(ValueError):
+            W.stock_rows(_grid({"A1": "합계"}))
+
+    def test_crypto_sheet_uses_raw_quantities(self):
+        cells = {"A7": "코드번호", "A8": "BTC", "B8": "비트코인", "D8": "0.12",
+                 "A9": "ETH", "B9": "이더리움", "D9": "3.21",
+                 "A10": "ZZZ", "B10": "모르는 코인", "D10": "1.00"}
+        holdings, skipped = W.parse_crypto_sheet(_grid(cells), [0.12345678, 3.21098765, 1.0])
+        self.assertEqual([(h["symbol"], h["qty"]) for h in holdings], [("BTC", 0.12345678), ("ETH", 3.21098765)])
+        self.assertEqual(holdings[0]["name"], "비트코인 (BTC)")
+        self.assertEqual(len(skipped), 1)                                      # allowlist에 없는 코인
+        # 원본 수량을 못 받은 행은 잘린 표시값으로 대신하지 않고 건너뛴다
+        holdings, skipped = W.parse_crypto_sheet(_grid(cells), [None, 3.21098765, None])
+        self.assertEqual([h["symbol"] for h in holdings], ["ETH"])
+        self.assertEqual(len(skipped), 2)
+
+    def test_debt_cell(self):
+        self.assertEqual(W.parse_debt_sheet(_grid({"B9": "대출", "D9": "₩12,300,000"})), 12_300_000)
+        self.assertEqual(W.parse_debt_sheet(_grid({"D9": "₩0"})), 0)
+        with self.assertRaises(ValueError):
+            W.parse_debt_sheet(_grid({"B9": "대출"}))
+
+    def test_gviz_column(self):
+        text = ('/*O_o*/\ngoogle.visualization.Query.setResponse({"version":"0.6","status":"ok","table":'
+                '{"cols":[{"id":"D","type":"number"}],"rows":[{"c":[{"v":0.12345678,"f":"0.12"}]},'
+                '{"c":[null]},{"c":[{"v":"합계"}]}]}});')
+        self.assertEqual(W.parse_gviz_column(text), [0.12345678, None, None])
+        with self.assertRaises(ValueError):
+            W.parse_gviz_column('x({"status":"error"});')
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ tests/test_wealth.py로 오프라인 검증한다. 모든 금액의 내부 단�
 """
 import calendar
 import copy
+import json
 import re
 import statistics
 import xml.etree.ElementTree as ET
@@ -497,3 +498,139 @@ def years_to_target(start, annual_saving, inflation_pct, return_pct, withdraw_pc
         if real_value(monthly_spend(asset, withdraw_pct), inflation_pct, n) >= target_monthly:
             return n
     return None
+
+
+# ---------------------------------------------------------------------------
+#  Google 스프레드시트 연동 — 여기는 응답 파싱만, 조회는 app.py
+# ---------------------------------------------------------------------------
+# 금융자산 항목 → 값을 가져오는 스프레드시트 종류. 예금과 각 항목의 현금 잔액은 직접 입력이다.
+SHEET_SECTIONS = {"personal": "pension", "retirement": "pension", "stock": "stock", "crypto": "crypto"}
+# 종류별 "가장 최신 시트" 이름 규칙(전체 일치). 자릿수가 고정이라 문자열 최댓값이 곧 최신이다.
+SHEET_NAME_PATTERNS = {"pension": r"\d{2}-\d{2}", "stock": r"\d{2}-\d{2}",
+                       "crypto": r"\d{2}-전략", "debt": r"\d{4}"}
+# 연금 시트: B=종목명, C=티커, F=보유 수량. 13행이 개인연금, 14·15·17~28행이 퇴직연금
+# (16행은 소계). 보유 수량이 0인 행은 건너뛴다.
+PENSION_PERSONAL_ROWS = (13,)
+PENSION_PERSONAL_LABEL = "듀얼모멘텀"          # A13, 공백 제거 후 비교 — 행이 밀렸는지 확인용
+PENSION_RETIREMENT_ROWS = (14, 15) + tuple(range(17, 29))
+CRYPTO_ROWS = (8, 9, 10)                         # A=심볼, D=수량
+DEBT_CELL = "D9"
+STOCK_HEADER = "종목"                            # A열 머리글. 그 아래 A열이 빌 때까지가 보유 종목
+
+
+def parse_sheet_tabs(html):
+    """스프레드시트 htmlview 페이지에서 [(시트 이름, gid), ...]."""
+    out = []
+    for name, gid in re.findall(r'items\.push\(\{name: "((?:[^"\\]|\\.)*)", pageUrl: "[^"]*", gid: "(\d+)"', html):
+        name = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), name)
+        try:
+            name = json.loads(f'"{name}"')
+        except ValueError:
+            pass
+        out.append((name, gid))
+    return out
+
+
+def pick_latest_sheet(tabs, pattern):
+    """이름이 pattern에 전체 일치하는 시트 중 이름이 가장 큰 것. 없으면 None."""
+    ok = [t for t in tabs if re.fullmatch(pattern, t[0].strip())]
+    return max(ok, key=lambda t: t[0].strip()) if ok else None
+
+
+def parse_amount(text):
+    """'₩12,300,000' · ' ₩ 4,560,000 ' · '1234' → 숫자. 빈칸·'#N/A' 등은 None."""
+    t = re.sub(r"[₩$,\s]", "", str(text if text is not None else ""))
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    return v if v == v and abs(v) != float("inf") else None
+
+
+def sheet_cell(rows, ref):
+    """rows(CSV를 읽은 2차원 목록)에서 'D9' 같은 칸의 문자열. 범위 밖이면 ''."""
+    m = re.fullmatch(r"([A-Z])(\d+)", ref)
+    r, c = int(m.group(2)) - 1, ord(m.group(1)) - ord("A")
+    return rows[r][c].strip() if r < len(rows) and c < len(rows[r]) else ""
+
+
+def stock_rows(rows):
+    """주식 시트에서 A열 '종목' 머리글 바로 아래부터 A열이 빌 때까지의 행 번호."""
+    for i, row in enumerate(rows):
+        if row and row[0].strip() == STOCK_HEADER:
+            out = []
+            for j in range(i + 1, len(rows)):
+                if not (rows[j] and rows[j][0].strip()):
+                    break
+                out.append(j + 1)
+            return out
+    raise ValueError("'종목' 머리글을 찾지 못했습니다")
+
+
+def sheet_holdings(rows, row_numbers, name_col, code_col, qty_col, market, raw_qty=None):
+    """지정한 행들에서 보유 종목을 읽는다. 반환: (holdings, 건너뛴 사유 목록).
+    market: 'KR' | 'CRYPTO' | 'AUTO'(숫자가 섞인 코드는 국내, 영문뿐이면 미국).
+    raw_qty: 표시 서식에 잘리지 않은 수량 목록(row_numbers와 같은 순서) — 코인처럼 소수 수량이
+    화면엔 둘째 자리까지만 보이는 경우에 쓴다. 수량이 0이거나 코드가 빈 행은 조용히 건너뛴다."""
+    holdings, skipped = [], []
+    for k, rn in enumerate(row_numbers):
+        code = sheet_cell(rows, f"{code_col}{rn}").upper()
+        name = sheet_cell(rows, f"{name_col}{rn}")
+        qty = raw_qty[k] if raw_qty is not None else parse_amount(sheet_cell(rows, f"{qty_col}{rn}"))
+        if not code and not name:
+            continue
+        if not isinstance(qty, (int, float)) or isinstance(qty, bool) or qty != qty:
+            skipped.append(f"{rn}행 {name or code}: 수량을 읽지 못함")
+            continue
+        if qty <= 0:
+            continue
+        mk = market
+        if mk == "AUTO":
+            mk = "KR" if re.search(r"\d", code) else "US"
+        if mk == "KR":
+            code = code.zfill(6)
+        if not valid_symbol(mk, code):
+            skipped.append(f"{rn}행 {name or code}: 등록할 수 없는 코드 '{code}'")
+            continue
+        if mk == "CRYPTO":
+            name = f"{CRYPTO_CATALOG[code][0]} ({code})"
+        holdings = upsert_holding(holdings, mk, code, name or code, qty)
+    return holdings, skipped
+
+
+def parse_pension_sheet(rows):
+    """연금 시트 → {'personal': (holdings, skipped), 'retirement': (holdings, skipped)}."""
+    label = re.sub(r"\s", "", sheet_cell(rows, f"A{PENSION_PERSONAL_ROWS[0]}"))
+    if label != PENSION_PERSONAL_LABEL:
+        raise ValueError(f"A{PENSION_PERSONAL_ROWS[0]}이 '듀얼 모멘텀'이 아닙니다(행 배치가 바뀜)")
+    return {"personal": sheet_holdings(rows, PENSION_PERSONAL_ROWS, "B", "C", "F", "KR"),
+            "retirement": sheet_holdings(rows, PENSION_RETIREMENT_ROWS, "B", "C", "F", "KR")}
+
+
+def parse_stock_sheet(rows):
+    return sheet_holdings(rows, stock_rows(rows), "A", "C", "E", "AUTO")
+
+
+def parse_crypto_sheet(rows, raw_qty):
+    return sheet_holdings(rows, CRYPTO_ROWS, "B", "A", "D", "CRYPTO", raw_qty=raw_qty)
+
+
+def parse_debt_sheet(rows):
+    v = parse_amount(sheet_cell(rows, DEBT_CELL))
+    if v is None or v < 0:
+        raise ValueError(f"{DEBT_CELL} 칸에서 금액을 읽지 못했습니다")
+    return int(round(v))
+
+
+def parse_gviz_column(text):
+    """gviz JSON 응답(한 열 범위)의 원본 값 목록. 숫자가 아닌 칸은 None."""
+    i, j = text.find("("), text.rfind(")")
+    data = json.loads(text[i + 1:j])
+    if data.get("status") != "ok":
+        raise ValueError("gviz 응답 오류")
+    out = []
+    for row in data["table"]["rows"]:
+        cell = (row.get("c") or [None])[0]
+        v = cell.get("v") if isinstance(cell, dict) else None
+        out.append(float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+    return out

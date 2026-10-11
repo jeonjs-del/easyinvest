@@ -4,7 +4,9 @@
 실행:  streamlit run app.py   (같은 폴더에 strategies.py 필요)
 """
 import contextlib
+from csv import reader as csv_reader
 import hmac
+import io
 import json
 import math
 import os
@@ -1411,6 +1413,79 @@ def _wealth_property_trades(prop, today):
     return {"configured": True, "match": match, "errors": errors}
 
 
+SHEET_KINDS = ("pension", "stock", "crypto", "debt")
+GSHEET_URL = "https://docs.google.com/spreadsheets/d/"
+
+
+def _sheet_ids():
+    """secrets의 [wealth_sheets] — {종류: 스프레드시트 ID}. 설정된 종류만 시트에서 가져오고
+    나머지는 직접 입력으로 남는다."""
+    try:
+        sec = st.secrets.get("wealth_sheets") or {}
+        return {k: str(sec[k]).strip() for k in SHEET_KINDS if sec.get(k)}
+    except Exception:
+        return {}
+
+
+def _sheet_get(kind, path, **params):
+    """링크 공유 시트는 ID가 곧 열쇠라 저장소·로그에 남기지 않는다 — ID는 secrets에서만 읽고,
+    요청 예외 메시지(URL 포함)는 그대로 올리지 않는다."""
+    try:
+        r = requests.get(GSHEET_URL + _sheet_ids()[kind] + path, params=params, timeout=20)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"요청 실패({type(e).__name__})") from None
+    if r.status_code != 200:
+        hint = " — 시트 공유 설정(링크가 있는 모든 사용자: 뷰어)을 확인하세요" if r.status_code in (401, 403) else ""
+        raise RuntimeError(f"HTTP {r.status_code}{hint}")
+    r.encoding = "utf-8"
+    return r.text
+
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def _sheet_fetch(kind):
+    """스프레드시트 하나에서 이름 규칙상 가장 최신 시트를 읽어 파싱한다. 실패는 예외로 올려
+    캐시에 남기지 않는다. 반환: {'sheet': 시트 이름, 'data': {...}}"""
+    tab = W.pick_latest_sheet(W.parse_sheet_tabs(_sheet_get(kind, "/htmlview")), W.SHEET_NAME_PATTERNS[kind])
+    if not tab:
+        raise RuntimeError("이름 규칙에 맞는 시트가 없습니다")
+    name, gid = tab
+    rows = list(csv_reader(io.StringIO(_sheet_get(kind, "/export", format="csv", gid=gid))))
+    if kind == "pension":
+        data = W.parse_pension_sheet(rows)
+    elif kind == "stock":
+        data = {"stock": W.parse_stock_sheet(rows)}
+    elif kind == "crypto":
+        # CSV는 표시 서식대로(소수 둘째 자리) 나와 코인 수량이 잘린다 — 수량 열만 원본 값으로 다시 받는다
+        n = len(W.CRYPTO_ROWS)
+        raw = W.parse_gviz_column(_sheet_get(
+            kind, "/gviz/tq", tqx="out:json", gid=gid, headers=0,
+            range=f"D{W.CRYPTO_ROWS[0]}:D{W.CRYPTO_ROWS[-1]}"))
+        data = {"crypto": W.parse_crypto_sheet(rows, (raw + [None] * n)[:n])}
+    else:
+        data = {"debt": W.parse_debt_sheet(rows)}
+    return {"sheet": name, "data": data}
+
+
+def _wealth_sheets():
+    """{'managed': 시트로 관리하는 종류, 'kinds': {종류: 조회 결과}, 'errors': {종류: 사유}}"""
+    ids = _sheet_ids()
+
+    def _one(kind):
+        try:
+            return kind, _sheet_fetch(kind), None
+        except Exception as e:
+            msg = str(e) if isinstance(e, (RuntimeError, ValueError)) else type(e).__name__
+            print(f"[wealth] 시트 조회 실패: {kind} {msg}")
+            return kind, None, msg
+
+    results = []
+    if ids:
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            results = list(ex.map(_one, ids))
+    return {"managed": set(ids), "kinds": {k: got for k, got, _ in results if got},
+            "errors": {k: err for k, _, err in results if err}}
+
+
 def _wealth_rerun():
     """은퇴 탭만 다시 그린다. 탭 안의 입력으로 시작된 실행이 아니면(페이지 첫 로딩 등)
     fragment 범위 재실행이 허용되지 않아 전체 재실행으로 넘어간다."""
@@ -1479,6 +1554,23 @@ def _render_wealth_tab():
     elif st.session_state.get("wealth_saved_at"):
         st.caption(f"💾 마지막 저장 {st.session_state.wealth_saved_at}"
                    + (" · Gist" if mode == "gist" else " · 이 기기(로컬 파일)"))
+
+    # ---- Google 시트 반영 -------------------------------------------------
+    # 시트가 기준이다: 조회에 성공한 항목은 저장된 값을 시트 값으로 바꾸고, 실패한 항목은
+    # 마지막으로 가져온 값(저장된 문서)을 그대로 둔다.
+    sheets = _wealth_sheets()
+    sheet_changed = False
+    for sec, sheet_kind in W.SHEET_SECTIONS.items():
+        got = sheets["kinds"].get(sheet_kind)
+        if got and fin[sec]["holdings"] != got["data"][sec][0]:
+            fin[sec]["holdings"] = got["data"][sec][0]
+            sheet_changed = True
+    got = sheets["kinds"].get("debt")
+    if got and int(fin.get("debt") or 0) != got["data"]["debt"]:
+        fin["debt"] = got["data"]["debt"]
+        sheet_changed = True
+    if sheet_changed:
+        commit(reset_inputs=True)
 
     # ---- 시세·실거래가 ----------------------------------------------------
     quotes, quotes_changed = _wealth_quotes(doc)
@@ -1584,6 +1676,11 @@ def _render_wealth_tab():
                      key="wealth_exp_financial"):
         st.caption("현금 잔액과 종목 평가액은 겹치지 않게 입력하세요(종목으로 넣은 금액을 현금에 또 넣지 않기). "
                    "종목 가격은 한국 시간 기준 전일까지 마감된 일봉의 실제 종가이며 실시간 시세가 아닙니다.")
+        if sheets["managed"]:
+            st.caption("📄 Google 시트 연동 중 — 시트로 관리하는 항목은 10분마다 다시 확인합니다.")
+            if st.button("🔄 시트에서 지금 다시 가져오기", key=K("sheet_refresh")):
+                _sheet_fetch.clear()
+                _wealth_rerun()
         for sec, title, kind in W.SECTIONS:
             sub, sub_status = s["sections"][sec]
             badge = {"ok": "", "stale": " · ⚠️ stale", "incomplete": " · ⚠️ 평가 미완료"}[sub_status]
@@ -1597,14 +1694,31 @@ def _render_wealth_tab():
                 if kind is None:
                     continue
 
+                sheet_kind = W.SHEET_SECTIONS.get(sec)
+                managed = sheet_kind in sheets["managed"]
+                if managed:
+                    got = sheets["kinds"].get(sheet_kind)
+                    if got:
+                        st.caption(f"📄 종목·수량은 Google 시트 '{got['sheet']}'에서 가져옵니다"
+                                   "(화면에서는 고칠 수 없고 시트를 고치면 반영됩니다).")
+                        for msg in got["data"][sec][1]:
+                            st.warning(f"시트에서 가져오지 못한 행 — {msg}")
+                    else:
+                        st.warning(f"Google 시트 조회 실패({sheets['errors'].get(sheet_kind, '')}) — "
+                                   "마지막으로 가져온 종목·수량을 표시합니다.")
+
                 for h in list(section["holdings"]):
                     hid = f"{sec}_{h['market']}_{h['symbol']}"
                     q = quotes.get(W.quote_key(h["market"], h["symbol"])) or {}
                     val = W.value_holding(h.get("qty") or 0, q)
                     h1, h2, h3, h4 = st.columns([4, 3, 4, 1])
                     h1.markdown(f"**{h.get('name') or h['symbol']}**  \n`{h['symbol']}`")
-                    qty = h2.number_input("수량", min_value=0.0, value=float(h.get("qty") or 0),
-                                          format="%.8g", key=K(f"{hid}_qty"))
+                    if managed:
+                        qty = float(h.get("qty") or 0)
+                        h2.markdown(f"수량  \n**{qty:,.8g}**")
+                    else:
+                        qty = h2.number_input("수량", min_value=0.0, value=float(h.get("qty") or 0),
+                                              format="%.8g", key=K(f"{hid}_qty"))
                     if q.get("close") is None:
                         price_txt = "종가 없음"
                     elif q["currency"] == "USD":
@@ -1615,6 +1729,8 @@ def _render_wealth_tab():
                     state = {"ok": "", "stale": " · ⚠️ stale(저장된 가격)", "missing": " · ⚠️ 평가 미완료"}[
                         q.get("status", "missing")]
                     h3.markdown(f"{price_txt}{state}  \n평가액 **{fmt(val) if val is not None else '—'}**")
+                    if managed:
+                        continue
                     if h4.button("삭제", key=K(f"{hid}_del")):
                         section["holdings"] = [x for x in section["holdings"] if x is not h]
                         dirty = True
@@ -1622,6 +1738,8 @@ def _render_wealth_tab():
                         h["qty"] = qty
                         dirty = True
 
+                if managed:
+                    continue
                 st.markdown("###### 종목 추가")
                 add_market, add_symbol, add_name = None, None, None
                 if kind == "crypto":
@@ -1665,10 +1783,19 @@ def _render_wealth_tab():
                             section["holdings"], add_market, add_symbol, add_name, add_qty)
                         commit(reset_inputs=True)
 
-        debt = won_input("금융 부채(신용대출·마이너스통장 등)", "fin_debt", fin.get("debt"))
-        if debt != int(fin.get("debt") or 0):
-            fin["debt"] = debt
-            dirty = True
+        if "debt" in sheets["managed"]:
+            got = sheets["kinds"].get("debt")
+            st.markdown(f"금융 부채(신용대출·마이너스통장 등): **{fmt(fin.get('debt') or 0)}**")
+            if got:
+                st.caption(f"📄 Google 시트 '{got['sheet']}'의 {W.DEBT_CELL} 값입니다(시트를 고치면 반영됩니다).")
+            else:
+                st.warning(f"Google 시트 조회 실패({sheets['errors'].get('debt', '')}) — "
+                           "마지막으로 가져온 금액을 표시합니다.")
+        else:
+            debt = won_input("금융 부채(신용대출·마이너스통장 등)", "fin_debt", fin.get("debt"))
+            if debt != int(fin.get("debt") or 0):
+                fin["debt"] = debt
+                dirty = True
 
     # ---- 자산 변화 --------------------------------------------------------
     records = doc["records"]
