@@ -1466,9 +1466,15 @@ def _sheet_ids():
     나머지는 직접 입력으로 남는다."""
     try:
         sec = st.secrets.get("wealth_sheets") or {}
-        return {k: str(sec[k]).strip() for k in SHEET_KINDS if sec.get(k)}
     except Exception:
         return {}
+    out = {}
+    for k in SHEET_KINDS:
+        v = str(sec.get(k) or "").strip()
+        m = re.search(r"/d/([A-Za-z0-9_-]+)", v)   # ID 대신 주소를 통째로 붙여 넣어도 받는다
+        if v:
+            out[k] = m.group(1) if m else v
+    return out
 
 
 def _sheet_get(kind, path, **params):
@@ -1770,10 +1776,15 @@ def _render_wealth_tab():
         st.caption("현금 잔액과 종목 평가액은 겹치지 않게 입력하세요(종목으로 넣은 금액을 현금에 또 넣지 않기). "
                    "종목 가격은 한국 시간 기준 전일까지 마감된 일봉의 실제 종가이며 실시간 시세가 아닙니다.")
         if sheets["managed"]:
-            st.caption("📄 Google 시트 연동 중 — 페이지를 새로 열 때와 이 탭의 값을 고칠 때(30초 간격) 시트를 다시 읽습니다.")
+            kind_names = {"pension": "연금", "stock": "주식", "crypto": "암호화폐", "debt": "금융 부채"}
+            st.caption("📄 Google 시트 연동 중(" + "·".join(kind_names[k] for k in SHEET_KINDS if k in sheets["managed"])
+                       + ") — 페이지를 새로 열 때와 이 탭의 값을 고칠 때(30초 간격) 시트를 다시 읽습니다.")
             if st.button("🔄 시트에서 지금 다시 가져오기", key=K("sheet_refresh")):
                 _sheet_fetch.clear()
                 _wealth_rerun()
+        else:
+            st.info("Google 시트 연동이 꺼져 있습니다 — secrets에 `[wealth_sheets]`(pension·stock·crypto·debt "
+                    "스프레드시트 ID)를 넣으면 종목·수량과 금융 부채를 시트에서 가져옵니다. 지금은 아래 값을 직접 입력합니다.")
         for sec, title, kind in W.SECTIONS:
             sub, sub_status = s["sections"][sec]
             badge = {"ok": "", "stale": " · ⚠️ stale", "incomplete": " · ⚠️ 평가 미완료"}[sub_status]
