@@ -19,6 +19,9 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
   선택, 실거래가 파싱·매칭, 자산 기록, 은퇴 계산). Streamlit·네트워크 비의존 — 화면/저장/외부
   조회는 `app.py`의 `_render_wealth_tab` 등이 맡는다. 은퇴 탭 계산을 고칠 땐 여기에 두고
   `tests/test_wealth.py`에 케이스를 추가할 것.
+- `coin_momentum.py` — 코인 탭 듀얼모멘텀 하위탭의 순수 계산 로직(유니버스 제외 목록
+  `DM_EXCLUDED`, 거래 어려움 목록 `DM_HARD_TO_TRADE`, BTC SMA120 필터, 순위). Streamlit·네트워크
+  비의존 — 조회·화면은 `app.py`의 `_render_coin_dual_momentum`. 테스트는 `tests/test_coin_momentum.py`.
 - `lwc_local.py` — `streamlit-lightweight-charts-ntf` 패치 래퍼(줌 상태 복원 + dblclick
   지원). 건드릴 일 거의 없음.
 - `scanner/` — 오프라인 배치 스캐너(로컬에서만 수동 실행, Cloud에서는 실행 안 됨):
@@ -34,6 +37,7 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
 - `tests/test_calibration.py` — 추세추종 신호 계산을 원사이트 공개 수치와 대조하는
   캘리브레이션 테스트(unittest, 실가격 네트워크 조회 필요, 로컬 전용, CI에는 없음).
 - `tests/test_wealth.py` — 은퇴 탭 계산 로직 검증(unittest, 오프라인, 수 ms).
+- `tests/test_coin_momentum.py` — 코인 듀얼모멘텀 계산 로직 검증(unittest, 오프라인).
 - `wealth.json` — 은퇴 탭 자산 데이터의 로컬 폴백. **개인 자산 정보라 `.gitignore`에 등록돼
   있고 커밋 금지**(이 저장소는 공개 저장소다). 주소·금액 같은 개인 값을 소스·테스트·문서에
   하드코딩하지 말 것.
@@ -62,6 +66,7 @@ python scanner/seasonality_scan.py
 ```
 python -m unittest tests.test_calibration -v   # 네트워크 필요
 python -m unittest tests.test_wealth -v        # 오프라인
+python -m unittest tests.test_coin_momentum -v # 오프라인
 ```
 
 ## 4. 탭 구성
@@ -73,8 +78,18 @@ python -m unittest tests.test_wealth -v        # 오프라인
    (`trend_scan.py` 결과, 신호유형별 백분위 별점) · 매매계획(포지션 사이징·손절/익절 계산기).
 6. **이동평균** — 지수/종목 이동평균 대비 이격도 표. 사용자가 지수·이평 목록을 추가/삭제
    가능(Gist 저장).
-7. **코인** — 하위탭 3개: 랭킹(CoinGecko 시세 + 다중소스 과거일봉으로 RS 계산) · 글로벌
-   24-7(Hyperliquid `xyz` 퍼프 DEX의 24시간 거래 전통자산) · 온체인(미구현, "준비 중").
+7. **코인** — 하위탭 4개: 랭킹(CoinGecko 시세 + 다중소스 과거일봉으로 RS 계산) · 듀얼모멘텀
+   (아래) · 글로벌 24-7(Hyperliquid `xyz` 퍼프 DEX의 24시간 거래 전통자산) · 온체인(미구현, "준비 중").
+   - **듀얼모멘텀**(강환국 알트코인 듀얼모멘텀 업그레이드): BTC 완결 일봉 종가 > SMA120이면 매수
+     가능 배너, 아니면 현금 배너+순위표 흐리게. 유니버스는 CoinGecko `coins/markets` 상위 60개에서
+     `coin_momentum.DM_EXCLUDED`(스테이블·래핑/스테이킹·금 토큰·토큰화 펀드 — 2026-10 상위권에
+     USYC·USDY·BUIDL 같은 이자형 달러 토큰이 들어와 있어 이 범주를 추가)와 "심볼/이름에 usd +
+     가격 0.97~1.03" 보조 규칙으로 거른 시총 상위 20개. 1·2주는 markets의 7d·14d 필드, 3·4주는
+     랭킹 탭과 같은 `_fetch_coin_daily_history` 일봉으로 계산. BTC 일봉은 FDR `BTC/USD`(Yahoo)
+     → 실패 시 CoinGecko `market_chart`(00:00 UTC 값을 전날 종가로 당겨 씀), 진행 중인 UTC 당일
+     봉은 뺀다. 조회 실패 시 `_coin_dm_last_good`(cache_resource)의 마지막 성공값+경고를 보여주고,
+     CoinGecko 429는 짧게 재시도. 한글명은 업비트 `market/all`. `DM_HARD_TO_TRADE`는 업비트·바이낸스·
+     OKX·바이비트 현물 상장목록으로 확인한 값이라(2026-10-15) 상위 20 구성이 바뀌면 다시 확인할 것.
 8. **은퇴** — 총자산·부채·순자산 요약, 부동산(국토교통부 실거래가 자동 반영), 금융자산
    5항목(예금·퇴직연금·개인연금·주식·암호화폐, 항목별 현금+보유 종목), 자산 변화(월말 기록·
    월별/연별 추이), 경제적 자유 계산기, 데이터 내보내기·가져오기. 각 구역은 접힌 expander.

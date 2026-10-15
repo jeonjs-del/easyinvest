@@ -12,6 +12,7 @@ import math
 import os
 import re
 import secrets
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -28,6 +29,7 @@ import yfinance as yf
 # 로컬 패치 래퍼: 줌 상태 복원 + dblclick 지원
 from lwc_local import renderLightweightCharts
 
+import coin_momentum as CM
 import wealth as W
 from strategies import (STRATEGIES, TAA_TICKERS, augment_panel,
                          VOLDM_TICKERS, VOLDM_ASSET_META, voldm_source_type)
@@ -735,6 +737,185 @@ def build_coin_ranking(pool_size=COIN_UNIVERSE_POOL):
 
     source_counts = df["history_source"].fillna("실패").value_counts().to_dict()
     return df, "ok", source_counts
+
+
+# ---- 코인 탭 · 듀얼모멘텀(계산 규칙은 coin_momentum.py) -----------------------
+def _coingecko_get(url, params, tries=3):
+    """무료 티어 429(레이트리밋)엔 짧게 쉬고 다시 시도한다. 실패하면 예외를 올린다 —
+    cache_data는 예외를 캐시하지 않아 다음 실행 때 다시 조회된다."""
+    for i in range(tries):
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code == 429 and i < tries - 1:
+            print(f"[coin_dm] CoinGecko 429, {2 * (i + 1)}초 후 재시도")
+            time.sleep(2 * (i + 1))
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f"CoinGecko HTTP {r.status_code}: {r.text[:150]}")
+        return r.json()
+
+
+@st.cache_data(ttl=600)
+def _fetch_dm_markets():
+    data = _coingecko_get("https://api.coingecko.com/api/v3/coins/markets",
+                          {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1,
+                           "price_change_percentage": "24h,7d,14d,30d"})
+    if not data:
+        raise RuntimeError("CoinGecko markets 빈 응답")
+    return data, pd.Timestamp.now(tz="Asia/Seoul")
+
+
+@st.cache_data(ttl=600)
+def _fetch_btc_daily_closes():
+    """(BTC/USD 일봉 종가 Series, 출처). 진행 중인 UTC 당일 봉은 호출부에서 뺀다."""
+    try:
+        start = (pd.Timestamp.today() - pd.Timedelta(days=300)).strftime("%Y-%m-%d")
+        df = fdr.DataReader("BTC/USD", start)
+        s = df["Close"].dropna()
+        if len(s) >= 130:
+            return s, "FinanceDataReader(Yahoo BTC-USD)"
+        print(f"[coin_dm] FDR BTC/USD 일봉 부족: {len(s)}개")
+    except Exception as e:
+        print(f"[coin_dm] FDR BTC/USD 실패: {type(e).__name__}: {e}")
+    data = _coingecko_get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+                          {"vs_currency": "usd", "days": 200, "interval": "daily"})
+    prices = data.get("prices") or []
+    # 00:00 UTC 시점 값 = 전날 일봉 종가라 하루 당겨 날짜를 맞춘다. 마지막 점(현재 시각)은 버린다.
+    s = pd.Series({pd.Timestamp(ts, unit="ms").normalize() - pd.Timedelta(days=1): p
+                   for ts, p in prices[:-1] if pd.Timestamp(ts, unit="ms").hour == 0})
+    if len(s) < 130:
+        raise RuntimeError(f"CoinGecko BTC 일봉 부족: {len(s)}개")
+    return s.sort_index(), "CoinGecko market_chart"
+
+
+@st.cache_data(ttl=60 * 60 * 24)
+def _fetch_upbit_korean_names():
+    try:
+        r = requests.get("https://api.upbit.com/v1/market/all", timeout=15)
+        r.raise_for_status()
+        return {m["market"].split("-")[1]: m["korean_name"] for m in r.json()}
+    except Exception as e:
+        print(f"[coin_dm] 업비트 한글명 조회 실패: {type(e).__name__}: {e}")
+        return {}
+
+
+@st.cache_resource
+def _coin_dm_last_good():
+    """세션·재실행과 무관하게 마지막 성공 조회값을 들고 있는 저장소(서버 프로세스당 1개)."""
+    return {}
+
+
+def _coin_dm_fetch(key, fn):
+    """(값, 오류문구). 실패하면 마지막 성공값과 오류를 함께 돌려준다(없으면 값 None)."""
+    store = _coin_dm_last_good()
+    try:
+        store[key] = fn()
+        return store[key], None
+    except Exception as e:
+        print(f"[coin_dm] {key} 조회 실패: {type(e).__name__}: {e}")
+        return store.get(key), f"{type(e).__name__}: {str(e)[:120]}"
+
+
+def _render_coin_dual_momentum():
+    st.caption("강환국 '알트코인 듀얼모멘텀 업그레이드' — BTC가 120일 이평 위일 때만, 시총 상위 "
+               f"{CM.DM_TOP_N}개(스테이블·래핑 토큰 제외) 중 최근 수익률 상위 {CM.DM_PICKS}개를 동일 비중 매수.")
+    markets_res, mk_err = _coin_dm_fetch("markets", _fetch_dm_markets)
+    btc_res, btc_err = _coin_dm_fetch("btc", _fetch_btc_daily_closes)
+
+    if btc_res is None:
+        st.warning("⚠️ BTC 일봉을 불러오지 못해 120일 이평 필터를 계산할 수 없습니다.")
+        sig = None
+    else:
+        btc_closes, btc_src = btc_res
+        sig = CM.sma_filter(CM.completed_closes(btc_closes, CM.today_utc_date()))
+        if btc_err:
+            st.warning("⚠️ BTC 일봉 조회에 실패해 마지막으로 받은 값으로 보여줍니다.")
+        if sig is None:
+            st.warning("⚠️ BTC 완결 일봉이 120개 미만이라 이평 필터를 계산할 수 없습니다.")
+    if sig is not None:
+        ok = sig["above"]
+        title = (f"BTC > 120MA: 매수 가능 (상위 2주 수익률 {CM.DM_PICKS}개 매수)" if ok
+                 else "BTC < 120MA: 100% 현금 보유")
+        bg, border = ("rgba(26,152,80,0.16)", "#1a9850") if ok else ("rgba(215,25,28,0.14)", "#d7191c")
+        st.markdown(
+            f"<div style='display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;"
+            f"gap:4px 16px;padding:12px 16px;border-radius:8px;background:{bg};border-left:5px solid {border};"
+            f"margin-bottom:8px'><b style='font-size:1.05rem'>{'🟢' if ok else '🔴'} {title}</b>"
+            f"<span>${sig['close']:,.0f} / ${sig['sma']:,.0f} "
+            f"(<b>{sig['gap']:+.2%}</b>)</span></div>", unsafe_allow_html=True)
+        print(f"[coin_dm] BTC 완결 종가 {sig['date']:%Y-%m-%d} {sig['close']:,.2f} / SMA120 {sig['sma']:,.2f} "
+              f"({sig['gap']:+.2%}) 출처 {btc_src}")
+
+    period = st.radio("기간", list(CM.DM_PERIODS), index=list(CM.DM_PERIODS).index(CM.DM_DEFAULT_PERIOD),
+                      horizontal=True, key="coin_dm_period")
+    if markets_res is None:
+        st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요."
+                   + (f" ({mk_err})" if mk_err else ""))
+        return
+    markets, fetched_at = markets_res
+    if mk_err:
+        st.warning(f"⚠️ CoinGecko 시세 조회에 실패해 {fetched_at:%H:%M}에 받은 값으로 보여줍니다.")
+
+    universe, excluded = CM.select_universe(markets)
+    field, days = CM.DM_PERIODS[period]
+    if field is None:
+        with st.spinner("일봉으로 수익률 계산 중..."):
+            with ThreadPoolExecutor(max_workers=10) as exe:
+                hists = list(exe.map(lambda m: _fetch_coin_daily_history(m["symbol"].upper(), m.get("id"))[0],
+                                     universe))
+        rets = [CM.lookback_return([c["close"] for c in h], days) if h else None for h in hists]
+    else:
+        rets = [_coingecko_pct(m, field) for m in universe]
+
+    ko = _fetch_upbit_korean_names()
+    rows = []
+    for mcap_rank, (m, ret) in enumerate(zip(universe, rets), start=1):
+        sym = m["symbol"].upper()
+        rows.append({"symbol": sym, "name": m["name"] + (f" ({ko[sym]})" if sym in ko else ""),
+                     "mcap_rank": mcap_rank, "price": m.get("current_price"),
+                     "chg_24h": _coingecko_pct(m, "price_change_percentage_24h_in_currency"), "ret": ret})
+    ranked = CM.rank_momentum(rows)
+    print(f"[coin_dm] {period} 순위: " + ", ".join(f"{r.symbol} {r.ret:+.2%}" if pd.notna(r.ret) else f"{r.symbol} -"
+                                                    for r in ranked.itertuples()))
+
+    risk_off = sig is not None and not sig["above"]
+    if risk_off:
+        st.caption("BTC가 120일 이평 아래라 아래 순위표는 참고용입니다.")
+    # 폰 폭에서 판단에 필요한 열(수익률·비고)이 먼저 보이게 앞에 두고 심볼 열을 고정한다.
+    disp = pd.DataFrame({
+        "순위": ranked["rank"], "심볼": ranked["symbol"], period: ranked["ret"], "1일": ranked["chg_24h"],
+        "비고": ranked.apply(CM.note_for, axis=1), "코인": ranked["name"],
+        "시총순위": ranked["mcap_rank"], "현재가": ranked["price"],
+    })
+    # 흐리게 표시할 땐 색 상한을 키워 진하기를 낮춘다.
+    dim = 3 if risk_off else 1
+    styled = disp.style
+    for c in ("1일", period):
+        _cap = _abs_cap(disp[c], COIN_RET_COLOR_CAP) * dim
+        styled = _apply_bg(styled, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
+    plain_cols = ["순위", "코인", "심볼", "시총순위", "현재가", "비고"]
+    if risk_off:
+        styled = _apply_bg(styled, lambda v: "color: #9aa0a6;")
+    else:
+        picks = ranked["is_pick"].tolist()
+        styled = styled.apply(lambda col: ["background-color: rgba(255,193,7,0.22); font-weight: 600;"
+                                           if p else "" for p in picks], subset=plain_cols)
+    st.dataframe(styled, use_container_width=True, hide_index=True,
+                 height=min(60 + 35 * len(disp), 800),
+                 column_config={
+                     "순위": st.column_config.NumberColumn(width="small", pinned=True),
+                     "심볼": st.column_config.TextColumn(width="small", pinned=True),
+                     "코인": st.column_config.TextColumn(width="medium"),
+                     "시총순위": st.column_config.NumberColumn(width="small"),
+                     "현재가": st.column_config.NumberColumn(format="$%.6g"),
+                     "1일": st.column_config.NumberColumn(format="percent", width="small"),
+                     period: st.column_config.NumberColumn(format="percent", width="small"),
+                     "비고": st.column_config.TextColumn(width="medium"),
+                 })
+    src = "CoinGecko" + (" + 일봉(랭킹 탭과 같은 다중소스)" if field is None else "")
+    st.caption(f"3일마다 재확인 · 상위권 유지 시 보유 지속 · 데이터: {src}, 갱신 시각 {fetched_at:%H:%M}"
+               " · '거래 어려움' = 업비트·바이낸스·OKX·바이비트 중 상장 거래소가 없거나 매우 적음")
+    with st.expander(f"유니버스에서 제외한 코인 ({len(excluded)}개, 시총 상위 60개 중)"):
+        st.write(" · ".join(f"{m['symbol'].upper()}({CM.DM_EXCLUDED_LABELS[r]})" for m, r in excluded) or "없음")
 
 
 def _lwc_time(ts, intraday):
@@ -2126,7 +2307,8 @@ watchlist = st.session_state.watchlist
 # 탭을 떠나 있는 동안엔 그 탭의 위젯이 그려지지 않아 Streamlit이 값을 지운다 — 선택했을 때만
 # 그리는 탭(동적자산배분·코인)의 필터 값은 다시 대입해 두어야 돌아왔을 때 유지된다.
 for _k in ("coin_tier", "coin_rank_n", "coin_mcap_min", "coin_col_weekrs", "coin_col_weekret",
-           "coin_col_monthret", "coin_rank_period", "coin_rank_iv", "g247_cat", "coin_g247_iv"):
+           "coin_col_monthret", "coin_rank_period", "coin_rank_iv", "g247_cat", "coin_g247_iv",
+           "coin_dm_period"):
     if _k in st.session_state:
         st.session_state[_k] = st.session_state[_k]
 
@@ -3423,7 +3605,12 @@ with tab6:
 # =====================  코인  ================================================
 with tab7:
     if tab7.open:
-        sub_rank, sub_g247, sub_onchain = st.tabs(["🏆 랭킹", "🌐 글로벌 24-7", "⛓️ 온체인"])
+        sub_rank, sub_dm, sub_g247, sub_onchain = st.tabs(
+            ["🏆 랭킹", "🚀 듀얼모멘텀", "🌐 글로벌 24-7", "⛓️ 온체인"])
+
+        # ---- 듀얼모멘텀 -----------------------------------------------------------
+        with sub_dm:
+            _render_coin_dual_momentum()
 
         # ---- 랭킹 ---------------------------------------------------------------
         with sub_rank:
