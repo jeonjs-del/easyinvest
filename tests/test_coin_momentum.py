@@ -67,6 +67,14 @@ class SmaFilterTest(unittest.TestCase):
         self.assertAlmostEqual(sig["sma"], (10 * 119 + 5) / 120)
         self.assertFalse(sig["above"])
 
+    def test_sma_live_price_decides(self):
+        s = pd.Series([100.0] * 120)
+        sig = CM.sma_filter(s, price=101.0)
+        self.assertTrue(sig["above"] and sig["live"])
+        self.assertAlmostEqual(sig["gap"], 0.01)
+        self.assertEqual(sig["close"], 100.0)
+        self.assertFalse(CM.sma_filter(s, price=99.0)["above"])
+
     def test_sma_insufficient(self):
         self.assertIsNone(CM.sma_filter(pd.Series([1.0] * 119)))
 
@@ -96,6 +104,24 @@ class RankTest(unittest.TestCase):
     def test_missing_ret_never_pick(self):
         df = CM.rank_momentum([{"symbol": "A", "ret": None}, {"symbol": "B", "ret": 0.1}])
         self.assertEqual(df["is_pick"].tolist(), [True, False])
+
+    def test_close_before_uses_close_time(self):
+        idx = pd.to_datetime(["2026-10-01 00:00", "2026-10-02 00:00", "2026-10-03 00:00"], utc=True)
+        s = pd.Series([1.0, 2.0, 3.0], index=idx)
+        self.assertEqual(CM.close_before(s, pd.Timestamp("2026-10-02 12:00", tz="UTC")), 2.0)
+        self.assertEqual(CM.close_before(s, pd.Timestamp("2026-10-03 00:00", tz="UTC")), 3.0)
+        self.assertIsNone(CM.close_before(s, pd.Timestamp("2026-09-30", tz="UTC")))
+
+    def test_live_return(self):
+        self.assertAlmostEqual(CM.live_return(110, 100), 0.10)
+        self.assertIsNone(CM.live_return(None, 100))
+        self.assertIsNone(CM.live_return(110, None))
+
+    def test_latest_update(self):
+        ms = [{"last_updated": "2026-10-15T12:16:32.123Z"}, {"last_updated": "2026-10-15T12:10:00Z"},
+              {"last_updated": None}, {}]
+        self.assertEqual(CM.latest_update(ms), pd.Timestamp("2026-10-15 12:16:32.123", tz="UTC"))
+        self.assertIsNone(CM.latest_update([{}]))
 
     def test_today_utc(self):
         self.assertEqual(CM.today_utc_date(pd.Timestamp("2026-10-15 08:30", tz="Asia/Seoul")),

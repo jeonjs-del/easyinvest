@@ -80,16 +80,28 @@ python -m unittest tests.test_coin_momentum -v # 오프라인
    가능(Gist 저장).
 7. **코인** — 하위탭 4개: 랭킹(CoinGecko 시세 + 다중소스 과거일봉으로 RS 계산) · 듀얼모멘텀
    (아래) · 글로벌 24-7(Hyperliquid `xyz` 퍼프 DEX의 24시간 거래 전통자산) · 온체인(미구현, "준비 중").
-   - **듀얼모멘텀**(강환국 알트코인 듀얼모멘텀 업그레이드): BTC 완결 일봉 종가 > SMA120이면 매수
-     가능 배너, 아니면 현금 배너+순위표 흐리게. 유니버스는 CoinGecko `coins/markets` 상위 60개에서
-     `coin_momentum.DM_EXCLUDED`(스테이블·래핑/스테이킹·금 토큰·토큰화 펀드 — 2026-10 상위권에
-     USYC·USDY·BUIDL 같은 이자형 달러 토큰이 들어와 있어 이 범주를 추가)와 "심볼/이름에 usd +
-     가격 0.97~1.03" 보조 규칙으로 거른 시총 상위 20개. 1·2주는 markets의 7d·14d 필드, 3·4주는
-     랭킹 탭과 같은 `_fetch_coin_daily_history` 일봉으로 계산. BTC 일봉은 FDR `BTC/USD`(Yahoo)
-     → 실패 시 CoinGecko `market_chart`(00:00 UTC 값을 전날 종가로 당겨 씀), 진행 중인 UTC 당일
-     봉은 뺀다. 조회 실패 시 `_coin_dm_last_good`(cache_resource)의 마지막 성공값+경고를 보여주고,
-     CoinGecko 429는 짧게 재시도. 한글명은 업비트 `market/all`. `DM_HARD_TO_TRADE`는 업비트·바이낸스·
-     OKX·바이비트 현물 상장목록으로 확인한 값이라(2026-10-15) 상위 20 구성이 바뀌면 다시 확인할 것.
+   - **듀얼모멘텀**(강환국 알트코인 듀얼모멘텀 업그레이드): **조회 시점 실시간 시세 기준.** 판정은
+     CoinGecko markets의 BTC 현재가 vs SMA120(완결 일봉 종가 120개) — 위면 매수 가능 배너, 아니면 현금
+     배너+순위표 흐리게. 유니버스는 `coins/markets` 상위 60개에서 `coin_momentum.DM_EXCLUDED`(스테이블·
+     래핑/스테이킹·금 토큰·토큰화 펀드 — 2026-10 상위권에 USYC·USDY·BUIDL 같은 이자형 달러 토큰이 있어
+     이 범주를 추가)와 "심볼/이름에 usd + 가격 0.97~1.03" 보조 규칙으로 거른 시총 상위 20개.
+   - **캐시 정책**: markets 호출(`_fetch_dm_markets`)은 `ttl=30`(레이트리밋 보호용)만 두고, 하위탭을
+     새로 열 때(직전 실행에 이 탭이 안 그려졌을 때 — `_coin_dm_was_open`/`_coin_dm_open_now`)와
+     '🔄 지금 갱신'을 누를 때 `.clear()`로 비워 무조건 새로 받는다. 이를 위해 코인 하위탭은
+     `key="coin_sub_tab", on_change="rerun"`이고 듀얼모멘텀만 `.open`일 때 그린다. 과거 데이터(BTC 일봉,
+     3·4주 기준 종가)는 UTC 날짜를 캐시 키에 넣고 1시간 캐시.
+   - 1·2주는 markets의 7d·14d 필드(현재가 vs N일 전, 롤링), 3·4주는 "실시간 현재가 / N일 전 시점 이전에
+     **마감한** 마지막 일봉 종가 − 1". 과거 종가는 Binance를 빼고 Coinbase→Bybit→OKX→CoinGecko 순
+     (`_fetch_dm_close_points`) — 거래소마다 일봉 시작 시각이 달라(OKX `1D`는 UTC+8) 날짜가 아니라 봉
+     마감 시각으로 맞춘다. BTC 일봉은 FDR `BTC/USD`(Yahoo) → 실패 시 CoinGecko `market_chart`(00:00 UTC
+     값을 전날 종가로 당겨 씀), 진행 중인 UTC 당일 봉은 뺀다.
+   - 표 위에 "시세 기준"(응답 `last_updated` 최댓값, KST)·조회 요청 시각·응답 수신 시각을 띄운다.
+     CoinGecko 공개 API 자체가 약 1분 단위로 갱신돼 시세 기준이 요청 시각보다 1분 남짓 늦을 수 있다.
+   - 실패 처리: 429·네트워크 오류는 최대 2회 재시도, 그래도 실패하면 `_coin_dm_last_good`
+     (cache_resource)의 직전 성공값과 "⚠ 실시간 조회 실패 — HH:MM:SS 기준 데이터 표시 중" 경고.
+     랭킹 하위탭이 함께 그려지면서 CoinGecko 폴백 호출을 많이 쓰면 429가 나기 쉽다.
+   - 한글명은 업비트 `market/all`. `DM_HARD_TO_TRADE`는 업비트·바이낸스·OKX·바이비트 현물 상장목록으로
+     확인한 값이라(2026-10-15) 상위 20 구성이 바뀌면 다시 확인할 것.
 8. **은퇴** — 총자산·부채·순자산 요약, 부동산(국토교통부 실거래가 자동 반영), 금융자산
    5항목(예금·퇴직연금·개인연금·주식·암호화폐, 항목별 현금+보유 종목), 자산 변화(월말 기록·
    월별/연별 추이), 경제적 자유 계산기, 데이터 내보내기·가져오기. 각 구역은 접힌 expander.

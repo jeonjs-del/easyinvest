@@ -1,6 +1,6 @@
 """코인 탭 '듀얼모멘텀' 하위탭(강환국 알트코인 듀얼모멘텀 업그레이드)의 순수 계산 로직.
 
-규칙: BTC 완결 일봉 종가 > SMA120이면 투자, 아니면 100% 현금. 유니버스는 '현재' 시총 상위
+규칙: BTC 실시간 현재가 > SMA120(완결 일봉 종가 120개)이면 투자, 아니면 100% 현금. 유니버스는 '현재' 시총 상위
 20개(스테이블·래핑/스테이킹 파생·금 토큰·토큰화 펀드 제외), 선택 기간 수익률 상위 3개를 동일
 비중 매수, 3일마다 재확인. Streamlit·네트워크 비의존 — 조회·화면은 app.py가 맡는다.
 
@@ -38,7 +38,7 @@ STABLE_PRICE_BAND = (0.97, 1.03)
 # 결과. 표시만 하고 순위에서는 빼지 않는다. LEO는 OKX에만 있다(유동성이 얕아 사용자 지정대로 포함).
 DM_HARD_TO_TRADE = {"LEO", "WBT", "XMR", "RAIN", "BTW"}
 
-# 표시명 → (CoinGecko markets 필드, 일봉에서 직접 계산할 때의 일수). 필드가 None이면 일봉으로 계산.
+# 표시명 → (CoinGecko markets 필드, 일수). 필드가 None이면 실시간가 / N일 전 일봉 종가로 계산.
 DM_PERIODS = {
     "1주": ("price_change_percentage_7d_in_currency", 7),
     "2주": ("price_change_percentage_14d_in_currency", 14),
@@ -86,15 +86,39 @@ def completed_closes(closes, today_utc):
     return s[idx_dates < today_utc]
 
 
-def sma_filter(closes, window=DM_SMA_WINDOW):
-    """완결 일봉 종가로 BTC 필터를 계산한다. 데이터가 window개 미만이면 None."""
+def sma_filter(closes, window=DM_SMA_WINDOW, price=None):
+    """SMA는 완결 일봉 종가 window개로 계산하고, 판정은 price(실시간 현재가)와 비교한다.
+    price가 없으면 마지막 완결 종가로 판정. 데이터가 window개 미만이면 None."""
     s = pd.Series(closes).dropna()
     if len(s) < window:
         return None
     close = float(s.iloc[-1])
     sma = float(s.iloc[-window:].mean())
-    return {"close": close, "sma": sma, "gap": close / sma - 1.0, "above": close > sma,
-            "date": s.index[-1]}
+    px = close if price is None else float(price)
+    return {"close": close, "sma": sma, "price": px, "live": price is not None,
+            "gap": px / sma - 1.0, "above": px > sma, "date": s.index[-1]}
+
+
+def close_before(closes_by_close_time, cutoff):
+    """봉 마감 시각을 인덱스로 둔 종가 Series에서 cutoff 이전에 마감한 마지막 종가.
+    거래소마다 일봉 시작 시각이 달라(OKX 1D는 UTC+8 기준) 날짜가 아니라 마감 시각으로 고른다."""
+    s = pd.Series(closes_by_close_time).dropna().sort_index()
+    s = s[s.index <= cutoff]
+    return float(s.iloc[-1]) if len(s) else None
+
+
+def live_return(price, base):
+    if price is None or not base:
+        return None
+    return price / base - 1.0
+
+
+def latest_update(markets):
+    """markets 응답의 last_updated 중 가장 최근 값(UTC Timestamp). 없으면 None."""
+    ts = pd.to_datetime([m.get("last_updated") for m in markets if m.get("last_updated")],
+                        utc=True, errors="coerce")
+    ts = ts.dropna()
+    return ts.max() if len(ts) else None
 
 
 def lookback_return(closes, days_back):

@@ -741,20 +741,30 @@ def build_coin_ranking(pool_size=COIN_UNIVERSE_POOL):
 
 # ---- 코인 탭 · 듀얼모멘텀(계산 규칙은 coin_momentum.py) -----------------------
 def _coingecko_get(url, params, tries=3):
-    """무료 티어 429(레이트리밋)엔 짧게 쉬고 다시 시도한다. 실패하면 예외를 올린다 —
-    cache_data는 예외를 캐시하지 않아 다음 실행 때 다시 조회된다."""
+    """429(레이트리밋)·네트워크 오류엔 짧게 쉬고 최대 2번 더 시도한다. 그래도 실패하면 예외를
+    올린다 — cache_data는 예외를 캐시하지 않아 다음 실행 때 다시 조회된다."""
     for i in range(tries):
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code == 429 and i < tries - 1:
-            print(f"[coin_dm] CoinGecko 429, {2 * (i + 1)}초 후 재시도")
-            time.sleep(2 * (i + 1))
+        last = i == tries - 1
+        try:
+            r = requests.get(url, params=params, timeout=15)
+        except requests.exceptions.RequestException as e:
+            if last:
+                raise
+            print(f"[coin_dm] CoinGecko {type(e).__name__}, 재시도")
+            time.sleep(1.5 * (i + 1))
+            continue
+        if r.status_code == 429 and not last:
+            print(f"[coin_dm] CoinGecko 429, {1.5 * (i + 1):.1f}초 후 재시도")
+            time.sleep(1.5 * (i + 1))
             continue
         if r.status_code != 200:
             raise RuntimeError(f"CoinGecko HTTP {r.status_code}: {r.text[:150]}")
         return r.json()
 
 
-@st.cache_data(ttl=600)
+# 실시간 순위용이라 길게 캐시하지 않는다 — 30초는 무료 티어 레이트리밋(분당 약 30회) 보호용.
+# 듀얼모멘텀 탭을 새로 열거나 '지금 갱신'을 누르면 .clear()로 비우고 바로 다시 받는다.
+@st.cache_data(ttl=30)
 def _fetch_dm_markets():
     data = _coingecko_get("https://api.coingecko.com/api/v3/coins/markets",
                           {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1,
@@ -764,14 +774,13 @@ def _fetch_dm_markets():
     return data, pd.Timestamp.now(tz="Asia/Seoul")
 
 
-@st.cache_data(ttl=600)
-def _fetch_btc_daily_closes():
-    """(BTC/USD 일봉 종가 Series, 출처). 진행 중인 UTC 당일 봉은 호출부에서 뺀다."""
+@st.cache_data(ttl=60 * 60)
+def _fetch_btc_daily_closes(utc_day):
+    """(BTC/USD 완결 일봉 종가 Series, 출처). utc_day가 캐시 키라 UTC 날짜가 바뀌면 새로 받는다."""
     try:
         start = (pd.Timestamp.today() - pd.Timedelta(days=300)).strftime("%Y-%m-%d")
-        df = fdr.DataReader("BTC/USD", start)
-        s = df["Close"].dropna()
-        if len(s) >= 130:
+        s = CM.completed_closes(fdr.DataReader("BTC/USD", start)["Close"], utc_day)
+        if len(s) >= CM.DM_SMA_WINDOW + 10:
             return s, "FinanceDataReader(Yahoo BTC-USD)"
         print(f"[coin_dm] FDR BTC/USD 일봉 부족: {len(s)}개")
     except Exception as e:
@@ -782,9 +791,27 @@ def _fetch_btc_daily_closes():
     # 00:00 UTC 시점 값 = 전날 일봉 종가라 하루 당겨 날짜를 맞춘다. 마지막 점(현재 시각)은 버린다.
     s = pd.Series({pd.Timestamp(ts, unit="ms").normalize() - pd.Timedelta(days=1): p
                    for ts, p in prices[:-1] if pd.Timestamp(ts, unit="ms").hour == 0})
-    if len(s) < 130:
+    s = CM.completed_closes(s, utc_day)
+    if len(s) < CM.DM_SMA_WINDOW + 10:
         raise RuntimeError(f"CoinGecko BTC 일봉 부족: {len(s)}개")
-    return s.sort_index(), "CoinGecko market_chart"
+    return s, "CoinGecko market_chart"
+
+
+@st.cache_data(ttl=60 * 60)
+def _fetch_dm_close_points(base_symbol, coin_id, utc_day):
+    """3·4주 수익률의 기준 종가용: (봉 마감 시각(UTC) 인덱스 종가 Series, 출처). Cloud(미국 IP)에서
+    막히는 Binance는 빼고 Coinbase→Bybit→OKX→CoinGecko 순. 거래소 봉은 시작 시각+1일이 마감,
+    CoinGecko market_chart는 각 점의 시각 자체가 그 가격의 시각이다."""
+    for name, fn in (("Coinbase", _fetch_daily_coinbase), ("Bybit", _fetch_daily_bybit),
+                     ("OKX", _fetch_daily_okx)):
+        rows = fn(base_symbol)
+        if rows and len(rows) >= 35:
+            return pd.Series({pd.Timestamp(r["time"]).tz_localize("UTC") + pd.Timedelta(days=1): r["close"]
+                              for r in rows}), name
+    rows = _fetch_daily_coingecko_market_chart(coin_id, days=60)
+    if rows and len(rows) >= 35:
+        return pd.Series({pd.Timestamp(r["time"]).tz_localize("UTC"): r["close"] for r in rows}), "CoinGecko"
+    return None, None
 
 
 @st.cache_data(ttl=60 * 60 * 24)
@@ -804,11 +831,11 @@ def _coin_dm_last_good():
     return {}
 
 
-def _coin_dm_fetch(key, fn):
+def _coin_dm_fetch(key, fn, *args):
     """(값, 오류문구). 실패하면 마지막 성공값과 오류를 함께 돌려준다(없으면 값 None)."""
     store = _coin_dm_last_good()
     try:
-        store[key] = fn()
+        store[key] = fn(*args)
         return store[key], None
     except Exception as e:
         print(f"[coin_dm] {key} 조회 실패: {type(e).__name__}: {e}")
@@ -818,51 +845,78 @@ def _coin_dm_fetch(key, fn):
 def _render_coin_dual_momentum():
     st.caption("강환국 '알트코인 듀얼모멘텀 업그레이드' — BTC가 120일 이평 위일 때만, 시총 상위 "
                f"{CM.DM_TOP_N}개(스테이블·래핑 토큰 제외) 중 최근 수익률 상위 {CM.DM_PICKS}개를 동일 비중 매수.")
-    markets_res, mk_err = _coin_dm_fetch("markets", _fetch_dm_markets)
-    btc_res, btc_err = _coin_dm_fetch("btc", _fetch_btc_daily_closes)
-
-    if btc_res is None:
-        st.warning("⚠️ BTC 일봉을 불러오지 못해 120일 이평 필터를 계산할 수 없습니다.")
-        sig = None
-    else:
-        btc_closes, btc_src = btc_res
-        sig = CM.sma_filter(CM.completed_closes(btc_closes, CM.today_utc_date()))
-        if btc_err:
-            st.warning("⚠️ BTC 일봉 조회에 실패해 마지막으로 받은 값으로 보여줍니다.")
-        if sig is None:
-            st.warning("⚠️ BTC 완결 일봉이 120개 미만이라 이평 필터를 계산할 수 없습니다.")
-    if sig is not None:
-        ok = sig["above"]
-        title = (f"BTC > 120MA: 매수 가능 (상위 2주 수익률 {CM.DM_PICKS}개 매수)" if ok
-                 else "BTC < 120MA: 100% 현금 보유")
-        bg, border = ("rgba(26,152,80,0.16)", "#1a9850") if ok else ("rgba(215,25,28,0.14)", "#d7191c")
-        st.markdown(
-            f"<div style='display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;"
-            f"gap:4px 16px;padding:12px 16px;border-radius:8px;background:{bg};border-left:5px solid {border};"
-            f"margin-bottom:8px'><b style='font-size:1.05rem'>{'🟢' if ok else '🔴'} {title}</b>"
-            f"<span>${sig['close']:,.0f} / ${sig['sma']:,.0f} "
-            f"(<b>{sig['gap']:+.2%}</b>)</span></div>", unsafe_allow_html=True)
-        print(f"[coin_dm] BTC 완결 종가 {sig['date']:%Y-%m-%d} {sig['close']:,.2f} / SMA120 {sig['sma']:,.2f} "
-              f"({sig['gap']:+.2%}) 출처 {btc_src}")
-
+    banner_box = st.container()
     period = st.radio("기간", list(CM.DM_PERIODS), index=list(CM.DM_PERIODS).index(CM.DM_DEFAULT_PERIOD),
                       horizontal=True, key="coin_dm_period")
-    if markets_res is None:
-        st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요."
+    info_col, btn_col = st.columns([4, 1], vertical_alignment="center")
+    # 탭을 새로 열었을 때(직전 실행에서 이 탭이 안 그려졌을 때)와 '지금 갱신'을 눌렀을 때는 30초 캐시도
+    # 무시하고 새로 받는다. 기간 선택 등 탭 안의 조작은 30초 캐시를 그대로 쓴다.
+    refresh = btn_col.button("🔄 지금 갱신", key="coin_dm_refresh", use_container_width=True)
+    if refresh or not st.session_state.get("_coin_dm_was_open"):
+        _fetch_dm_markets.clear()
+        st.session_state.coin_dm_requested_at = pd.Timestamp.now(tz="Asia/Seoul")
+    st.session_state._coin_dm_open_now = True
+
+    utc_day = CM.today_utc_date()
+    markets_res, mk_err = _coin_dm_fetch("markets", _fetch_dm_markets)
+    btc_res, btc_err = _coin_dm_fetch("btc", _fetch_btc_daily_closes, utc_day)
+
+    markets = fetched_at = quote_ts = None
+    if markets_res is not None:
+        markets, fetched_at = markets_res
+        quote_ts = CM.latest_update(markets)
+        quote_kst = quote_ts.tz_convert("Asia/Seoul") if quote_ts is not None else fetched_at
+        if mk_err:
+            st.warning(f"⚠ 실시간 조회 실패 — {quote_kst:%H:%M:%S} 기준 데이터 표시 중 ({mk_err})")
+    btc_live = next((m.get("current_price") for m in markets or [] if m.get("id") == "bitcoin"), None)
+
+    sig = None
+    with banner_box:
+        if btc_res is None:
+            st.warning("⚠️ BTC 일봉을 불러오지 못해 120일 이평 필터를 계산할 수 없습니다.")
+        else:
+            btc_closes, btc_src = btc_res
+            if btc_err:
+                st.warning("⚠️ BTC 일봉 조회에 실패해 마지막으로 받은 값으로 120일 이평을 계산합니다.")
+            sig = CM.sma_filter(btc_closes, price=btc_live)
+            if sig is None:
+                st.warning("⚠️ BTC 완결 일봉이 120개 미만이라 이평 필터를 계산할 수 없습니다.")
+        if sig is not None:
+            ok = sig["above"]
+            title = (f"BTC > 120MA: 매수 가능 (상위 2주 수익률 {CM.DM_PICKS}개 매수)" if ok
+                     else "BTC < 120MA: 100% 현금 보유")
+            bg, border = ("rgba(26,152,80,0.16)", "#1a9850") if ok else ("rgba(215,25,28,0.14)", "#d7191c")
+            px_label = "실시간 BTC" if sig["live"] else f"BTC 종가({sig['date']:%m-%d})"
+            st.markdown(
+                f"<div style='display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;"
+                f"gap:4px 16px;padding:12px 16px;border-radius:8px;background:{bg};"
+                f"border-left:5px solid {border};margin-bottom:8px'>"
+                f"<b style='font-size:1.05rem'>{'🟢' if ok else '🔴'} {title}</b>"
+                f"<span>{px_label} ${sig['price']:,.0f} / 120MA ${sig['sma']:,.0f} "
+                f"(<b>{sig['gap']:+.1%}</b>)</span></div>", unsafe_allow_html=True)
+            print(f"[coin_dm] {px_label} {sig['price']:,.2f} / SMA120 {sig['sma']:,.2f} ({sig['gap']:+.2%}) "
+                  f"· SMA 마지막 완결 봉 {sig['date']:%Y-%m-%d} 종가 {sig['close']:,.2f} · 출처 {btc_src}")
+
+    if markets is None:
+        st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 '지금 갱신'을 눌러주세요."
                    + (f" ({mk_err})" if mk_err else ""))
         return
-    markets, fetched_at = markets_res
-    if mk_err:
-        st.warning(f"⚠️ CoinGecko 시세 조회에 실패해 {fetched_at:%H:%M}에 받은 값으로 보여줍니다.")
+    req = st.session_state.get("coin_dm_requested_at")
+    info_col.caption(
+        f"시세 기준: {quote_kst:%Y-%m-%d %H:%M:%S} KST (CoinGecko)"
+        + (f" · 조회: {req:%H:%M:%S}" if req is not None else "")
+        + f" · 응답 수신: {fetched_at:%H:%M:%S}")
 
     universe, excluded = CM.select_universe(markets)
     field, days = CM.DM_PERIODS[period]
     if field is None:
-        with st.spinner("일봉으로 수익률 계산 중..."):
-            with ThreadPoolExecutor(max_workers=10) as exe:
-                hists = list(exe.map(lambda m: _fetch_coin_daily_history(m["symbol"].upper(), m.get("id"))[0],
-                                     universe))
-        rets = [CM.lookback_return([c["close"] for c in h], days) if h else None for h in hists]
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+        with st.spinner("과거 종가 조회 중..."):
+            with ThreadPoolExecutor(max_workers=8) as exe:
+                points = list(exe.map(
+                    lambda m: _fetch_dm_close_points(m["symbol"].upper(), m.get("id"), utc_day)[0], universe))
+        rets = [CM.live_return(m.get("current_price"), CM.close_before(p, cutoff) if p is not None else None)
+                for m, p in zip(universe, points)]
     else:
         rets = [_coingecko_pct(m, field) for m in universe]
 
@@ -874,8 +928,9 @@ def _render_coin_dual_momentum():
                      "mcap_rank": mcap_rank, "price": m.get("current_price"),
                      "chg_24h": _coingecko_pct(m, "price_change_percentage_24h_in_currency"), "ret": ret})
     ranked = CM.rank_momentum(rows)
-    print(f"[coin_dm] {period} 순위: " + ", ".join(f"{r.symbol} {r.ret:+.2%}" if pd.notna(r.ret) else f"{r.symbol} -"
-                                                    for r in ranked.itertuples()))
+    print(f"[coin_dm] {period} 순위(시세 기준 {quote_kst:%H:%M:%S} KST): " + ", ".join(
+        f"{r.symbol} ${r.price:,.6g} {r.ret:+.2%}" if pd.notna(r.ret) else f"{r.symbol} -"
+        for r in ranked.head(5).itertuples()))
 
     risk_off = sig is not None and not sig["above"]
     if risk_off:
@@ -911,8 +966,9 @@ def _render_coin_dual_momentum():
                      period: st.column_config.NumberColumn(format="percent", width="small"),
                      "비고": st.column_config.TextColumn(width="medium"),
                  })
-    src = "CoinGecko" + (" + 일봉(랭킹 탭과 같은 다중소스)" if field is None else "")
-    st.caption(f"3일마다 재확인 · 상위권 유지 시 보유 지속 · 데이터: {src}, 갱신 시각 {fetched_at:%H:%M}"
+    src = ("CoinGecko 실시간가 ÷ N일 전 마감 일봉 종가(Coinbase→Bybit→OKX→CoinGecko)" if field is None
+           else f"CoinGecko {days}일 변동률(현재가 vs {days}일 전, 롤링)")
+    st.caption(f"3일마다 재확인 · 상위권 유지 시 보유 지속 · 데이터: {src}, 갱신 시각 {quote_kst:%H:%M}"
                " · '거래 어려움' = 업비트·바이낸스·OKX·바이비트 중 상장 거래소가 없거나 매우 적음")
     with st.expander(f"유니버스에서 제외한 코인 ({len(excluded)}개, 시총 상위 60개 중)"):
         st.write(" · ".join(f"{m['symbol'].upper()}({CM.DM_EXCLUDED_LABELS[r]})" for m, r in excluded) or "없음")
@@ -2308,9 +2364,12 @@ watchlist = st.session_state.watchlist
 # 그리는 탭(동적자산배분·코인)의 필터 값은 다시 대입해 두어야 돌아왔을 때 유지된다.
 for _k in ("coin_tier", "coin_rank_n", "coin_mcap_min", "coin_col_weekrs", "coin_col_weekret",
            "coin_col_monthret", "coin_rank_period", "coin_rank_iv", "g247_cat", "coin_g247_iv",
-           "coin_dm_period"):
+           "coin_dm_period", "coin_sub_tab"):
     if _k in st.session_state:
         st.session_state[_k] = st.session_state[_k]
+
+# 듀얼모멘텀 하위탭이 직전 실행에 그려졌는지 — 아니었다면 이번이 '탭을 새로 연' 실행이라 실시간 시세를 새로 받는다.
+st.session_state._coin_dm_was_open = st.session_state.pop("_coin_dm_open_now", False)
 
 # on_change="rerun"이어야 탭의 .open이 채워진다. 동적자산배분·코인은 계산이 무거워(처음 열 때
 # 각각 10초·40초 안팎) 선택됐을 때만 실행한다 — 안 그러면 어느 탭을 보든 매번 이 계산을 기다린다.
@@ -3605,12 +3664,15 @@ with tab6:
 # =====================  코인  ================================================
 with tab7:
     if tab7.open:
+        # 듀얼모멘텀은 탭을 누르는 순간 실시간 시세를 받아야 해서 하위탭도 on_change="rerun"으로 .open을
+        # 받는다. 나머지 하위탭은 예전처럼 항상 그린다.
         sub_rank, sub_dm, sub_g247, sub_onchain = st.tabs(
-            ["🏆 랭킹", "🚀 듀얼모멘텀", "🌐 글로벌 24-7", "⛓️ 온체인"])
+            ["🏆 랭킹", "🚀 듀얼모멘텀", "🌐 글로벌 24-7", "⛓️ 온체인"], key="coin_sub_tab", on_change="rerun")
 
         # ---- 듀얼모멘텀 -----------------------------------------------------------
         with sub_dm:
-            _render_coin_dual_momentum()
+            if sub_dm.open:
+                _render_coin_dual_momentum()
 
         # ---- 랭킹 ---------------------------------------------------------------
         with sub_rank:
