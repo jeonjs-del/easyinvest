@@ -825,6 +825,50 @@ def _fetch_upbit_korean_names():
         return {}
 
 
+# '거래 가능' 판정용 현물 상장목록. 시세와 같이 30초만 캐시하고 탭 진입·'지금 갱신' 때 함께 비운다.
+@st.cache_data(ttl=30)
+def _fetch_dm_listing_upbit():
+    r = requests.get("https://api.upbit.com/v1/market/all", timeout=15)
+    r.raise_for_status()
+    syms = {m["market"].split("-")[1] for m in r.json()}
+    if not syms:
+        raise RuntimeError("업비트 상장목록 빈 응답")
+    return syms
+
+
+@st.cache_data(ttl=30)
+def _fetch_dm_listing_okx():
+    """(상장 심볼 set, 심볼별 24시간 USDT·USDC 거래대금). tickers 한 번으로 둘 다 얻는다."""
+    r = requests.get("https://www.okx.com/api/v5/market/tickers", params={"instType": "SPOT"}, timeout=15)
+    r.raise_for_status()
+    rows = r.json().get("data") or []
+    if not rows:
+        raise RuntimeError(f"OKX tickers 빈 응답: {r.text[:150]}")
+    syms, vol = set(), {}
+    for t in rows:
+        base, quote = t["instId"].split("-")[:2]
+        syms.add(base)
+        if quote in ("USDT", "USDC"):
+            vol[base] = vol.get(base, 0.0) + float(t.get("volCcy24h") or 0)
+    return syms, vol
+
+
+@st.cache_data(ttl=30)
+def _fetch_dm_listing_bybit():
+    r = requests.get("https://api.bybit.com/v5/market/instruments-info",
+                     params={"category": "spot", "limit": 1000}, timeout=15)
+    r.raise_for_status()
+    rows = (r.json().get("result") or {}).get("list") or []
+    if not rows:
+        raise RuntimeError(f"Bybit instruments 빈 응답: {r.text[:150]}")
+    return {i["baseCoin"] for i in rows if i.get("status") == "Trading"}
+
+
+_DM_LISTING_FETCHERS = {"upbit": _fetch_dm_listing_upbit, "okx": _fetch_dm_listing_okx,
+                        "bybit": _fetch_dm_listing_bybit}
+_DM_VENUE_LABELS = {"upbit": "업비트", "okx": "OKX", "bybit": "바이비트"}
+
+
 @st.cache_resource
 def _coin_dm_last_good():
     """세션·재실행과 무관하게 마지막 성공 조회값을 들고 있는 저장소(서버 프로세스당 1개)."""
@@ -854,6 +898,8 @@ def _render_coin_dual_momentum():
     refresh = btn_col.button("🔄 지금 갱신", key="coin_dm_refresh", use_container_width=True)
     if refresh or not st.session_state.get("_coin_dm_was_open"):
         _fetch_dm_markets.clear()
+        for _fn in _DM_LISTING_FETCHERS.values():
+            _fn.clear()
         st.session_state.coin_dm_requested_at = pd.Timestamp.now(tz="Asia/Seoul")
     st.session_state._coin_dm_open_now = True
 
@@ -907,7 +953,26 @@ def _render_coin_dual_momentum():
         + (f" · 조회: {req:%H:%M:%S}" if req is not None else "")
         + f" · 응답 수신: {fetched_at:%H:%M:%S}")
 
-    universe, excluded = CM.select_universe(markets)
+    # 매 조회마다 시총 순위와 함께 거래 가능 여부도 새로 판정해 '거래 가능한' 상위 20개를 만든다.
+    listings, okx_vol, failed, missing = {}, None, [], []
+    with ThreadPoolExecutor(max_workers=3) as exe:
+        futs = {v: exe.submit(_coin_dm_fetch, f"listing_{v}", fn) for v, fn in _DM_LISTING_FETCHERS.items()}
+    for v, fut in futs.items():
+        res, err = fut.result()
+        if v == "okx" and res is not None:
+            res, okx_vol = res
+        listings[v] = res
+        if err:
+            (failed if res is not None else missing).append(_DM_VENUE_LABELS[v])
+    if missing:
+        st.warning(f"⚠ {'·'.join(missing)} 상장목록을 받지 못해 '거래 어려움'은 고정 목록"
+                   f"({', '.join(sorted(CM.DM_HARD_TO_TRADE))})으로 판정했습니다.")
+    elif failed:
+        st.warning(f"⚠ {'·'.join(failed)} 상장목록 조회 실패 — 직전에 받은 목록으로 거래 가능 여부를 판정했습니다.")
+    hard = CM.hard_to_trade_symbols([m["symbol"] for m in markets], listings, okx_vol)
+    universe, excluded = CM.select_universe(markets, hard=hard)
+    print(f"[coin_dm] 거래 어려움 제외: {sorted(s for s in hard)} · 유니버스: "
+          + ", ".join(m["symbol"].upper() for m in universe))
     field, days = CM.DM_PERIODS[period]
     if field is None:
         cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
@@ -969,7 +1034,8 @@ def _render_coin_dual_momentum():
     src = ("CoinGecko 실시간가 ÷ N일 전 마감 일봉 종가(Coinbase→Bybit→OKX→CoinGecko)" if field is None
            else f"CoinGecko {days}일 변동률(현재가 vs {days}일 전, 롤링)")
     st.caption(f"3일마다 재확인 · 상위권 유지 시 보유 지속 · 데이터: {src}, 갱신 시각 {quote_kst:%H:%M}"
-               " · 업비트·바이낸스·OKX·바이비트에서 거래하기 어려운 코인은 빼고 다음 순위로 채움")
+               " · 거래 어려운 코인(업비트·OKX·바이비트 미상장, OKX 단독이면 24시간 거래대금 "
+               f"${CM.DM_MIN_OKX_ONLY_VOLUME_USD / 1e6:.0f}M 미만)은 조회할 때마다 다시 판정해 빼고 다음 순위로 채움")
     with st.expander(f"유니버스에서 제외한 코인 ({len(excluded)}개, 시총 상위 60개 중)"):
         st.write(" · ".join(f"{m['symbol'].upper()}({CM.DM_EXCLUDED_LABELS[r]})" for m, r in excluded) or "없음")
 

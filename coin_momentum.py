@@ -34,10 +34,14 @@ DM_EXCLUDED_LABELS = {"stablecoin": "스테이블코인", "wrapped": "래핑·�
                       "stable_rule": "스테이블(보조 규칙)"}
 STABLE_PRICE_BAND = (0.97, 1.03)
 
-# 업비트·바이낸스·OKX·바이비트 현물 상장 여부를 2026-10-15에 각 거래소 상장목록 API로 확인한
-# 결과(2026-10-18 재확인). 사서 들고 갈 수 없는 코인이라 유니버스에서 빼고 다음 순위로 채운다.
-# 넷 다 미상장이 기준이고, LEO는 OKX에만 있지만 거래량이 하루 수십만 달러뿐이라 사용자 지정으로 넣었다.
-# OKB(OKX 전용, OKX 자체 토큰이라 OKX에선 거래 활발)는 넣지 않았다.
+# 거래 어려운 코인은 유니버스에서 빼고 다음 순위로 채운다. 판정은 조회할 때마다 업비트·OKX·바이비트
+# 현물 상장목록으로 새로 한다(hard_to_trade_symbols). Binance는 Cloud(미국 IP)에서 막히고 사용자 지시로
+# 쓰지 않는다 — 바이낸스에만 있는 코인은 '거래 어려움'으로 잡히지만 2026-10 상위 60엔 그런 코인이 없었다.
+# OKX에만 있는 코인은 OKX 24시간 USDT·USDC 거래대금이 이 값 미만이면 거래 어려움(LEO는 하루 $135였다,
+# OKB는 $740만).
+DM_MIN_OKX_ONLY_VOLUME_USD = 1_000_000
+DM_LISTING_VENUES = ("upbit", "okx", "bybit")
+# 상장목록을 하나라도 못 받았고 직전 성공값도 없을 때만 쓰는 고정 목록(2026-10-18 4대 거래소 확인 결과).
 DM_HARD_TO_TRADE = {"LEO", "WBT", "XMR", "RAIN", "BTW"}
 
 # 표시명 → (CoinGecko markets 필드, 일수). 필드가 None이면 실시간가 / N일 전 일봉 종가로 계산.
@@ -50,30 +54,48 @@ DM_PERIODS = {
 DM_DEFAULT_PERIOD = "2주"
 
 
-def exclusion_reason(m):
-    """markets 항목 하나가 유니버스 제외 대상이면 DM_EXCLUDED 카테고리(또는 "stable_rule"), 아니면 None."""
+def hard_to_trade_symbols(symbols, listings, okx_volume_usd=None):
+    """symbols 중 거래 어려운 심볼 집합. listings: {거래소: 상장 심볼 set 또는 None(조회 실패)}.
+    한 곳이라도 None이면 판정할 수 없어 고정 목록 DM_HARD_TO_TRADE로 대신한다."""
+    symbols = {s.upper() for s in symbols}
+    if any(listings.get(v) is None for v in DM_LISTING_VENUES):
+        return symbols & DM_HARD_TO_TRADE
+    hard = set()
+    for s in symbols:
+        venues = [v for v in DM_LISTING_VENUES if s in listings[v]]
+        if not venues:
+            hard.add(s)
+        elif venues == ["okx"] and okx_volume_usd is not None \
+                and okx_volume_usd.get(s, 0.0) < DM_MIN_OKX_ONLY_VOLUME_USD:
+            hard.add(s)
+    return hard
+
+
+def exclusion_reason(m, hard=DM_HARD_TO_TRADE):
+    """markets 항목 하나가 유니버스 제외 대상이면 DM_EXCLUDED 카테고리·"stable_rule"·"hard_to_trade", 아니면 None.
+    스테이블 판정을 먼저 해야 미상장 스테이블이 '거래 어려움'으로 잘못 분류되지 않는다."""
     sym = (m.get("symbol") or "").upper()
     for cat, syms in DM_EXCLUDED.items():
         if sym in syms:
             return cat
-    if sym in DM_HARD_TO_TRADE:
-        return "hard_to_trade"
     name = (m.get("name") or "").lower()
     price = m.get("current_price")
     if ("usd" in sym.lower() or "usd" in name) and price is not None \
             and STABLE_PRICE_BAND[0] <= price <= STABLE_PRICE_BAND[1]:
         return "stable_rule"
+    if sym in hard:
+        return "hard_to_trade"
     return None
 
 
-def select_universe(markets, top_n=DM_TOP_N):
+def select_universe(markets, top_n=DM_TOP_N, hard=DM_HARD_TO_TRADE):
     """(유니버스 상위 top_n, 제외된 [(항목, 사유)]) 반환. 시총 내림차순으로 다시 정렬한다 —
     CoinGecko의 market_cap_rank에 동률·역전이 있었다(build_coin_ranking 주석)."""
     ordered = sorted((m for m in markets if m.get("market_cap")),
                      key=lambda m: m["market_cap"], reverse=True)
     kept, excluded = [], []
     for m in ordered:
-        reason = exclusion_reason(m)
+        reason = exclusion_reason(m, hard)
         if reason:
             excluded.append((m, reason))
         elif len(kept) < top_n:

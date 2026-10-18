@@ -47,6 +47,27 @@ class ExclusionTest(unittest.TestCase):
         self.assertEqual([m["symbol"] for m in kept], ["btc", "eth", "avax", "sui"])
         self.assertEqual([(m["symbol"], r) for m, r in excluded], [("wbt", "hard_to_trade"), ("leo", "hard_to_trade")])
 
+    def test_hard_to_trade_from_live_listings(self):
+        listings = {"upbit": {"BTC"}, "okx": {"BTC", "OKB", "LEO", "NEW"}, "bybit": {"BTC", "SUI"}}
+        vol = {"OKB": 7_000_000, "LEO": 135, "NEW": 2_000_000}
+        hard = CM.hard_to_trade_symbols(["BTC", "OKB", "LEO", "SUI", "XMR", "new"], listings, vol)
+        self.assertEqual(hard, {"LEO", "XMR"})
+        # 고정 목록에 없던 코인도 상장목록에서 빠지면 바로 잡힌다
+        self.assertEqual(CM.hard_to_trade_symbols(["ETH"], listings, vol), {"ETH"})
+
+    def test_hard_to_trade_fallback_when_listing_missing(self):
+        listings = {"upbit": {"BTC"}, "okx": None, "bybit": {"BTC"}}
+        self.assertEqual(CM.hard_to_trade_symbols(["BTC", "LEO", "ETH"], listings), {"LEO"})
+
+    def test_unlisted_stable_stays_stable(self):
+        self.assertEqual(CM.exclusion_reason(_m("NUSD", 1, 1.0), hard={"NUSD"}), "stable_rule")
+
+    def test_select_universe_live_hard_set(self):
+        markets = [_m("BTC", 100), _m("OKB", 95), _m("ETH", 90), _m("AVAX", 80)]
+        kept, excluded = CM.select_universe(markets, top_n=2, hard={"OKB"})
+        self.assertEqual([m["symbol"] for m in kept], ["btc", "eth"])
+        self.assertEqual(excluded[0][1], "hard_to_trade")
+
     def test_select_universe_reorders_by_market_cap(self):
         kept, _ = CM.select_universe([_m("A", 5), _m("B", 9), _m("C", 7)], top_n=3)
         self.assertEqual([m["symbol"] for m in kept], ["b", "c", "a"])

@@ -20,7 +20,7 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
   조회는 `app.py`의 `_render_wealth_tab` 등이 맡는다. 은퇴 탭 계산을 고칠 땐 여기에 두고
   `tests/test_wealth.py`에 케이스를 추가할 것.
 - `coin_momentum.py` — 코인 탭 듀얼모멘텀 하위탭의 순수 계산 로직(유니버스 제외 목록
-  `DM_EXCLUDED`, 거래 어려움 목록 `DM_HARD_TO_TRADE` — 둘 다 유니버스에서 빼고 다음 순위로 채움, BTC SMA120 필터, 순위). Streamlit·네트워크
+  `DM_EXCLUDED`, 거래 어려움 판정 `hard_to_trade_symbols` — 둘 다 유니버스에서 빼고 다음 순위로 채움, BTC SMA120 필터, 순위). Streamlit·네트워크
   비의존 — 조회·화면은 `app.py`의 `_render_coin_dual_momentum`. 테스트는 `tests/test_coin_momentum.py`.
 - `lwc_local.py` — `streamlit-lightweight-charts-ntf` 패치 래퍼(줌 상태 복원 + dblclick
   지원). 건드릴 일 거의 없음.
@@ -84,7 +84,7 @@ python -m unittest tests.test_coin_momentum -v # 오프라인
      CoinGecko markets의 BTC 현재가 vs SMA120(완결 일봉 종가 120개) — 위면 매수 가능 배너, 아니면 현금
      배너+순위표 흐리게. 유니버스는 `coins/markets` 상위 60개에서 `coin_momentum.DM_EXCLUDED`(스테이블·
      래핑/스테이킹·금 토큰·토큰화 펀드 — 2026-10 상위권에 USYC·USDY·BUIDL 같은 이자형 달러 토큰이 있어
-     이 범주를 추가)와 "심볼/이름에 usd + 가격 0.97~1.03" 보조 규칙, `DM_HARD_TO_TRADE`(4대 거래소 미상장 등)로 거른 시총 상위 20개.
+     이 범주를 추가)와 "심볼/이름에 usd + 가격 0.97~1.03" 보조 규칙, 거래 어려움 판정(아래)으로 거른 시총 상위 20개.
    - **캐시 정책**: markets 호출(`_fetch_dm_markets`)은 `ttl=30`(레이트리밋 보호용)만 두고, 하위탭을
      새로 열 때(직전 실행에 이 탭이 안 그려졌을 때 — `_coin_dm_was_open`/`_coin_dm_open_now`)와
      '🔄 지금 갱신'을 누를 때 `.clear()`로 비워 무조건 새로 받는다. 이를 위해 코인 하위탭은
@@ -100,8 +100,13 @@ python -m unittest tests.test_coin_momentum -v # 오프라인
    - 실패 처리: 429·네트워크 오류는 최대 2회 재시도, 그래도 실패하면 `_coin_dm_last_good`
      (cache_resource)의 직전 성공값과 "⚠ 실시간 조회 실패 — HH:MM:SS 기준 데이터 표시 중" 경고.
      랭킹 하위탭이 함께 그려지면서 CoinGecko 폴백 호출을 많이 쓰면 429가 나기 쉽다.
-   - 한글명은 업비트 `market/all`. `DM_HARD_TO_TRADE`(유니버스에서 제외, 다음 순위로 채움)는 업비트·바이낸스·OKX·바이비트 현물 상장목록으로
-     확인한 값이라(2026-10-15) 상위 20 구성이 바뀌면 다시 확인할 것.
+   - **거래 어려움(조회 때마다 다시 판정)**: 시세와 함께 업비트 `market/all`·OKX `market/tickers`·Bybit
+     `instruments-info` 현물 상장목록을 받아(각 30초 캐시, 탭 진입·'지금 갱신' 때 함께 비움) 세 곳 모두
+     미상장이거나 OKX 단독인데 24시간 USDT·USDC 거래대금이 `DM_MIN_OKX_ONLY_VOLUME_USD`($1M) 미만이면 빼고
+     다음 순위로 채운다(`coin_momentum.hard_to_trade_symbols`). Binance는 Cloud 차단·사용자 지시로 조회하지
+     않는다 — 바이낸스에만 있는 코인은 '거래 어려움'으로 잡힌다(2026-10 상위 60엔 없었음). 상장목록 조회가
+     실패하면 거래소별 직전 성공값, 그것도 없으면 고정 목록 `DM_HARD_TO_TRADE`로 판정하고 경고를 띄운다.
+   - 한글명은 업비트 `market/all`(하루 캐시).
 8. **은퇴** — 총자산·부채·순자산 요약, 부동산(국토교통부 실거래가 자동 반영), 금융자산
    5항목(예금·퇴직연금·개인연금·주식·암호화폐, 항목별 현금+보유 종목), 자산 변화(월말 기록·
    월별/연별 추이), 경제적 자유 계산기, 데이터 내보내기·가져오기. 각 구역은 접힌 expander.
