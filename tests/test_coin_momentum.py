@@ -24,6 +24,8 @@ class ExclusionTest(unittest.TestCase):
         self.assertEqual(CM.exclusion_reason(_m("WBTC", 1, 80000)), "wrapped")
         self.assertEqual(CM.exclusion_reason(_m("PAXG", 1, 4000)), "gold")
         self.assertEqual(CM.exclusion_reason(_m("USYC", 1, 1.14)), "tokenized_fund")
+        self.assertEqual(CM.exclusion_reason(_m("LEO", 1, 9.0)), "hard_to_trade")
+        self.assertEqual(CM.exclusion_reason(_m("XMR", 1, 500)), "hard_to_trade")
 
     def test_stable_rule(self):
         self.assertEqual(CM.exclusion_reason(_m("NEWX", 1, 1.001, name="New USD")), "stable_rule")
@@ -38,6 +40,12 @@ class ExclusionTest(unittest.TestCase):
         kept, excluded = CM.select_universe(markets, top_n=2)
         self.assertEqual([m["symbol"] for m in kept], ["btc", "eth"])
         self.assertEqual([r for _, r in excluded], ["stablecoin", "wrapped"])
+
+    def test_hard_to_trade_replaced_by_next(self):
+        markets = [_m("BTC", 100), _m("WBT", 95), _m("ETH", 90), _m("LEO", 85), _m("AVAX", 80), _m("SUI", 70)]
+        kept, excluded = CM.select_universe(markets, top_n=4)
+        self.assertEqual([m["symbol"] for m in kept], ["btc", "eth", "avax", "sui"])
+        self.assertEqual([(m["symbol"], r) for m, r in excluded], [("wbt", "hard_to_trade"), ("leo", "hard_to_trade")])
 
     def test_select_universe_reorders_by_market_cap(self):
         kept, _ = CM.select_universe([_m("A", 5), _m("B", 9), _m("C", 7)], top_n=3)
@@ -88,16 +96,15 @@ class RankTest(unittest.TestCase):
         self.assertIsNone(CM.lookback_return([100, 110], 2))
 
     def test_rank_order_and_flags(self):
-        rows = [{"symbol": "A", "ret": 0.05}, {"symbol": "LEO", "ret": 0.20}, {"symbol": "C", "ret": None},
+        rows = [{"symbol": "A", "ret": 0.05}, {"symbol": "B", "ret": 0.20}, {"symbol": "C", "ret": None},
                 {"symbol": "D", "ret": -0.01}, {"symbol": "E", "ret": -0.30}]
         df = CM.rank_momentum(rows)
-        self.assertEqual(df["symbol"].tolist(), ["LEO", "A", "D", "E", "C"])
+        self.assertEqual(df["symbol"].tolist(), ["B", "A", "D", "E", "C"])
         self.assertEqual(df["rank"].tolist()[:4], [1, 2, 3, 4])
         self.assertTrue(pd.isna(df["rank"].iloc[4]))
         self.assertEqual(df["is_pick"].tolist(), [True, True, True, False, False])
         self.assertEqual(df["neg_momentum"].tolist(), [False, False, True, False, False])
-        self.assertTrue(df["hard_to_trade"].iloc[0])
-        self.assertEqual(CM.note_for(df.iloc[0]), "🟢 매수 후보 · 거래 어려움")
+        self.assertEqual(CM.note_for(df.iloc[0]), "🟢 매수 후보")
         self.assertEqual(CM.note_for(df.iloc[2]), "⚠ 모멘텀 음수(현금 보유 고려)")
         self.assertEqual(CM.note_for(df.iloc[3]), "")
 

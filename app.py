@@ -969,7 +969,7 @@ def _render_coin_dual_momentum():
     src = ("CoinGecko 실시간가 ÷ N일 전 마감 일봉 종가(Coinbase→Bybit→OKX→CoinGecko)" if field is None
            else f"CoinGecko {days}일 변동률(현재가 vs {days}일 전, 롤링)")
     st.caption(f"3일마다 재확인 · 상위권 유지 시 보유 지속 · 데이터: {src}, 갱신 시각 {quote_kst:%H:%M}"
-               " · '거래 어려움' = 업비트·바이낸스·OKX·바이비트 중 상장 거래소가 없거나 매우 적음")
+               " · 업비트·바이낸스·OKX·바이비트에서 거래하기 어려운 코인은 빼고 다음 순위로 채움")
     with st.expander(f"유니버스에서 제외한 코인 ({len(excluded)}개, 시총 상위 60개 중)"):
         st.write(" · ".join(f"{m['symbol'].upper()}({CM.DM_EXCLUDED_LABELS[r]})" for m, r in excluded) or "없음")
 

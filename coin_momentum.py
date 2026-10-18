@@ -30,12 +30,14 @@ DM_EXCLUDED = {
                        "SYRUPUSDC"},
 }
 DM_EXCLUDED_LABELS = {"stablecoin": "스테이블코인", "wrapped": "래핑·스테이킹 파생",
-                      "gold": "금 토큰", "tokenized_fund": "토큰화 펀드·RWA",
+                      "gold": "금 토큰", "tokenized_fund": "토큰화 펀드·RWA", "hard_to_trade": "거래 어려움",
                       "stable_rule": "스테이블(보조 규칙)"}
 STABLE_PRICE_BAND = (0.97, 1.03)
 
 # 업비트·바이낸스·OKX·바이비트 현물 상장 여부를 2026-10-15에 각 거래소 상장목록 API로 확인한
-# 결과. 표시만 하고 순위에서는 빼지 않는다. LEO는 OKX에만 있다(유동성이 얕아 사용자 지정대로 포함).
+# 결과(2026-10-18 재확인). 사서 들고 갈 수 없는 코인이라 유니버스에서 빼고 다음 순위로 채운다.
+# 넷 다 미상장이 기준이고, LEO는 OKX에만 있지만 거래량이 하루 수십만 달러뿐이라 사용자 지정으로 넣었다.
+# OKB(OKX 전용, OKX 자체 토큰이라 OKX에선 거래 활발)는 넣지 않았다.
 DM_HARD_TO_TRADE = {"LEO", "WBT", "XMR", "RAIN", "BTW"}
 
 # 표시명 → (CoinGecko markets 필드, 일수). 필드가 None이면 실시간가 / N일 전 일봉 종가로 계산.
@@ -54,6 +56,8 @@ def exclusion_reason(m):
     for cat, syms in DM_EXCLUDED.items():
         if sym in syms:
             return cat
+    if sym in DM_HARD_TO_TRADE:
+        return "hard_to_trade"
     name = (m.get("name") or "").lower()
     price = m.get("current_price")
     if ("usd" in sym.lower() or "usd" in name) and price is not None \
@@ -140,18 +144,14 @@ def rank_momentum(rows, picks=DM_PICKS):
     df["rank"] = pd.Series(range(1, len(df) + 1), dtype="Int64").where(has_ret)
     df["is_pick"] = has_ret & (df.index < picks)
     df["neg_momentum"] = df["is_pick"] & (df["ret"] <= 0)
-    df["hard_to_trade"] = df["symbol"].str.upper().isin(DM_HARD_TO_TRADE)
     return df
 
 
 def note_for(row):
     """순위표 '비고' 칸 문자열."""
-    notes = []
-    if row["is_pick"]:
-        notes.append("⚠ 모멘텀 음수(현금 보유 고려)" if row["neg_momentum"] else "🟢 매수 후보")
-    if row["hard_to_trade"]:
-        notes.append("거래 어려움")
-    return " · ".join(notes)
+    if not row["is_pick"]:
+        return ""
+    return "⚠ 모멘텀 음수(현금 보유 고려)" if row["neg_momentum"] else "🟢 매수 후보"
 
 
 def today_utc_date(now=None):
