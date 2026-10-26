@@ -48,7 +48,8 @@ class ExclusionTest(unittest.TestCase):
         self.assertEqual([(m["symbol"], r) for m, r in excluded], [("wbt", "hard_to_trade"), ("leo", "hard_to_trade")])
 
     def test_hard_to_trade_from_live_listings(self):
-        listings = {"upbit": {"BTC"}, "okx": {"BTC", "OKB", "LEO", "NEW"}, "bybit": {"BTC", "SUI"}}
+        listings = {"upbit": {"BTC"}, "okx": {"BTC", "OKB", "LEO", "NEW"}, "bybit": {"BTC", "SUI"},
+                    "coinbase": {"BTC"}}
         vol = {"OKB": 7_000_000, "LEO": 135, "NEW": 2_000_000}
         hard = CM.hard_to_trade_symbols(["BTC", "OKB", "LEO", "SUI", "XMR", "new"], listings, vol)
         self.assertEqual(hard, {"LEO", "XMR"})
@@ -56,8 +57,12 @@ class ExclusionTest(unittest.TestCase):
         self.assertEqual(CM.hard_to_trade_symbols(["ETH"], listings, vol), {"ETH"})
 
     def test_hard_to_trade_fallback_when_listing_missing(self):
-        listings = {"upbit": {"BTC"}, "okx": None, "bybit": {"BTC"}}
-        self.assertEqual(CM.hard_to_trade_symbols(["BTC", "LEO", "ETH"], listings), {"LEO"})
+        # 일부만 실패하면 받은 거래소로 판정(미국 IP에서 바이비트가 막혀도 동작)
+        listings = {"upbit": {"BTC"}, "okx": None, "bybit": None, "coinbase": {"BTC", "ETH"}}
+        self.assertEqual(CM.hard_to_trade_symbols(["BTC", "LEO", "ETH", "NEW"], listings), {"LEO", "NEW"})
+        # 전부 실패하면 고정 목록
+        none = {v: None for v in CM.DM_LISTING_VENUES}
+        self.assertEqual(CM.hard_to_trade_symbols(["BTC", "LEO", "ETH"], none), {"LEO"})
 
     def test_unlisted_stable_stays_stable(self):
         self.assertEqual(CM.exclusion_reason(_m("NUSD", 1, 1.0), hard={"NUSD"}), "stable_rule")

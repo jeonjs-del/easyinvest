@@ -434,6 +434,16 @@ def _fetch_ma_row(symbol, periods):
 # ============================================================================
 #  코인 탭 — 랭킹(CoinGecko + 일봉 히스토리 다중소스) / 글로벌 24-7(Hyperliquid)
 # ============================================================================
+def _coingecko_headers():
+    """secrets 최상위의 COINGECKO_API_KEY(무료 Demo 키)가 있으면 붙인다. 키가 없으면 IP 단위로 레이트리밋을
+    세는데, Streamlit Cloud는 여러 앱이 IP를 나눠 써서 429가 잦다."""
+    try:
+        key = st.secrets.get("COINGECKO_API_KEY")
+    except Exception:
+        key = None
+    return {"x-cg-demo-api-key": key} if key else {}
+
+
 @st.cache_data(ttl=300)
 def _fetch_coingecko_markets(pool_size):
     """CoinGecko 공개 markets 엔드포인트(무인증) — 시세·시총·거래량·24h/7d/30d
@@ -443,7 +453,7 @@ def _fetch_coingecko_markets(pool_size):
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": pool_size,
                     "page": 1, "sparkline": "true", "price_change_percentage": "24h,7d,30d"},
-            timeout=20,
+            timeout=20, headers=_coingecko_headers(),
         )
         r.raise_for_status()
         return r.json()
@@ -600,7 +610,8 @@ def _fetch_daily_coingecko_market_chart(coin_id, days=365):
         return None
     try:
         r = requests.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
-                          params={"vs_currency": "usd", "days": days, "interval": "daily"}, timeout=15)
+                          params={"vs_currency": "usd", "days": days, "interval": "daily"}, timeout=15,
+                          headers=_coingecko_headers())
     except requests.exceptions.Timeout:
         _log_coin_fetch_fail("CoinGecko", f"{coin_id} 타임아웃")
         return None
@@ -746,7 +757,7 @@ def _coingecko_get(url, params, tries=3):
     for i in range(tries):
         last = i == tries - 1
         try:
-            r = requests.get(url, params=params, timeout=15)
+            r = requests.get(url, params=params, timeout=15, headers=_coingecko_headers())
         except requests.exceptions.RequestException as e:
             if last:
                 raise
@@ -766,12 +777,31 @@ def _coingecko_get(url, params, tries=3):
 # 듀얼모멘텀 탭을 새로 열거나 '지금 갱신'을 누르면 .clear()로 비우고 바로 다시 받는다.
 @st.cache_data(ttl=30)
 def _fetch_dm_markets():
-    data = _coingecko_get("https://api.coingecko.com/api/v3/coins/markets",
-                          {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1,
-                           "price_change_percentage": "24h,7d,14d,30d"})
+    """(markets, 받은 시각 KST, 출처). CoinGecko가 막히면 CoinPaprika tickers를 CoinGecko 형식으로 바꿔 쓴다
+    (14d 필드가 없어 2주 수익률은 거래소 일봉으로 계산된다)."""
+    try:
+        data = _coingecko_get("https://api.coingecko.com/api/v3/coins/markets",
+                              {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 60, "page": 1,
+                               "price_change_percentage": "24h,7d,14d,30d"})
+        if not data:
+            raise RuntimeError("CoinGecko markets 빈 응답")
+        return data, pd.Timestamp.now(tz="Asia/Seoul"), "CoinGecko"
+    except Exception as e:
+        print(f"[coin_dm] CoinGecko markets 실패 → CoinPaprika로 대체: {type(e).__name__}: {str(e)[:150]}")
+    r = requests.get("https://api.coinpaprika.com/v1/tickers", params={"quotes": "USD"}, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"CoinGecko 실패 후 CoinPaprika도 HTTP {r.status_code}: {r.text[:150]}")
+    data = []
+    for t in sorted(r.json(), key=lambda t: t.get("rank") or 10 ** 9)[:80]:
+        q = (t.get("quotes") or {}).get("USD") or {}
+        data.append({"id": None, "symbol": (t.get("symbol") or "").lower(), "name": t.get("name") or "",
+                     "market_cap": q.get("market_cap"), "current_price": q.get("price"),
+                     "last_updated": t.get("last_updated"),
+                     "price_change_percentage_24h_in_currency": q.get("percent_change_24h"),
+                     "price_change_percentage_7d_in_currency": q.get("percent_change_7d")})
     if not data:
-        raise RuntimeError("CoinGecko markets 빈 응답")
-    return data, pd.Timestamp.now(tz="Asia/Seoul")
+        raise RuntimeError("CoinPaprika tickers 빈 응답")
+    return data, pd.Timestamp.now(tz="Asia/Seoul"), "CoinPaprika"
 
 
 @st.cache_data(ttl=60 * 60)
@@ -785,6 +815,11 @@ def _fetch_btc_daily_closes(utc_day):
         print(f"[coin_dm] FDR BTC/USD 일봉 부족: {len(s)}개")
     except Exception as e:
         print(f"[coin_dm] FDR BTC/USD 실패: {type(e).__name__}: {e}")
+    rows = _fetch_daily_coinbase("BTC") or []
+    s = CM.completed_closes(pd.Series({pd.Timestamp(r["time"]).normalize(): r["close"] for r in rows},
+                                      dtype=float), utc_day)
+    if len(s) >= max(CM.DM_SMA_WINDOWS) + 10:
+        return s, "Coinbase BTC-USD"
     data = _coingecko_get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
                           {"vs_currency": "usd", "days": 200, "interval": "daily"})
     prices = data.get("prices") or []
@@ -864,9 +899,20 @@ def _fetch_dm_listing_bybit():
     return {i["baseCoin"] for i in rows if i.get("status") == "Trading"}
 
 
+@st.cache_data(ttl=30)
+def _fetch_dm_listing_coinbase():
+    r = requests.get("https://api.exchange.coinbase.com/products", timeout=15,
+                     headers={"User-Agent": "easyinvest/1.0"})
+    r.raise_for_status()
+    syms = {p["base_currency"] for p in r.json() if p.get("status") == "online" and not p.get("trading_disabled")}
+    if not syms:
+        raise RuntimeError("Coinbase products 빈 응답")
+    return syms
+
+
 _DM_LISTING_FETCHERS = {"upbit": _fetch_dm_listing_upbit, "okx": _fetch_dm_listing_okx,
-                        "bybit": _fetch_dm_listing_bybit}
-_DM_VENUE_LABELS = {"upbit": "업비트", "okx": "OKX", "bybit": "바이비트"}
+                        "bybit": _fetch_dm_listing_bybit, "coinbase": _fetch_dm_listing_coinbase}
+_DM_VENUE_LABELS = {"upbit": "업비트", "okx": "OKX", "bybit": "바이비트", "coinbase": "코인베이스"}
 
 
 @st.cache_resource
@@ -884,6 +930,11 @@ def _coin_dm_fetch(key, fn, *args):
     except Exception as e:
         print(f"[coin_dm] {key} 조회 실패: {type(e).__name__}: {e}")
         return store.get(key), f"{type(e).__name__}: {str(e)[:120]}"
+
+
+def _render_coin_dm_diag(diag):
+    with st.expander("🔧 데이터 조회 상태", expanded=any(v.startswith("❌") for _, v in diag[:2])):
+        st.table(pd.DataFrame(diag, columns=["항목", "상태"]).set_index("항목"))
 
 
 def _render_coin_dual_momentum():
@@ -908,14 +959,19 @@ def _render_coin_dual_momentum():
     markets_res, mk_err = _coin_dm_fetch("markets", _fetch_dm_markets)
     btc_res, btc_err = _coin_dm_fetch("btc", _fetch_btc_daily_closes, utc_day)
 
+    diag = [("시세(markets)", f"✅ {markets_res[2]}" if markets_res and not mk_err else
+             f"❌ {mk_err}" + (" — 직전 값 사용" if markets_res else ""))]
+    diag.append(("BTC 일봉", f"✅ {btc_res[1]}" if btc_res and not btc_err else
+                 f"❌ {btc_err}" + (" — 직전 값 사용" if btc_res else "")))
     markets = fetched_at = quote_ts = None
+    mk_src = "CoinGecko"
     if markets_res is not None:
-        markets, fetched_at = markets_res
+        markets, fetched_at, mk_src = markets_res
         quote_ts = CM.latest_update(markets)
         quote_kst = quote_ts.tz_convert("Asia/Seoul") if quote_ts is not None else fetched_at
         if mk_err:
             st.warning(f"⚠ 실시간 조회 실패 — {quote_kst:%H:%M:%S} 기준 데이터 표시 중 ({mk_err})")
-    btc_live = next((m.get("current_price") for m in markets or [] if m.get("id") == "bitcoin"), None)
+    btc_live = next((m.get("current_price") for m in markets or [] if m.get("symbol") == "btc"), None)
 
     sig = None
     with banner_box:
@@ -949,38 +1005,47 @@ def _render_coin_dual_momentum():
                   f"· SMA 마지막 완결 봉 {sig['date']:%Y-%m-%d} 종가 {sig['close']:,.2f} · 출처 {btc_src}")
 
     if markets is None:
-        st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 '지금 갱신'을 눌러주세요."
+        st.warning("⚠️ 시세 조회(CoinGecko·CoinPaprika)에 실패했습니다. 잠시 후 '지금 갱신'을 눌러주세요."
                    + (f" ({mk_err})" if mk_err else ""))
+        _render_coin_dm_diag(diag)
         return
     req = st.session_state.get("coin_dm_requested_at")
     info_col.caption(
-        f"시세 기준: {quote_kst:%Y-%m-%d %H:%M:%S} KST (CoinGecko)"
+        f"시세 기준: {quote_kst:%Y-%m-%d %H:%M:%S} KST ({mk_src})"
         + (f" · 조회: {req:%H:%M:%S}" if req is not None else "")
         + f" · 응답 수신: {fetched_at:%H:%M:%S}")
 
     # 매 조회마다 시총 순위와 함께 거래 가능 여부도 새로 판정해 '거래 가능한' 상위 20개를 만든다.
     listings, okx_vol, failed, missing = {}, None, [], []
-    with ThreadPoolExecutor(max_workers=3) as exe:
+    with ThreadPoolExecutor(max_workers=len(_DM_LISTING_FETCHERS)) as exe:
         futs = {v: exe.submit(_coin_dm_fetch, f"listing_{v}", fn) for v, fn in _DM_LISTING_FETCHERS.items()}
     for v, fut in futs.items():
         res, err = fut.result()
         if v == "okx" and res is not None:
             res, okx_vol = res
         listings[v] = res
+        diag.append((f"상장목록 · {_DM_VENUE_LABELS[v]}", "✅" if not err else
+                     f"❌ {err}" + (" — 직전 값 사용" if res is not None else "")))
         if err:
             (failed if res is not None else missing).append(_DM_VENUE_LABELS[v])
-    if missing:
-        st.warning(f"⚠ {'·'.join(missing)} 상장목록을 받지 못해 '거래 어려움'은 고정 목록"
+    if len(missing) == len(_DM_LISTING_FETCHERS):
+        st.warning(f"⚠ 거래소 상장목록을 하나도 받지 못해 '거래 어려움'은 고정 목록"
                    f"({', '.join(sorted(CM.DM_HARD_TO_TRADE))})으로 판정했습니다.")
-    elif failed:
-        st.warning(f"⚠ {'·'.join(failed)} 상장목록 조회 실패 — 직전에 받은 목록으로 거래 가능 여부를 판정했습니다.")
+    elif missing or failed:
+        # 바이비트는 미국 IP를 막아 Cloud에선 늘 실패할 수 있다 — 나머지로 판정되니 경고 대신 안내만.
+        st.caption(f"ℹ️ {'·'.join(missing + failed)} 상장목록 조회 실패 — "
+                   + ("받은 거래소 목록만으로" if missing else "직전에 받은 목록으로") + " 거래 가능 여부를 판정했습니다.")
     hard = CM.hard_to_trade_symbols([m["symbol"] for m in markets], listings, okx_vol)
     universe, excluded = CM.select_universe(markets, hard=hard)
     print(f"[coin_dm] 거래 어려움 제외: {sorted(s for s in hard)} · 유니버스: "
           + ", ".join(m["symbol"].upper() for m in universe))
     field, days = CM.DM_PERIODS[period]
-    if field is None:
+    # CoinPaprika로 받았을 땐 14d 필드가 없어 2주도 실시간가 / 과거 종가로 계산한다.
+    from_closes = field is None or all(field not in m for m in universe)
+    if from_closes:
         cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+        if field is not None:
+            diag.append((f"{period} 수익률", "markets에 필드가 없어 거래소 일봉으로 계산"))
         with st.spinner("과거 종가 조회 중..."):
             with ThreadPoolExecutor(max_workers=8) as exe:
                 points = list(exe.map(
@@ -1036,13 +1101,14 @@ def _render_coin_dual_momentum():
                      period: st.column_config.NumberColumn(format="percent", width="small"),
                      "비고": st.column_config.TextColumn(width="medium"),
                  })
-    src = ("CoinGecko 실시간가 ÷ N일 전 마감 일봉 종가(Coinbase→Bybit→OKX→CoinGecko)" if field is None
-           else f"CoinGecko {days}일 변동률(현재가 vs {days}일 전, 롤링)")
+    src = (f"{mk_src} 실시간가 ÷ N일 전 마감 일봉 종가(Coinbase→Bybit→OKX→CoinGecko)" if from_closes
+           else f"{mk_src} {days}일 변동률(현재가 vs {days}일 전, 롤링)")
     st.caption(f"3일마다 재확인 · 상위권 유지 시 보유 지속 · 데이터: {src}, 갱신 시각 {quote_kst:%H:%M}"
-               " · 거래 어려운 코인(업비트·OKX·바이비트 미상장, OKX 단독이면 24시간 거래대금 "
+               " · 거래 어려운 코인(업비트·OKX·바이비트·코인베이스 미상장, OKX 단독이면 24시간 거래대금 "
                f"${CM.DM_MIN_OKX_ONLY_VOLUME_USD / 1e6:.0f}M 미만)은 조회할 때마다 다시 판정해 빼고 다음 순위로 채움")
-    with st.expander(f"유니버스에서 제외한 코인 ({len(excluded)}개, 시총 상위 60개 중)"):
+    with st.expander(f"유니버스에서 제외한 코인 ({len(excluded)}개, 시총 상위 {len(markets)}개 중)"):
         st.write(" · ".join(f"{m['symbol'].upper()}({CM.DM_EXCLUDED_LABELS[r]})" for m, r in excluded) or "없음")
+    _render_coin_dm_diag(diag)
 
 
 def _lwc_time(ts, intraday):
@@ -3736,7 +3802,7 @@ with tab6:
 with tab7:
     if tab7.open:
         # 듀얼모멘텀은 탭을 누르는 순간 실시간 시세를 받아야 해서 하위탭도 on_change="rerun"으로 .open을
-        # 받는다. 나머지 하위탭은 예전처럼 항상 그린다. 코인 탭의 기본 화면은 듀얼모멘텀(맨 앞).
+        # 받는다. 랭킹도 열었을 때만 그린다. 코인 탭의 기본 화면은 듀얼모멘텀(맨 앞).
         sub_dm, sub_rank, sub_g247, sub_onchain = st.tabs(
             ["🚀 듀얼모멘텀", "🏆 랭킹", "🌐 글로벌 24-7", "⛓️ 온체인"], key="coin_sub_tab", on_change="rerun")
 
@@ -3747,127 +3813,130 @@ with tab7:
 
         # ---- 랭킹 ---------------------------------------------------------------
         with sub_rank:
-            st.caption("데이터: CoinGecko(시세·시총·스파크라인). 과거 일봉(RS·주간/월간 수익률용)은 "
-                       "Binance→data-api.binance.vision→Coinbase→Bybit→OKX→CoinGecko 순으로 첫 성공한 "
-                       "소스를 씀(지역 차단·장애 대비 다중소스 폴백 — 아래 표 하단 출처 참고). "
-                       "시세는 5분, 과거 일봉은 1시간 캐시.")
+            # 랭킹은 과거 일봉을 많이 받아(CoinGecko 폴백 포함) 듀얼모멘텀과 같이 그리면 CoinGecko 429를 부른다 —
+            # 열었을 때만 그린다.
+            if sub_rank.open:
+                st.caption("데이터: CoinGecko(시세·시총·스파크라인). 과거 일봉(RS·주간/월간 수익률용)은 "
+                           "Binance→data-api.binance.vision→Coinbase→Bybit→OKX→CoinGecko 순으로 첫 성공한 "
+                           "소스를 씀(지역 차단·장애 대비 다중소스 폴백 — 아래 표 하단 출처 참고). "
+                           "시세는 5분, 과거 일봉은 1시간 캐시.")
 
-            fc1, fc2, fc3, fc4, fc5, fc6 = st.columns([1.1, 1, 1.3, 1, 1, 1.2])
-            tier_label = fc1.selectbox("시총 구간", ["top10", "top20", "top50", "top100", "전체"],
-                                        index=4, key="coin_tier")
-            rank_n = fc2.number_input("순위 ≤ (0=미적용)", min_value=0, value=0, step=10, key="coin_rank_n")
-            mcap_min_m = fc3.number_input("시총 ≥ 백만$ (0=미적용)", min_value=0.0, value=0.0, step=100.0,
-                                           key="coin_mcap_min")
-            show_week_rs = fc4.checkbox("+주간RS", key="coin_col_weekrs")
-            show_week_ret = fc5.checkbox("+주간수익", key="coin_col_weekret")
-            show_month_ret = fc6.checkbox("+3·6·12개월", key="coin_col_monthret")
+                fc1, fc2, fc3, fc4, fc5, fc6 = st.columns([1.1, 1, 1.3, 1, 1, 1.2])
+                tier_label = fc1.selectbox("시총 구간", ["top10", "top20", "top50", "top100", "전체"],
+                                            index=4, key="coin_tier")
+                rank_n = fc2.number_input("순위 ≤ (0=미적용)", min_value=0, value=0, step=10, key="coin_rank_n")
+                mcap_min_m = fc3.number_input("시총 ≥ 백만$ (0=미적용)", min_value=0.0, value=0.0, step=100.0,
+                                               key="coin_mcap_min")
+                show_week_rs = fc4.checkbox("+주간RS", key="coin_col_weekrs")
+                show_week_ret = fc5.checkbox("+주간수익", key="coin_col_weekret")
+                show_month_ret = fc6.checkbox("+3·6·12개월", key="coin_col_monthret")
 
-            with st.spinner("코인 시세·RS 조회 중..."):
-                rank_df, rank_status, source_counts = build_coin_ranking(COIN_UNIVERSE_POOL)
+                with st.spinner("코인 시세·RS 조회 중..."):
+                    rank_df, rank_status, source_counts = build_coin_ranking(COIN_UNIVERSE_POOL)
 
-            if rank_status == "coingecko_fail":
-                st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요.")
-            elif rank_df.empty:
-                st.info("표시할 코인 데이터가 없습니다.")
-            else:
-                work = rank_df.copy()
-                _tier_map = {"top10": 10, "top20": 20, "top50": 50, "top100": 100, "전체": None}
-                _tier_n = _tier_map[tier_label]
-                if _tier_n is not None:
-                    work = work[work["market_cap_rank"] <= _tier_n]
-                if rank_n > 0:
-                    work = work[work["market_cap_rank"] <= rank_n]
-                if mcap_min_m > 0:
-                    work = work[work["market_cap"] >= mcap_min_m * 1e6]
-                work = work.reset_index(drop=True)
-
-                if work.empty:
-                    st.info("조건에 맞는 코인이 없습니다.")
+                if rank_status == "coingecko_fail":
+                    st.warning("⚠️ CoinGecko 시세 조회에 실패했습니다. 잠시 후 다시 시도해주세요.")
+                elif rank_df.empty:
+                    st.info("표시할 코인 데이터가 없습니다.")
                 else:
-                    st.caption(f"{len(work)}개 코인 · 기본 정렬: 시총순 (표 헤더 클릭으로 재정렬 가능, "
-                               "'#'열은 항상 시총 순위 고정)")
+                    work = rank_df.copy()
+                    _tier_map = {"top10": 10, "top20": 20, "top50": 50, "top100": 100, "전체": None}
+                    _tier_n = _tier_map[tier_label]
+                    if _tier_n is not None:
+                        work = work[work["market_cap_rank"] <= _tier_n]
+                    if rank_n > 0:
+                        work = work[work["market_cap_rank"] <= rank_n]
+                    if mcap_min_m > 0:
+                        work = work[work["market_cap"] >= mcap_min_m * 1e6]
+                    work = work.reset_index(drop=True)
 
-                    col_data = {
-                        "#": work["#"], "이름": work["symbol"] + " · " + work["name"],
-                        "가격": work["price"], "24h": work["chg_24h"], "7일": work["chg_7d"],
-                        "30일": work["chg_30d"], "종합RS": work["rs_total"],
-                        "시총": work["market_cap"], "거래량": work["volume"],
-                        "7일 스파크라인": work["sparkline"],
-                    }
-                    if show_week_rs:
-                        for w in (1, 2, 3, 4):
-                            col_data[f"{w}주RS"] = work[f"rs_{w}w"]
-                    if show_week_ret:
-                        for w in (1, 2, 3, 4):
-                            col_data[f"{w}주수익"] = work[f"ret_{w}w"]
-                    if show_month_ret:
-                        col_data["3개월"] = work["ret_3m"]
-                        col_data["6개월"] = work["ret_6m"]
-                        col_data["12개월"] = work["ret_12m"]
-
-                    disp = pd.DataFrame(col_data)
-                    pct_cols = [c for c in ["24h", "7일", "30일"]
-                                + ([f"{w}주수익" for w in (1, 2, 3, 4)] if show_week_ret else [])
-                                + (["3개월", "6개월", "12개월"] if show_month_ret else [])]
-
-                    styled = disp.style
-                    for c in pct_cols:
-                        _cap = _abs_cap(disp[c], COIN_RET_COLOR_CAP)
-                        styled = _apply_bg(styled, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
-
-                    col_config = {
-                        "#": st.column_config.NumberColumn(width="small"),
-                        "가격": st.column_config.NumberColumn(format="$%.6g"),
-                        "24h": st.column_config.NumberColumn(format="percent"),
-                        "7일": st.column_config.NumberColumn(format="percent"),
-                        "30일": st.column_config.NumberColumn(format="percent"),
-                        "종합RS": st.column_config.NumberColumn(format="%.0f"),
-                        "시총": st.column_config.NumberColumn(format="compact"),
-                        "거래량": st.column_config.NumberColumn(format="compact"),
-                        "7일 스파크라인": st.column_config.LineChartColumn(width="medium"),
-                    }
-                    for w in (1, 2, 3, 4):
-                        col_config[f"{w}주RS"] = st.column_config.NumberColumn(format="%.0f")
-                        col_config[f"{w}주수익"] = st.column_config.NumberColumn(format="percent")
-                    for c in ("3개월", "6개월", "12개월"):
-                        col_config[c] = st.column_config.NumberColumn(format="percent")
-
-                    rank_ev = st.dataframe(
-                        styled, use_container_width=True, hide_index=True, column_config=col_config,
-                        height=min(60 + 35 * len(disp), 600),
-                        on_select="rerun", selection_mode="single-row", key="coin_rank_table",
-                    )
-                    _src_label = " · ".join(f"{k} {v}개" for k, v in source_counts.items())
-                    st.caption(f"과거 일봉 출처: {_src_label}")
-
-                    _sel_rows = rank_ev.selection.rows if rank_ev and rank_ev.selection else []
-                    if _sel_rows:
-                        _sel_sym = work.iloc[_sel_rows[0]]["symbol"]
-                        if _sel_sym != st.session_state.coin_rank_symbol:
-                            st.session_state.coin_rank_symbol = _sel_sym
-                            st.rerun()
-
-                    chart_base = st.session_state.coin_rank_symbol or work.iloc[0]["symbol"]
-                    chart_row = work[work["symbol"] == chart_base]
-                    chart_sym = chart_base + "USDT"
-                    chart_label = (chart_row.iloc[0]["symbol"] + " · " + chart_row.iloc[0]["name"]
-                                   if not chart_row.empty else chart_base)
-                    st.markdown(f"#### {chart_label}")
-                    cc1, cc2 = st.columns(2)
-                    chart_period = cc1.radio("기간", list(COIN_CHART_PERIOD_DAYS), index=0,
-                                              horizontal=True, key="coin_rank_period")
-                    chart_iv_label = cc2.radio("봉", list(COIN_CHART_INTERVAL_MAP), index=0,
-                                                horizontal=True, key="coin_rank_iv")
-                    _iv = COIN_CHART_INTERVAL_MAP[chart_iv_label]
-                    _bars_needed = {"1d": 366, "1w": 53, "1M": 13}[_iv] \
-                        if chart_period == "1년" else \
-                        ({"1d": 1096, "1w": 157, "1M": 37} if chart_period == "3년"
-                         else {"1d": 1000, "1w": 1000, "1M": 1000})[_iv]
-                    candles = _fetch_binance_klines(chart_sym, _iv, _bars_needed)
-                    if not candles:
-                        st.warning("차트 데이터를 불러오지 못했습니다.")
+                    if work.empty:
+                        st.info("조건에 맞는 코인이 없습니다.")
                     else:
-                        _render_price_chart(candles, key=f"lwc_coin_rank_{chart_sym}_{_iv}", intraday=False)
+                        st.caption(f"{len(work)}개 코인 · 기본 정렬: 시총순 (표 헤더 클릭으로 재정렬 가능, "
+                                   "'#'열은 항상 시총 순위 고정)")
+
+                        col_data = {
+                            "#": work["#"], "이름": work["symbol"] + " · " + work["name"],
+                            "가격": work["price"], "24h": work["chg_24h"], "7일": work["chg_7d"],
+                            "30일": work["chg_30d"], "종합RS": work["rs_total"],
+                            "시총": work["market_cap"], "거래량": work["volume"],
+                            "7일 스파크라인": work["sparkline"],
+                        }
+                        if show_week_rs:
+                            for w in (1, 2, 3, 4):
+                                col_data[f"{w}주RS"] = work[f"rs_{w}w"]
+                        if show_week_ret:
+                            for w in (1, 2, 3, 4):
+                                col_data[f"{w}주수익"] = work[f"ret_{w}w"]
+                        if show_month_ret:
+                            col_data["3개월"] = work["ret_3m"]
+                            col_data["6개월"] = work["ret_6m"]
+                            col_data["12개월"] = work["ret_12m"]
+
+                        disp = pd.DataFrame(col_data)
+                        pct_cols = [c for c in ["24h", "7일", "30일"]
+                                    + ([f"{w}주수익" for w in (1, 2, 3, 4)] if show_week_ret else [])
+                                    + (["3개월", "6개월", "12개월"] if show_month_ret else [])]
+
+                        styled = disp.style
+                        for c in pct_cols:
+                            _cap = _abs_cap(disp[c], COIN_RET_COLOR_CAP)
+                            styled = _apply_bg(styled, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
+
+                        col_config = {
+                            "#": st.column_config.NumberColumn(width="small"),
+                            "가격": st.column_config.NumberColumn(format="$%.6g"),
+                            "24h": st.column_config.NumberColumn(format="percent"),
+                            "7일": st.column_config.NumberColumn(format="percent"),
+                            "30일": st.column_config.NumberColumn(format="percent"),
+                            "종합RS": st.column_config.NumberColumn(format="%.0f"),
+                            "시총": st.column_config.NumberColumn(format="compact"),
+                            "거래량": st.column_config.NumberColumn(format="compact"),
+                            "7일 스파크라인": st.column_config.LineChartColumn(width="medium"),
+                        }
+                        for w in (1, 2, 3, 4):
+                            col_config[f"{w}주RS"] = st.column_config.NumberColumn(format="%.0f")
+                            col_config[f"{w}주수익"] = st.column_config.NumberColumn(format="percent")
+                        for c in ("3개월", "6개월", "12개월"):
+                            col_config[c] = st.column_config.NumberColumn(format="percent")
+
+                        rank_ev = st.dataframe(
+                            styled, use_container_width=True, hide_index=True, column_config=col_config,
+                            height=min(60 + 35 * len(disp), 600),
+                            on_select="rerun", selection_mode="single-row", key="coin_rank_table",
+                        )
+                        _src_label = " · ".join(f"{k} {v}개" for k, v in source_counts.items())
+                        st.caption(f"과거 일봉 출처: {_src_label}")
+
+                        _sel_rows = rank_ev.selection.rows if rank_ev and rank_ev.selection else []
+                        if _sel_rows:
+                            _sel_sym = work.iloc[_sel_rows[0]]["symbol"]
+                            if _sel_sym != st.session_state.coin_rank_symbol:
+                                st.session_state.coin_rank_symbol = _sel_sym
+                                st.rerun()
+
+                        chart_base = st.session_state.coin_rank_symbol or work.iloc[0]["symbol"]
+                        chart_row = work[work["symbol"] == chart_base]
+                        chart_sym = chart_base + "USDT"
+                        chart_label = (chart_row.iloc[0]["symbol"] + " · " + chart_row.iloc[0]["name"]
+                                       if not chart_row.empty else chart_base)
+                        st.markdown(f"#### {chart_label}")
+                        cc1, cc2 = st.columns(2)
+                        chart_period = cc1.radio("기간", list(COIN_CHART_PERIOD_DAYS), index=0,
+                                                  horizontal=True, key="coin_rank_period")
+                        chart_iv_label = cc2.radio("봉", list(COIN_CHART_INTERVAL_MAP), index=0,
+                                                    horizontal=True, key="coin_rank_iv")
+                        _iv = COIN_CHART_INTERVAL_MAP[chart_iv_label]
+                        _bars_needed = {"1d": 366, "1w": 53, "1M": 13}[_iv] \
+                            if chart_period == "1년" else \
+                            ({"1d": 1096, "1w": 157, "1M": 37} if chart_period == "3년"
+                             else {"1d": 1000, "1w": 1000, "1M": 1000})[_iv]
+                        candles = _fetch_binance_klines(chart_sym, _iv, _bars_needed)
+                        if not candles:
+                            st.warning("차트 데이터를 불러오지 못했습니다.")
+                        else:
+                            _render_price_chart(candles, key=f"lwc_coin_rank_{chart_sym}_{_iv}", intraday=False)
 
         # ---- 글로벌 24-7 ----------------------------------------------------------
         with sub_g247:

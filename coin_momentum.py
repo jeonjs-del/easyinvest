@@ -34,14 +34,15 @@ DM_EXCLUDED_LABELS = {"stablecoin": "스테이블코인", "wrapped": "래핑·�
                       "stable_rule": "스테이블(보조 규칙)"}
 STABLE_PRICE_BAND = (0.97, 1.03)
 
-# 거래 어려운 코인은 유니버스에서 빼고 다음 순위로 채운다. 판정은 조회할 때마다 업비트·OKX·바이비트
-# 현물 상장목록으로 새로 한다(hard_to_trade_symbols). Binance는 Cloud(미국 IP)에서 막히고 사용자 지시로
+# 거래 어려운 코인은 유니버스에서 빼고 다음 순위로 채운다. 판정은 조회할 때마다 업비트·OKX·바이비트·
+# 코인베이스 현물 상장목록으로 새로 한다(hard_to_trade_symbols). 바이비트는 미국 IP를 막아 Cloud에선 실패할
+# 수 있어 미국에서 열리는 코인베이스를 함께 본다(2026-10 상위 60에 바이비트에만 있는 코인은 없었다). Binance는 Cloud(미국 IP)에서 막히고 사용자 지시로
 # 쓰지 않는다 — 바이낸스에만 있는 코인은 '거래 어려움'으로 잡히지만 2026-10 상위 60엔 그런 코인이 없었다.
 # OKX에만 있는 코인은 OKX 24시간 USDT·USDC 거래대금이 이 값 미만이면 거래 어려움(LEO는 하루 $135였다,
 # OKB는 $740만).
 DM_MIN_OKX_ONLY_VOLUME_USD = 1_000_000
-DM_LISTING_VENUES = ("upbit", "okx", "bybit")
-# 상장목록을 하나라도 못 받았고 직전 성공값도 없을 때만 쓰는 고정 목록(2026-10-18 4대 거래소 확인 결과).
+DM_LISTING_VENUES = ("upbit", "okx", "bybit", "coinbase")
+# 상장목록을 하나도 못 받았을 때만 쓰는 고정 목록(2026-10-18 4대 거래소 확인 결과).
 DM_HARD_TO_TRADE = {"LEO", "WBT", "XMR", "RAIN", "BTW"}
 
 # 표시명 → (CoinGecko markets 필드, 일수). 필드가 None이면 실시간가 / N일 전 일봉 종가로 계산.
@@ -56,13 +57,14 @@ DM_DEFAULT_PERIOD = "2주"
 
 def hard_to_trade_symbols(symbols, listings, okx_volume_usd=None):
     """symbols 중 거래 어려운 심볼 집합. listings: {거래소: 상장 심볼 set 또는 None(조회 실패)}.
-    한 곳이라도 None이면 판정할 수 없어 고정 목록 DM_HARD_TO_TRADE로 대신한다."""
+    받은 거래소만으로 판정하고, 하나도 못 받았을 때만 고정 목록 DM_HARD_TO_TRADE로 대신한다."""
     symbols = {s.upper() for s in symbols}
-    if any(listings.get(v) is None for v in DM_LISTING_VENUES):
+    avail = [v for v in DM_LISTING_VENUES if listings.get(v) is not None]
+    if not avail:
         return symbols & DM_HARD_TO_TRADE
     hard = set()
     for s in symbols:
-        venues = [v for v in DM_LISTING_VENUES if s in listings[v]]
+        venues = [v for v in avail if s in listings[v]]
         if not venues:
             hard.add(s)
         elif venues == ["okx"] and okx_volume_usd is not None \
