@@ -84,7 +84,7 @@ class SmaFilterTest(unittest.TestCase):
     def test_sma_values(self):
         s = pd.Series([float(i) for i in range(1, 121)],
                       index=pd.date_range("2026-01-01", periods=120, freq="D"))
-        sig = CM.sma_filter(s)
+        sig = CM.sma_filter(s, 120)
         self.assertAlmostEqual(sig["sma"], 60.5)
         self.assertEqual(sig["close"], 120.0)
         self.assertTrue(sig["above"])
@@ -92,23 +92,51 @@ class SmaFilterTest(unittest.TestCase):
 
     def test_sma_uses_last_window_only(self):
         s = pd.Series([1000.0] * 10 + [10.0] * 119 + [5.0])
-        sig = CM.sma_filter(s)
+        sig = CM.sma_filter(s, 120)
         self.assertAlmostEqual(sig["sma"], (10 * 119 + 5) / 120)
         self.assertFalse(sig["above"])
 
     def test_sma_live_price_decides(self):
         s = pd.Series([100.0] * 120)
-        sig = CM.sma_filter(s, price=101.0)
+        sig = CM.sma_filter(s, 120, price=101.0)
         self.assertTrue(sig["above"] and sig["live"])
         self.assertAlmostEqual(sig["gap"], 0.01)
         self.assertEqual(sig["close"], 100.0)
-        self.assertFalse(CM.sma_filter(s, price=99.0)["above"])
+        self.assertFalse(CM.sma_filter(s, 120, price=99.0)["above"])
 
     def test_sma_insufficient(self):
-        self.assertIsNone(CM.sma_filter(pd.Series([1.0] * 119)))
+        self.assertIsNone(CM.sma_filter(pd.Series([1.0] * 119), 120))
 
     def test_equal_is_not_above(self):
-        self.assertFalse(CM.sma_filter(pd.Series([5.0] * 120))["above"])
+        self.assertFalse(CM.sma_filter(pd.Series([5.0] * 120), 120)["above"])
+
+
+class MaFilterTest(unittest.TestCase):
+    def _closes(self):
+        # 앞 50개 200, 뒤 50개 100 → SMA100=150, SMA50=100
+        return pd.Series([200.0] * 50 + [100.0] * 50,
+                         index=pd.date_range("2026-01-01", periods=100, freq="D"))
+
+    def test_above_both_invests(self):
+        sig = CM.ma_filter(self._closes(), price=160.0)
+        self.assertTrue(sig["above"])
+        self.assertAlmostEqual(sig["mas"][50]["sma"], 100.0)
+        self.assertAlmostEqual(sig["mas"][100]["sma"], 150.0)
+        self.assertAlmostEqual(sig["mas"][100]["gap"], 160 / 150 - 1)
+
+    def test_below_either_is_cash(self):
+        sig = CM.ma_filter(self._closes(), price=120.0)  # 50MA 위, 100MA 아래
+        self.assertFalse(sig["above"])
+        self.assertTrue(sig["mas"][50]["above"])
+        self.assertFalse(sig["mas"][100]["above"])
+        closes = pd.Series([100.0] * 50 + [200.0] * 50)  # SMA100=150, SMA50=200
+        sig = CM.ma_filter(closes, price=170.0)          # 100MA 위, 50MA 아래
+        self.assertFalse(sig["above"])
+        self.assertFalse(sig["mas"][50]["above"])
+
+    def test_insufficient_for_longest(self):
+        self.assertIsNone(CM.ma_filter(pd.Series([1.0] * 99)))
+        self.assertEqual(list(CM.ma_filter(pd.Series([1.0] * 100))["mas"]), [50, 100])
 
 
 class RankTest(unittest.TestCase):

@@ -780,7 +780,7 @@ def _fetch_btc_daily_closes(utc_day):
     try:
         start = (pd.Timestamp.today() - pd.Timedelta(days=300)).strftime("%Y-%m-%d")
         s = CM.completed_closes(fdr.DataReader("BTC/USD", start)["Close"], utc_day)
-        if len(s) >= CM.DM_SMA_WINDOW + 10:
+        if len(s) >= max(CM.DM_SMA_WINDOWS) + 10:
             return s, "FinanceDataReader(Yahoo BTC-USD)"
         print(f"[coin_dm] FDR BTC/USD 일봉 부족: {len(s)}개")
     except Exception as e:
@@ -792,7 +792,7 @@ def _fetch_btc_daily_closes(utc_day):
     s = pd.Series({pd.Timestamp(ts, unit="ms").normalize() - pd.Timedelta(days=1): p
                    for ts, p in prices[:-1] if pd.Timestamp(ts, unit="ms").hour == 0})
     s = CM.completed_closes(s, utc_day)
-    if len(s) < CM.DM_SMA_WINDOW + 10:
+    if len(s) < max(CM.DM_SMA_WINDOWS) + 10:
         raise RuntimeError(f"CoinGecko BTC 일봉 부족: {len(s)}개")
     return s, "CoinGecko market_chart"
 
@@ -887,7 +887,8 @@ def _coin_dm_fetch(key, fn, *args):
 
 
 def _render_coin_dual_momentum():
-    st.caption("강환국 '알트코인 듀얼모멘텀 업그레이드' — BTC가 120일 이평 위일 때만, 시총 상위 "
+    st.caption("강환국 '알트코인 듀얼모멘텀 업그레이드' — BTC가 50일·100일 이평 둘 다 위일 때만(하나라도 아래면 "
+               "현금), 시총 상위 "
                f"{CM.DM_TOP_N}개(스테이블·래핑 토큰 제외) 중 최근 수익률 상위 {CM.DM_PICKS}개를 동일 비중 매수.")
     banner_box = st.container()
     period = st.radio("기간", list(CM.DM_PERIODS), index=list(CM.DM_PERIODS).index(CM.DM_DEFAULT_PERIOD),
@@ -919,18 +920,21 @@ def _render_coin_dual_momentum():
     sig = None
     with banner_box:
         if btc_res is None:
-            st.warning("⚠️ BTC 일봉을 불러오지 못해 120일 이평 필터를 계산할 수 없습니다.")
+            st.warning("⚠️ BTC 일봉을 불러오지 못해 50일·100일 이평 필터를 계산할 수 없습니다.")
         else:
             btc_closes, btc_src = btc_res
             if btc_err:
-                st.warning("⚠️ BTC 일봉 조회에 실패해 마지막으로 받은 값으로 120일 이평을 계산합니다.")
-            sig = CM.sma_filter(btc_closes, price=btc_live)
+                st.warning("⚠️ BTC 일봉 조회에 실패해 마지막으로 받은 값으로 이평을 계산합니다.")
+            sig = CM.ma_filter(btc_closes, price=btc_live)
             if sig is None:
-                st.warning("⚠️ BTC 완결 일봉이 120개 미만이라 이평 필터를 계산할 수 없습니다.")
+                st.warning(f"⚠️ BTC 완결 일봉이 {max(CM.DM_SMA_WINDOWS)}개 미만이라 이평 필터를 계산할 수 없습니다.")
         if sig is not None:
             ok = sig["above"]
-            title = (f"BTC > 120MA: 매수 가능 (상위 2주 수익률 {CM.DM_PICKS}개 매수)" if ok
-                     else "BTC < 120MA: 100% 현금 보유")
+            ma_names = "·".join(f"{w}MA" for w in sig["mas"])
+            below = "·".join(f"{w}MA" for w, v in sig["mas"].items() if not v["above"])
+            title = (f"BTC > {ma_names}: 매수 가능 (상위 {period} 수익률 {CM.DM_PICKS}개 매수)" if ok
+                     else f"BTC < {below}: 100% 현금 보유")
+            ma_text = " · ".join(f"{w}MA ${v['sma']:,.0f} (<b>{v['gap']:+.1%}</b>)" for w, v in sig["mas"].items())
             bg, border = ("rgba(26,152,80,0.16)", "#1a9850") if ok else ("rgba(215,25,28,0.14)", "#d7191c")
             px_label = "실시간 BTC" if sig["live"] else f"BTC 종가({sig['date']:%m-%d})"
             st.markdown(
@@ -938,9 +942,10 @@ def _render_coin_dual_momentum():
                 f"gap:4px 16px;padding:12px 16px;border-radius:8px;background:{bg};"
                 f"border-left:5px solid {border};margin-bottom:8px'>"
                 f"<b style='font-size:1.05rem'>{'🟢' if ok else '🔴'} {title}</b>"
-                f"<span>{px_label} ${sig['price']:,.0f} / 120MA ${sig['sma']:,.0f} "
-                f"(<b>{sig['gap']:+.1%}</b>)</span></div>", unsafe_allow_html=True)
-            print(f"[coin_dm] {px_label} {sig['price']:,.2f} / SMA120 {sig['sma']:,.2f} ({sig['gap']:+.2%}) "
+                f"<span>{px_label} ${sig['price']:,.0f} / {ma_text}</span></div>", unsafe_allow_html=True)
+            print(f"[coin_dm] {px_label} {sig['price']:,.2f} / " + ", ".join(
+                f"SMA{w} {v['sma']:,.2f} ({v['gap']:+.2%})" for w, v in sig["mas"].items())
+                  + f" → {'투자' if ok else '현금'} "
                   f"· SMA 마지막 완결 봉 {sig['date']:%Y-%m-%d} 종가 {sig['close']:,.2f} · 출처 {btc_src}")
 
     if markets is None:
@@ -999,7 +1004,7 @@ def _render_coin_dual_momentum():
 
     risk_off = sig is not None and not sig["above"]
     if risk_off:
-        st.caption("BTC가 120일 이평 아래라 아래 순위표는 참고용입니다.")
+        st.caption("BTC가 50일·100일 이평 중 하나 이상 아래라 아래 순위표는 참고용입니다.")
     # 폰 폭에서 판단에 필요한 열(수익률·비고)이 먼저 보이게 앞에 두고 심볼 열을 고정한다.
     disp = pd.DataFrame({
         "순위": ranked["rank"], "심볼": ranked["symbol"], period: ranked["ret"], "1일": ranked["chg_24h"],
@@ -3731,9 +3736,9 @@ with tab6:
 with tab7:
     if tab7.open:
         # 듀얼모멘텀은 탭을 누르는 순간 실시간 시세를 받아야 해서 하위탭도 on_change="rerun"으로 .open을
-        # 받는다. 나머지 하위탭은 예전처럼 항상 그린다.
-        sub_rank, sub_dm, sub_g247, sub_onchain = st.tabs(
-            ["🏆 랭킹", "🚀 듀얼모멘텀", "🌐 글로벌 24-7", "⛓️ 온체인"], key="coin_sub_tab", on_change="rerun")
+        # 받는다. 나머지 하위탭은 예전처럼 항상 그린다. 코인 탭의 기본 화면은 듀얼모멘텀(맨 앞).
+        sub_dm, sub_rank, sub_g247, sub_onchain = st.tabs(
+            ["🚀 듀얼모멘텀", "🏆 랭킹", "🌐 글로벌 24-7", "⛓️ 온체인"], key="coin_sub_tab", on_change="rerun")
 
         # ---- 듀얼모멘텀 -----------------------------------------------------------
         with sub_dm:

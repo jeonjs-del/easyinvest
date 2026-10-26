@@ -20,7 +20,7 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
   조회는 `app.py`의 `_render_wealth_tab` 등이 맡는다. 은퇴 탭 계산을 고칠 땐 여기에 두고
   `tests/test_wealth.py`에 케이스를 추가할 것.
 - `coin_momentum.py` — 코인 탭 듀얼모멘텀 하위탭의 순수 계산 로직(유니버스 제외 목록
-  `DM_EXCLUDED`, 거래 어려움 판정 `hard_to_trade_symbols` — 둘 다 유니버스에서 빼고 다음 순위로 채움, BTC SMA120 필터, 순위). Streamlit·네트워크
+  `DM_EXCLUDED`, 거래 어려움 판정 `hard_to_trade_symbols` — 둘 다 유니버스에서 빼고 다음 순위로 채움, BTC SMA50·SMA100 필터 `ma_filter`, 순위). Streamlit·네트워크
   비의존 — 조회·화면은 `app.py`의 `_render_coin_dual_momentum`. 테스트는 `tests/test_coin_momentum.py`.
 - `lwc_local.py` — `streamlit-lightweight-charts-ntf` 패치 래퍼(줌 상태 복원 + dblclick
   지원). 건드릴 일 거의 없음.
@@ -78,11 +78,11 @@ python -m unittest tests.test_coin_momentum -v # 오프라인
    (`trend_scan.py` 결과, 신호유형별 백분위 별점) · 매매계획(포지션 사이징·손절/익절 계산기).
 6. **이동평균** — 지수/종목 이동평균 대비 이격도 표. 사용자가 지수·이평 목록을 추가/삭제
    가능(Gist 저장).
-7. **코인** — 하위탭 4개: 랭킹(CoinGecko 시세 + 다중소스 과거일봉으로 RS 계산) · 듀얼모멘텀
-   (아래) · 글로벌 24-7(Hyperliquid `xyz` 퍼프 DEX의 24시간 거래 전통자산) · 온체인(미구현, "준비 중").
+7. **코인** — 하위탭 4개: 듀얼모멘텀(아래, 맨 앞이라 코인 탭 기본 화면) · 랭킹(CoinGecko 시세 + 다중소스 과거일봉으로 RS 계산) · 글로벌 24-7(Hyperliquid `xyz` 퍼프 DEX의 24시간 거래 전통자산) · 온체인(미구현, "준비 중").
    - **듀얼모멘텀**(강환국 알트코인 듀얼모멘텀 업그레이드): **조회 시점 실시간 시세 기준.** 판정은
-     CoinGecko markets의 BTC 현재가 vs SMA120(완결 일봉 종가 120개) — 위면 매수 가능 배너, 아니면 현금
-     배너+순위표 흐리게. 유니버스는 `coins/markets` 상위 60개에서 `coin_momentum.DM_EXCLUDED`(스테이블·
+     CoinGecko markets의 BTC 현재가 vs SMA50·SMA100(완결 일봉 종가, `DM_SMA_WINDOWS`) — 둘 다 위면 매수 가능
+     배너, 하나라도 아래면 현금 배너(아래인 이평 표시)+순위표 흐리게. 원 전략은 SMA120이었으나 사용자 지시로
+     2026-10-26 변경. 유니버스는 `coins/markets` 상위 60개에서 `coin_momentum.DM_EXCLUDED`(스테이블·
      래핑/스테이킹·금 토큰·토큰화 펀드 — 2026-10 상위권에 USYC·USDY·BUIDL 같은 이자형 달러 토큰이 있어
      이 범주를 추가)와 "심볼/이름에 usd + 가격 0.97~1.03" 보조 규칙, 거래 어려움 판정(아래)으로 거른 시총 상위 20개.
    - **캐시 정책**: markets 호출(`_fetch_dm_markets`)은 `ttl=30`(레이트리밋 보호용)만 두고, 하위탭을

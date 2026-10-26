@@ -1,6 +1,6 @@
 """코인 탭 '듀얼모멘텀' 하위탭(강환국 알트코인 듀얼모멘텀 업그레이드)의 순수 계산 로직.
 
-규칙: BTC 실시간 현재가 > SMA120(완결 일봉 종가 120개)이면 투자, 아니면 100% 현금. 유니버스는 '현재' 시총 상위
+규칙: BTC 실시간 현재가가 SMA50·SMA100(완결 일봉 종가 기준) 둘 다 위면 투자, 하나라도 아래면 100% 현금. 유니버스는 '현재' 시총 상위
 20개(스테이블·래핑/스테이킹 파생·금 토큰·토큰화 펀드 제외), 선택 기간 수익률 상위 3개를 동일
 비중 매수, 3일마다 재확인. Streamlit·네트워크 비의존 — 조회·화면은 app.py가 맡는다.
 
@@ -12,7 +12,7 @@ import pandas as pd
 
 DM_TOP_N = 20
 DM_PICKS = 3
-DM_SMA_WINDOW = 120
+DM_SMA_WINDOWS = (50, 100)
 
 # 유니버스에서 뺄 코인(CoinGecko 심볼, 대문자). 여기만 고치면 된다.
 # 토큰화 펀드/RWA는 사용자 목록엔 없었지만 2026-10 실제 상위 60에 FIGR_HELOC·USYC·USDY·BUIDL·
@@ -112,7 +112,7 @@ def completed_closes(closes, today_utc):
     return s[idx_dates < today_utc]
 
 
-def sma_filter(closes, window=DM_SMA_WINDOW, price=None):
+def sma_filter(closes, window, price=None):
     """SMA는 완결 일봉 종가 window개로 계산하고, 판정은 price(실시간 현재가)와 비교한다.
     price가 없으면 마지막 완결 종가로 판정. 데이터가 window개 미만이면 None."""
     s = pd.Series(closes).dropna()
@@ -123,6 +123,18 @@ def sma_filter(closes, window=DM_SMA_WINDOW, price=None):
     px = close if price is None else float(price)
     return {"close": close, "sma": sma, "price": px, "live": price is not None,
             "gap": px / sma - 1.0, "above": px > sma, "date": s.index[-1]}
+
+
+def ma_filter(closes, windows=DM_SMA_WINDOWS, price=None):
+    """여러 이평 필터를 한 번에: 현재가가 모든 이평 위일 때만 above. 하나라도 데이터가 모자라면 None.
+    반환: close·price·live·date·above와 이평별 {"sma", "gap", "above"}를 담은 "mas"(windows 순서)."""
+    sigs = {w: sma_filter(closes, w, price) for w in windows}
+    if any(v is None for v in sigs.values()):
+        return None
+    first = sigs[windows[0]]
+    return {"close": first["close"], "price": first["price"], "live": first["live"], "date": first["date"],
+            "mas": {w: {"sma": v["sma"], "gap": v["gap"], "above": v["above"]} for w, v in sigs.items()},
+            "above": all(v["above"] for v in sigs.values())}
 
 
 def close_before(closes_by_close_time, cutoff):
