@@ -938,8 +938,7 @@ def _render_coin_dm_diag(diag):
 
 
 def _render_coin_dual_momentum():
-    st.caption("강환국 '알트코인 듀얼모멘텀 업그레이드' — BTC가 50일·100일 이평 둘 다 위일 때만(하나라도 아래면 "
-               "현금), 시총 상위 "
+    st.caption("강환국 '알트코인 듀얼모멘텀 업그레이드' — BTC가 120일 이평 위일 때만, 시총 상위 "
                f"{CM.DM_TOP_N}개(스테이블·래핑 토큰 제외) 중 최근 수익률 상위 {CM.DM_PICKS}개를 동일 비중 매수.")
     banner_box = st.container()
     period = st.radio("기간", list(CM.DM_PERIODS), index=list(CM.DM_PERIODS).index(CM.DM_DEFAULT_PERIOD),
@@ -976,7 +975,7 @@ def _render_coin_dual_momentum():
     sig = None
     with banner_box:
         if btc_res is None:
-            st.warning("⚠️ BTC 일봉을 불러오지 못해 50일·100일 이평 필터를 계산할 수 없습니다.")
+            st.warning("⚠️ BTC 일봉을 불러오지 못해 120일 이평 필터를 계산할 수 없습니다.")
         else:
             btc_closes, btc_src = btc_res
             if btc_err:
@@ -1069,7 +1068,7 @@ def _render_coin_dual_momentum():
 
     risk_off = sig is not None and not sig["above"]
     if risk_off:
-        st.caption("BTC가 50일·100일 이평 중 하나 이상 아래라 아래 순위표는 참고용입니다.")
+        st.caption("BTC가 120일 이평 아래라 아래 순위표는 참고용입니다.")
     # 폰 폭에서 판단에 필요한 열(수익률·비고)이 먼저 보이게 앞에 두고 심볼 열을 고정한다.
     disp = pd.DataFrame({
         "순위": ranked["rank"], "심볼": ranked["symbol"], period: ranked["ret"], "1일": ranked["chg_24h"],

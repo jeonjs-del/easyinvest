@@ -123,25 +123,34 @@ class MaFilterTest(unittest.TestCase):
                          index=pd.date_range("2026-01-01", periods=100, freq="D"))
 
     def test_above_both_invests(self):
-        sig = CM.ma_filter(self._closes(), price=160.0)
+        sig = CM.ma_filter(self._closes(), (50, 100), price=160.0)
         self.assertTrue(sig["above"])
         self.assertAlmostEqual(sig["mas"][50]["sma"], 100.0)
         self.assertAlmostEqual(sig["mas"][100]["sma"], 150.0)
         self.assertAlmostEqual(sig["mas"][100]["gap"], 160 / 150 - 1)
 
     def test_below_either_is_cash(self):
-        sig = CM.ma_filter(self._closes(), price=120.0)  # 50MA 위, 100MA 아래
+        sig = CM.ma_filter(self._closes(), (50, 100), price=120.0)  # 50MA 위, 100MA 아래
         self.assertFalse(sig["above"])
         self.assertTrue(sig["mas"][50]["above"])
         self.assertFalse(sig["mas"][100]["above"])
         closes = pd.Series([100.0] * 50 + [200.0] * 50)  # SMA100=150, SMA50=200
-        sig = CM.ma_filter(closes, price=170.0)          # 100MA 위, 50MA 아래
+        sig = CM.ma_filter(closes, (50, 100), price=170.0) # 100MA 위, 50MA 아래
         self.assertFalse(sig["above"])
         self.assertFalse(sig["mas"][50]["above"])
 
     def test_insufficient_for_longest(self):
-        self.assertIsNone(CM.ma_filter(pd.Series([1.0] * 99)))
-        self.assertEqual(list(CM.ma_filter(pd.Series([1.0] * 100))["mas"]), [50, 100])
+        self.assertIsNone(CM.ma_filter(pd.Series([1.0] * 99), (50, 100)))
+        self.assertEqual(list(CM.ma_filter(pd.Series([1.0] * 100), (50, 100))["mas"]), [50, 100])
+
+    def test_default_is_single_sma120(self):
+        self.assertEqual(CM.DM_SMA_WINDOWS, (120,))
+        closes = pd.Series([100.0] * 120)
+        self.assertIsNone(CM.ma_filter(closes.iloc[:119]))
+        sig = CM.ma_filter(closes, price=101.0)
+        self.assertEqual(list(sig["mas"]), [120])
+        self.assertTrue(sig["above"])
+        self.assertFalse(CM.ma_filter(closes, price=99.0)["above"])
 
 
 class RankTest(unittest.TestCase):
