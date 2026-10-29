@@ -528,18 +528,40 @@ def monthly_spend(asset, withdraw_pct):
     return asset * withdraw_pct / 100 / 12
 
 
+# 은퇴 금융자산을 전부 사적연금(연금저축·IRP·퇴직연금)으로 보고 매년 연금으로 받는다고 가정한 세금(보수적).
+# 사적연금 수령액이 연 1,500만원 이하면 연금소득세 3.3~5.5%(나이별 — 70세 미만의 5.5%로 고정), 넘으면 그 해
+# 수령액 전액이 종합과세 또는 16.5% 분리과세 대상이라 분리과세 16.5%를 상한으로 잡는다(2024년 귀속분부터
+# 1,200만원 → 1,500만원). 퇴직금 재원(이연퇴직소득세의 60~70%)·세액공제를 안 받은 원금(비과세)은 대개 이보다
+# 덜 내므로 나누지 않고 전액 과세 대상으로 본다. 판정 기준은 그 해의 명목 수령액(한도가 물가에 연동되지 않음).
+PENSION_LOW_TAX_LIMIT = 15_000_000
+PENSION_LOW_TAX_PCT = 5.5
+PENSION_HIGH_TAX_PCT = 16.5
+
+
+def pension_tax_pct(annual_withdrawal):
+    return PENSION_LOW_TAX_PCT if annual_withdrawal <= PENSION_LOW_TAX_LIMIT else PENSION_HIGH_TAX_PCT
+
+
+def after_tax_monthly(monthly):
+    """세전 월 사용액 → 위 가정의 세금을 뺀 월 사용액."""
+    return monthly * (1 - pension_tax_pct(monthly * 12) / 100)
+
+
 def real_value(amount, inflation_pct, years):
     return amount / (1 + inflation_pct / 100) ** int(years)
 
 
 def years_to_target(start, annual_saving, inflation_pct, return_pct, withdraw_pct,
-                    target_monthly, max_years=100):
-    """현재 가치 기준 월 사용액이 목표에 처음 도달하는 은퇴 시점(0~max_years년). 없으면 None."""
+                    target_monthly, max_years=100, after_tax=False):
+    """현재 가치 기준 월 사용액(after_tax면 세후)이 목표에 처음 도달하는 은퇴 시점(0~max_years년). 없으면 None."""
     if target_monthly is None or target_monthly <= 0:
         return None
     for n in range(max_years + 1):
         asset = project_assets(start, annual_saving, inflation_pct, n, return_pct)
-        if real_value(monthly_spend(asset, withdraw_pct), inflation_pct, n) >= target_monthly:
+        monthly = monthly_spend(asset, withdraw_pct)
+        if after_tax:
+            monthly = after_tax_monthly(monthly)
+        if real_value(monthly, inflation_pct, n) >= target_monthly:
             return n
     return None
 

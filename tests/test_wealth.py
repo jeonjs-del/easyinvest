@@ -255,6 +255,29 @@ def _grid(cells, n_rows=30, n_cols=12):
     return rows
 
 
+class PensionTaxTest(unittest.TestCase):
+    def test_rate_by_annual_amount(self):
+        self.assertEqual(W.pension_tax_pct(15_000_000), 5.5)        # 한도 이하(경계 포함)
+        self.assertEqual(W.pension_tax_pct(15_000_001), 16.5)       # 넘으면 전액 16.5%
+        self.assertEqual(W.pension_tax_pct(0), 5.5)
+
+    def test_after_tax_monthly(self):
+        self.assertAlmostEqual(W.after_tax_monthly(1_000_000), 945_000)        # 연 1,200만원
+        self.assertAlmostEqual(W.after_tax_monthly(1_250_000), 1_181_250)      # 연 1,500만원 경계
+        self.assertAlmostEqual(W.after_tax_monthly(4_000_000), 3_340_000)      # 연 4,800만원
+        self.assertEqual(W.after_tax_monthly(0), 0)
+
+    def test_years_to_target_after_tax_is_later(self):
+        args = (600_000_000, 30_000_000, 2, 6, 4, 4_000_000)
+        pre, post = W.years_to_target(*args), W.years_to_target(*args, after_tax=True)
+        self.assertGreater(post, pre)
+        # 세후 기준 도달 연도엔 실제로 세후 현재 가치가 목표 이상
+        asset = W.project_assets(600_000_000, 30_000_000, 2, post, 6)
+        self.assertGreaterEqual(W.real_value(W.after_tax_monthly(W.monthly_spend(asset, 4)), 2, post), 4_000_000)
+        asset = W.project_assets(600_000_000, 30_000_000, 2, post - 1, 6)
+        self.assertLess(W.real_value(W.after_tax_monthly(W.monthly_spend(asset, 4)), 2, post - 1), 4_000_000)
+
+
 class SheetTest(unittest.TestCase):
     def test_latest_sheet_by_name_rule(self):
         html = ('items.push({name: "26-09", pageUrl: "x", gid: "11"});'

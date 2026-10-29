@@ -2368,7 +2368,8 @@ def _render_wealth_tab():
                                f_years, fire.get("annual_return") or 0)
     f_monthly = W.monthly_spend(f_asset, f_real)
     f_monthly4 = W.monthly_spend(f_asset, W.CONSERVATIVE_WITHDRAW_PCT)
-    with st.expander(f"🏖 경제적 자유 계산기 · 은퇴 후 월 사용액 {fmt(f_monthly)}",
+    with st.expander(f"🏖 경제적 자유 계산기 · 은퇴 후 월 사용액 {fmt(f_monthly)}"
+                     f" (세후 {fmt(W.after_tax_monthly(f_monthly))})",
                      key="wealth_exp_fire"):
         nf = dict(fire)
         nf.pop("withdraw_rate", None)   # 인출률 입력을 없애기 전에 저장된 문서에 남아 있는 값
@@ -2394,28 +2395,33 @@ def _render_wealth_tab():
             nf["inflation"] = st.number_input("물가상승률 = 저축 증가율 (%)", -10.0, 50.0,
                                               float(fire.get("inflation") or 0), 0.5, key=K("f_inf"))
 
-        o1, o2, o3 = st.columns(3)
         f_inf = fire.get("inflation") or 0
-        o1.metric(f"{f_years}년 후 은퇴 금융자산", fmt(f_asset))
-        o2.metric(f"월 사용액 · 실질수익률 {f_real:g}% 인출", fmt(f_monthly))
-        o3.metric("〃 현재 가치", fmt(W.real_value(f_monthly, f_inf, f_years)))
-        _, c2, c3 = st.columns(3)
-        c2.metric(f"월 사용액 · 연 {W.CONSERVATIVE_WITHDRAW_PCT:g}% 인출(보수적)", fmt(f_monthly4))
-        c3.metric("〃 현재 가치", fmt(W.real_value(f_monthly4, f_inf, f_years)))
+        st.metric(f"{f_years}년 후 은퇴 금융자산", fmt(f_asset))
+        for label, m in ((f"실질수익률 {f_real:g}% 인출", f_monthly),
+                         (f"연 {W.CONSERVATIVE_WITHDRAW_PCT:g}% 인출(보수적)", f_monthly4)):
+            st.markdown(f"**월 사용액 · {label}**")
+            m_net = W.after_tax_monthly(m)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("세전", fmt(m))
+            c2.metric("세전 · 현재 가치", fmt(W.real_value(m, f_inf, f_years)))
+            c3.metric(f"세후 · 세율 {W.pension_tax_pct(m * 12):g}%", fmt(m_net))
+            c4.metric("세후 · 현재 가치", fmt(W.real_value(m_net, f_inf, f_years)))
         if f_real <= 0:
             st.warning(f"실질수익률이 {f_real:g}%라 원금의 구매력을 지키면서 꺼내 쓸 수익이 없습니다"
                        "(실질수익률 인출 기준 월 사용액 0원).")
         target = fire.get("target_monthly") or 0
         if target > 0:
-            def _when(pct):
+            def _when(pct, after_tax=False):
                 n = W.years_to_target(start, fire.get("annual_saving") or 0, f_inf,
-                                      fire.get("annual_return") or 0, pct, target)
+                                      fire.get("annual_return") or 0, pct, target, after_tax=after_tax)
                 return n, ("지금 가능" if n == 0 else f"{n}년 후 가능" if n is not None else "100년 내 도달 불가")
 
             n, when = _when(f_real)
             _, when4 = _when(W.CONSERVATIVE_WITHDRAW_PCT)
-            msg = (f"목표 월 생활비 {fmt(target)}(현재 가치): 실질수익률 인출 기준 {when} · "
-                   f"연 {W.CONSERVATIVE_WITHDRAW_PCT:g}% 인출 기준 {when4}")
+            _, when_t = _when(f_real, True)
+            _, when4_t = _when(W.CONSERVATIVE_WITHDRAW_PCT, True)
+            msg = (f"목표 월 생활비 {fmt(target)}(현재 가치): 실질수익률 인출 기준 {when}(세후 {when_t}) · "
+                   f"연 {W.CONSERVATIVE_WITHDRAW_PCT:g}% 인출 기준 {when4}(세후 {when4_t})")
             (st.success if n == 0 else st.info if n is not None else st.warning)(msg)
         else:
             st.caption("목표 월 생활비를 입력하면 도달 시점을 계산합니다.")
@@ -2424,8 +2430,14 @@ def _render_wealth_tab():
                    f"{W.CONSERVATIVE_WITHDRAW_PCT:g}%를 인출한다고 보고 12로 나눈 은퇴 첫해 금액이며, 현재 가치는 이를 "
                    "그때까지의 물가로 나눈 오늘의 돈 가치입니다. 실질수익률만큼만 꺼내면 수익 중 물가 몫이 원금에 남아 "
                    "원금의 구매력이 유지되고, 인출률이 실질수익률보다 높으면 원금의 구매력이 해마다 줄어듭니다. "
-                   "수익률·물가·인출률은 가정일 뿐 보장이 아니며, 연금 수령 가능 시점·중도인출 제한·세금·수수료는 "
+                   "수익률·물가·인출률은 가정일 뿐 보장이 아니며, 연금 수령 가능 시점·중도인출 제한·수수료는 "
                    "반영하지 않았습니다.")
+        st.caption(f"세후는 은퇴 금융자산 전부를 사적연금(연금저축·IRP·퇴직연금)으로 매년 연금 수령한다고 보고 "
+                   f"보수적으로 잡은 세금을 뺀 금액입니다: 한 해 수령액이 {fmt(W.PENSION_LOW_TAX_LIMIT)} 이하면 "
+                   f"연금소득세 {W.PENSION_LOW_TAX_PCT:g}%(나이별 3.3~5.5% 중 가장 높은 70세 미만 세율), 넘으면 "
+                   f"수령액 전액에 {W.PENSION_HIGH_TAX_PCT:g}%(분리과세 선택 시 상한). 퇴직금 재원·세액공제 안 받은 "
+                   "원금은 실제로는 세금이 더 적고, 일반 계좌·예금의 이자·배당 과세와 건강보험료는 따로 계산하지 "
+                   "않았습니다. 세법은 바뀔 수 있습니다.")
         if nf != fire:
             doc["fire"] = nf
             dirty = True
