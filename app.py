@@ -1251,6 +1251,11 @@ def _us_market_closed_mask(times):
 #  동적자산배분 엔진
 # ============================================================================
 @st.cache_data(ttl=60 * 60 * 4)
+def _fred_unrate():
+    return fdr.DataReader("FRED:UNRATE")
+
+
+@st.cache_data(ttl=60 * 60 * 4)
 def load_monthly_panel():
     def _fetch(tk):
         df = get_price(tk, "1990-01-01")
@@ -1259,8 +1264,19 @@ def load_monthly_panel():
         col = "Adj Close" if "Adj Close" in df.columns else "Close"
         return tk, df[col].resample("ME").last()
 
-    with ThreadPoolExecutor(max_workers=10) as exe:
-        results = list(exe.map(_fetch, TAA_TICKERS))
+    def _prefetch_fred():
+        try:
+            _fred_unrate()
+        except Exception:
+            pass   # build_ctx가 다시 시도하고 실패하면 실업률 없이 계산한다
+
+    # 대부분 응답 대기라 전부 한꺼번에 받는다(10개씩 나눠 받을 때 4.2초 → 2.5초). KS200은 1990년부터
+    # 9천여 행이라 혼자 3~4초 걸려 맨 먼저 시작한다. build_ctx가 쓸 실업률(FRED)도 같이 받아 둔다.
+    order = sorted(TAA_TICKERS, key=lambda tk: tk != "KS200")
+    with ThreadPoolExecutor(max_workers=len(order) + 1) as exe:
+        fred = exe.submit(_prefetch_fred)
+        results = list(exe.map(_fetch, order))
+        fred.result()
 
     cols = {tk: s for tk, s in results if s is not None}
     if not cols:
@@ -1274,7 +1290,7 @@ def build_ctx(index_list):
     idx = pd.DatetimeIndex(index_list)
     ue_ok = True
     try:
-        ue = fdr.DataReader("FRED:UNRATE").iloc[:, 0].dropna().resample("ME").last()
+        ue = _fred_unrate().iloc[:, 0].dropna().resample("ME").last()
         ue_bear = (ue > ue.rolling(12).mean()).shift(1).fillna(False)
         ue_up12 = (ue > ue.shift(12)).shift(1).fillna(False)
     except Exception:
@@ -1741,9 +1757,10 @@ def _wealth_quotes(doc):
             for h in doc["financial"][sec]["holdings"]}
     if not keys:
         return {}, False
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=9) as ex:
+        fx_fut = ex.submit(_wealth_fx_rows) if any(m != "KR" for m, _ in keys) else None
         rows_by_key = dict(zip(keys, ex.map(lambda k: _wealth_price_rows(*k), keys)))
-    fx_rows = _wealth_fx_rows() if any(m != "KR" for m, _ in keys) else []
+        fx_rows = fx_fut.result() if fx_fut else []
     quotes, changed = {}, False
     for (market, symbol), rows in rows_by_key.items():
         qk = W.quote_key(market, symbol)
@@ -1869,27 +1886,60 @@ def _sheet_get(kind, path, **params):
     return r.text
 
 
+# 종류별로 지난번에 고른 시트(이름, gid). 시트 목록(htmlview, 1~6초)과 데이터(export, 1.5초)를 순서대로
+# 받으면 둘을 더해 기다려서, 목록을 받는 동안 지난번 시트의 데이터를 미리 받아 둔다. 목록상 최신 시트가
+# 바뀌었으면(새 달 시트 추가 등) 그때만 다시 받는다. app.py는 실행마다 처음부터 다시 돌아 모듈 변수로는
+# 안 남으므로 cache_resource(서버 프로세스당 하나)에 둔다.
+@st.cache_resource
+def _sheet_tab_memo():
+    return {}
+
+
+def _sheet_rows(kind, gid):
+    """(CSV 행 목록, 코인이면 수량 열 원본 값 목록 아니면 None)."""
+    def _csv():
+        return list(csv_reader(io.StringIO(_sheet_get(kind, "/export", format="csv", gid=gid))))
+
+    if kind != "crypto":
+        return _csv(), None
+    # CSV는 표시 서식대로(소수 둘째 자리) 나와 코인 수량이 잘린다 — 수량 열만 원본 값으로 따로 받는다
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        raw = ex.submit(lambda: W.parse_gviz_column(_sheet_get(
+            kind, "/gviz/tq", tqx="out:json", gid=gid, headers=0,
+            range=f"D{W.CRYPTO_ROWS[0]}:D{W.CRYPTO_ROWS[-1]}")))
+        rows = _csv()
+        return rows, raw.result()
+
+
 # 시트를 고치면 바로 보여야 하므로 캐시는 짧게 둔다 — 입력칸을 연달아 고칠 때 매번 시트 4개를
 # 다시 받지 않게 하는 정도. 페이지를 새로 열면(_render_wealth_tab) 이 캐시도 비우고 새로 받는다.
 @st.cache_data(ttl=30, show_spinner=False)
 def _sheet_fetch(kind):
     """스프레드시트 하나에서 이름 규칙상 가장 최신 시트를 읽어 파싱한다. 실패는 예외로 올려
     캐시에 남기지 않는다. 반환: {'sheet': 시트 이름, 'data': {...}}"""
+    memo = _sheet_tab_memo()
+    guess = memo.get(kind)
+    ex = ThreadPoolExecutor(max_workers=1)
+    early = ex.submit(_sheet_rows, kind, guess[1]) if guess else None
+    ex.shutdown(wait=False)
     tab = W.pick_latest_sheet(W.parse_sheet_tabs(_sheet_get(kind, "/htmlview")), W.SHEET_NAME_PATTERNS[kind])
     if not tab:
         raise RuntimeError("이름 규칙에 맞는 시트가 없습니다")
     name, gid = tab
-    rows = list(csv_reader(io.StringIO(_sheet_get(kind, "/export", format="csv", gid=gid))))
+    got = None
+    if early is not None and tuple(guess) == tuple(tab):
+        try:
+            got = early.result()
+        except Exception:
+            got = None   # 미리 받은 요청이 실패했으면 아래에서 다시 받는다
+    rows, raw = got if got is not None else _sheet_rows(kind, gid)
+    memo[kind] = (name, gid)
     if kind == "pension":
         data = W.parse_pension_sheet(rows)
     elif kind == "stock":
         data = {"stock": W.parse_stock_sheet(rows)}
     elif kind == "crypto":
-        # CSV는 표시 서식대로(소수 둘째 자리) 나와 코인 수량이 잘린다 — 수량 열만 원본 값으로 다시 받는다
         n = len(W.CRYPTO_ROWS)
-        raw = W.parse_gviz_column(_sheet_get(
-            kind, "/gviz/tq", tqx="out:json", gid=gid, headers=0,
-            range=f"D{W.CRYPTO_ROWS[0]}:D{W.CRYPTO_ROWS[-1]}"))
         data = {"crypto": W.parse_crypto_sheet(rows, (raw + [None] * n)[:n])}
     else:
         data = {"debt": W.parse_debt_sheet(rows)}
@@ -2005,9 +2055,11 @@ def _render_wealth_tab():
 
     # 실거래가(12개월치)는 시트와 무관해 시트를 받는 동안 미리 받아 둔다(시트 3초 + 실거래가 1초를 순서대로
     # 기다리지 않게). 시트 반영으로 재실행되더라도 결과는 캐시에 남아 다음 실행에 쓰인다.
-    _trade_ex = ThreadPoolExecutor(max_workers=1)
-    _trade_fut = _trade_ex.submit(_wealth_property_trades, dict(prop), today)
-    _trade_ex.shutdown(wait=False)
+    # 보유 종목 시세도 저장된 종목 기준으로 미리 받는다 — 시트에서 종목이 바뀌었으면 그 종목만 아래에서 더 받는다.
+    _pre_ex = ThreadPoolExecutor(max_workers=2)
+    _trade_fut = _pre_ex.submit(_wealth_property_trades, dict(prop), today)
+    _pre_ex.submit(_wealth_quotes, json.loads(json.dumps(doc)))
+    _pre_ex.shutdown(wait=False)
 
     # ---- Google 시트 반영 -------------------------------------------------
     # 시트가 기준이다: 조회에 성공한 항목은 저장된 값을 시트 값으로 바꾸고, 실패한 항목은

@@ -21,6 +21,7 @@ ETF 치환: EFA→IEFA, VWO/EEM→IEMG, DBC→PDBC, IWD→VTV, IWN→VBR, 현금
   있고 업종지수·TR지수는 없음) backfill을 적용하지 않는다. 상장 전에는 각각 IT 오버레이
   생략(KOSPI200 100%로 대체) / 안전자산 후보 제외로 기존 동작을 유지한다.
 """
+import numpy as np
 import pandas as pd
 
 TAA_TICKERS = ["SPY", "IEFA", "IEMG", "AGG", "BND", "QQQ", "IWM", "VGK", "EWJ",
@@ -197,10 +198,13 @@ def sma_score(mp, sym, t, window):
     """현재가 / 최근 window개 월말 종가 평균 - 1 (window개 = 현재 포함)."""
     if sym not in mp.columns or t - window + 1 < 0:
         return None
-    seg = pd.Series(_col(mp, sym)[t - window + 1:t + 1])
-    if seg.isna().any() or seg.mean() == 0:
+    seg = _col(mp, sym)[t - window + 1:t + 1].astype(float)
+    if np.isnan(seg).any():
         return None
-    return seg.iloc[-1] / seg.mean() - 1.0
+    mean = seg.mean()
+    if mean == 0:
+        return None
+    return seg[-1] / mean - 1.0
 
 
 def top_keys(scores, n):
