@@ -76,6 +76,11 @@ python -m unittest tests.test_coin_momentum -v # 오프라인
 4. **프리미엄** — 김치프리미엄(업비트 vs Coinbase BTC), 금치프리미엄(KRX금현물 ETF vs GLD).
 5. **매수** — 하위탭 3개: 계절성(`seasonality_scan.py` 결과, 매수창 필터) · 추세추종
    (`trend_scan.py` 결과, 신호유형별 백분위 별점) · 매매계획(포지션 사이징·손절/익절 계산기).
+   - 매매계획은 코인도 받는다: 직접 입력에 `BTCUSD`·`BTCKRW`·`BTC-USDT`·`ETH/KRW` 형태(`_PLAN_COIN_RE`,
+     USDT·USDC는 달러). 원화는 업비트 일봉(없으면 Yahoo `BTC/KRW` — 달러 환산값), 달러는 Coinbase→OKX→Bybit→
+     Yahoo(Binance 제외). 진행 중 일봉의 마지막 값을 현재가로 쓰고 1분 캐시(`_plan_coin_closes`). 수량은
+     소수 8자리 아래 버림(`PLAN_COIN_LOT`), 가격 자릿수는 유효숫자 4자리 이상(`_plan_price_decimals`).
+     주식 경로는 그대로다.
 6. **이동평균** — 지수/종목 이동평균 대비 이격도 표. 사용자가 지수·이평 목록을 추가/삭제
    가능(Gist 저장).
 7. **코인** — 하위탭 4개: 듀얼모멘텀(아래, 맨 앞이라 코인 탭 기본 화면) · 랭킹(CoinGecko 시세 + 다중소스 과거일봉으로 RS 계산) · 글로벌 24-7(Hyperliquid `xyz` 퍼프 DEX의 24시간 거래 전통자산) · 온체인(미구현, "준비 중").

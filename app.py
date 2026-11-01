@@ -1573,15 +1573,19 @@ def load_trend():
 # ============================================================================
 #  매수 탭 · 매매계획 (순수 계산기, 스캐너 불필요)
 # ============================================================================
-def _position_sizing_plan(price, asset, max_loss_pct, stop_pct, tp_mult):
+def _position_sizing_plan(price, asset, max_loss_pct, stop_pct, tp_mult, lot=1):
     """매수가 P, 총자산 A, 최대손실률 L, 손절폭 S, 익절배수 M으로 포지션 사이징 계산.
-    손절가=P*(1-S), 주수=floor(A*L / (P-손절가)), 익절1차=P*(1+S*M)."""
+    손절가=P*(1-S), 주수=floor(A*L / (P-손절가)), 익절1차=P*(1+S*M).
+    lot은 최소 수량 단위 — 주식은 1주, 코인은 1e-8(그 아래는 버림)."""
     stop_price = price * (1 - stop_pct)
     risk_per_share = price - stop_price
     if risk_per_share <= 0:
         return None
     max_loss_amount = asset * max_loss_pct
-    shares = int(max_loss_amount // risk_per_share)
+    if lot == 1:
+        shares = int(max_loss_amount // risk_per_share)
+    else:
+        shares = round(math.floor(max_loss_amount / risk_per_share / lot) * lot, 10)
     buy_amount = price * shares
     worst_loss = risk_per_share * shares
     worst_loss_pct = (worst_loss / asset) if asset else 0.0
@@ -1590,6 +1594,59 @@ def _position_sizing_plan(price, asset, max_loss_pct, stop_pct, tp_mult):
         "stop_price": stop_price, "shares": shares, "buy_amount": buy_amount,
         "worst_loss": worst_loss, "worst_loss_pct": worst_loss_pct, "tp1_price": tp1_price,
     }
+
+
+# 매매계획 코인 티커: BTCUSD·BTCKRW·BTC-USD·BTC/KRW·BTCUSDT. USDT·USDC는 달러로 본다.
+_PLAN_COIN_RE = re.compile(r"^([A-Z0-9]{2,12}?)[-/]?(USDT|USDC|USD|KRW)$")
+PLAN_COIN_LOT = 1e-8
+
+
+def _plan_coin_pair(ticker):
+    m = _PLAN_COIN_RE.match(ticker.strip().upper())
+    if not m:
+        return None
+    return m.group(1), ("KRW" if m.group(2) == "KRW" else "USD")
+
+
+@st.cache_data(ttl=60)
+def _plan_coin_closes(base, quote):
+    """(일봉 종가 Series, 출처, 받은 시각 KST). 마지막 값은 진행 중인 봉이라 사실상 현재가다(1분 캐시).
+    원화는 실제로 사고파는 업비트 시세를 먼저 쓰고(Yahoo BTC-KRW는 달러 시세를 환산한 값),
+    업비트에 없으면 Yahoo. 달러는 Binance를 빼고 Coinbase→OKX(USDT)→Bybit(USDT)→Yahoo."""
+    if quote == "KRW":
+        try:
+            r = requests.get("https://api.upbit.com/v1/candles/days",
+                             params={"market": f"KRW-{base}", "count": 60}, timeout=10)
+            r.raise_for_status()
+            rows = r.json()
+            if rows:
+                s = pd.Series({pd.Timestamp(c["candle_date_time_kst"][:10]): float(c["trade_price"])
+                               for c in rows}).sort_index()
+                return s, "업비트", pd.Timestamp.now(tz="Asia/Seoul")
+        except Exception as e:
+            print(f"[plan] 업비트 KRW-{base} 조회 실패: {type(e).__name__}")
+        attempts = []
+    else:
+        attempts = [("Coinbase", _fetch_daily_coinbase), ("OKX", _fetch_daily_okx),
+                    ("Bybit", _fetch_daily_bybit)]
+    for name, fn in attempts:
+        rows = fn(base)
+        if rows:
+            s = pd.Series({pd.Timestamp(r["time"]).normalize(): r["close"] for r in rows}).sort_index()
+            return s[~s.index.duplicated(keep="last")], name, pd.Timestamp.now(tz="Asia/Seoul")
+    df = get_price(f"{base}/{quote}", (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d"))
+    if not df.empty:
+        return df["Close"].dropna(), "Yahoo", pd.Timestamp.now(tz="Asia/Seoul")
+    return pd.Series(dtype=float), None, None
+
+
+def _plan_price_decimals(price, is_krw):
+    """코인 가격 표시 소수 자릿수 — 0.07달러·20원 같은 코인이 0으로 보이지 않게."""
+    if price >= (100 if is_krw else 1):
+        return 0 if is_krw else 2
+    if price <= 0:
+        return 2
+    return max(2, 3 - math.floor(math.log10(price)))  # 유효숫자 4자리 이상
 
 
 def _round_half_up(x):
@@ -3496,7 +3553,7 @@ with tab5:
                 with st.form("_plan_fs", clear_on_submit=True, border=False):
                     _pfc, _pbc = st.columns([4, 1])
                     _pft = _pfc.text_input(
-                        "직접 입력", placeholder="티커 직접 입력 (예: AAPL)",
+                        "직접 입력", placeholder="티커 (예: AAPL, BTCUSD, BTCKRW)",
                         label_visibility="collapsed",
                     )
                     _psub = _pbc.form_submit_button("조회", use_container_width=True)
@@ -3507,30 +3564,65 @@ with tab5:
                     st.rerun()
 
             p_ticker = normalize(st.session_state.plan_ticker)
-            p_is_krw = p_ticker.isdigit()
-            p_start = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
-            p_df = get_price(p_ticker, p_start)
+            p_coin = _plan_coin_pair(p_ticker)
+            p_src = None
+            if p_coin:
+                p_base, p_quote = p_coin
+                p_ticker = p_base + p_quote
+                p_is_krw = p_quote == "KRW"
+                p_close, p_src, p_at = _plan_coin_closes(p_base, p_quote)
+                p_kor = _fetch_upbit_korean_names().get(p_base) if p_is_krw else None
+                p_name = f"{p_kor} ({p_base}/{p_quote})" if p_kor else f"{p_base}/{p_quote}"
+            else:
+                p_is_krw = p_ticker.isdigit()
+                p_start = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+                p_df = get_price(p_ticker, p_start)
+                p_close = p_df["Close"].dropna() if not p_df.empty else pd.Series(dtype=float)
+                p_name = name_of(p_ticker, names)
 
-            if p_df.empty:
+            if p_close.empty:
                 st.warning(f"'{p_ticker}' 가격 데이터를 불러오지 못했습니다.")
             else:
-                p_close = p_df["Close"].dropna()
                 latest_price = float(p_close.iloc[-1])
                 latest_date = p_close.index[-1]
                 ma20 = float(p_close.iloc[-20:].mean()) if len(p_close) >= 20 else None
-                cur_label = f"{name_of(p_ticker, names)} ({p_ticker})"
+                if p_coin:
+                    p_dec = _plan_price_decimals(latest_price, p_is_krw)
+                    cur_label = p_name
+                else:
+                    p_dec = 0 if p_is_krw else 2
+                    cur_label = f"{p_name} ({p_ticker})"
+
+                def _px(x):
+                    return f"{x:,.{p_dec}f}원" if p_is_krw else f"${x:,.{p_dec}f}"
+
+                def _amt(x):  # 금액은 가격 자릿수와 무관하게 원 단위·센트 단위
+                    return f"{_round_half_up(x):,}원" if p_is_krw else f"${x:,.2f}"
+
+                def _qty(q):
+                    if not p_coin:
+                        return f"{q}주"
+                    return f"{q:,.8f}".rstrip("0").rstrip(".") + f" {p_base}"
 
                 st.markdown(f"**{cur_label}**")
-                if p_is_krw:
-                    st.caption(f"현재가 {latest_price:,.0f}원 ({latest_date:%Y-%m-%d} 종가)")
+                if p_coin:
+                    st.caption(f"현재가 {_px(latest_price)} ({p_src} {latest_date:%Y-%m-%d} 일봉 진행 중 시세, "
+                               f"{p_at:%H:%M} KST 조회)")
                 else:
-                    st.caption(f"현재가 ${latest_price:,.2f} ({latest_date:%Y-%m-%d} 종가)")
+                    st.caption(f"현재가 {_px(latest_price)} ({latest_date:%Y-%m-%d} 종가)")
 
-                buy_price = st.number_input(
-                    "매수가", min_value=0.0,
-                    value=round(latest_price, 0) if p_is_krw else round(latest_price, 2),
-                    step=(100.0 if p_is_krw else 0.5), key=f"plan_price_{p_ticker}",
-                )
+                if p_coin:
+                    buy_price = st.number_input(
+                        "매수가", min_value=0.0, value=round(latest_price, p_dec),
+                        step=float(10 ** max(-p_dec, int(math.log10(latest_price)) - 3)) if latest_price > 0 else 1.0,
+                        format=f"%.{p_dec}f", key=f"plan_price_{p_ticker}",
+                    )
+                else:
+                    buy_price = st.number_input(
+                        "매수가", min_value=0.0,
+                        value=round(latest_price, 0) if p_is_krw else round(latest_price, 2),
+                        step=(100.0 if p_is_krw else 0.5), key=f"plan_price_{p_ticker}",
+                    )
 
                 # 투자자산: 원화/달러 종목을 오가도 서로 다른 통화의 숫자가 섞이지 않도록
                 # 통화별로 세션에 값을 따로 유지한다(관심목록처럼 Gist에 영구 저장하진
@@ -3576,11 +3668,22 @@ with tab5:
                     st.session_state.plan_computed = True
 
                 if asset_valid and st.session_state.get("plan_computed"):
-                    plan = _position_sizing_plan(buy_price, asset, loss_pct, stop_pct, tp_mult)
+                    p_lot = PLAN_COIN_LOT if p_coin else 1
+                    plan = _position_sizing_plan(buy_price, asset, loss_pct, stop_pct, tp_mult, lot=p_lot)
                     if plan is None or plan["shares"] <= 0:
-                        st.warning("손절폭·매수가 조합상 매수 가능 주식 수가 0입니다. 파라미터를 확인해주세요.")
+                        st.warning("손절폭·매수가 조합상 매수 가능 수량이 0입니다. 파라미터를 확인해주세요.")
                     else:
-                        if p_is_krw:
+                        if p_coin:
+                            _p10 = 10 ** p_dec
+                            header_price = _px(buy_price)
+                            amt_str = _amt(plan["buy_amount"])
+                            if p_is_krw:
+                                amt_str += f" ({_krw_abbrev(plan['buy_amount'])})"
+                            loss_str = _amt(plan["worst_loss"])
+                            stop_str = _px(math.floor(plan["stop_price"] * _p10) / _p10)  # 손절가는 버림
+                            tp1_str = _px(_round_half_up(plan["tp1_price"] * _p10) / _p10)
+                            ma_str = _px(ma20) if ma20 is not None else "—"
+                        elif p_is_krw:
                             header_price = f"{buy_price:,.0f}원"
                             amt_str = f"{_round_half_up(plan['buy_amount']):,}원 ({_krw_abbrev(plan['buy_amount'])})"
                             loss_str = f"{_round_half_up(plan['worst_loss']):,}원"
@@ -3595,16 +3698,24 @@ with tab5:
                             tp1_str = f"${plan['tp1_price']:,.2f}"
                             ma_str = f"${ma20:,.2f}" if ma20 is not None else "—"
 
-                        st.markdown(f"##### {name_of(p_ticker, names)} · 매수가 {header_price} 기준 계획입니다")
+                        st.markdown(f"##### {p_name} · 매수가 {header_price} 기준 계획입니다")
 
-                        st.markdown(f"**① 매수 {amt_str} · {plan['shares']}주**")
+                        st.markdown(f"**① 매수 {amt_str} · {_qty(plan['shares'])}**")
                         st.caption(f"최악의 경우 손실 {loss_str} (자산의 {plan['worst_loss_pct']:.1%})")
 
                         if pyramiding == "함":
-                            shares_1 = int(plan["shares"] * 0.6)
-                            shares_2 = plan["shares"] - shares_1
+                            if p_coin:
+                                shares_1 = round(math.floor(plan["shares"] * 0.6 / p_lot) * p_lot, 10)
+                                shares_2 = round(plan["shares"] - shares_1, 10)
+                            else:
+                                shares_1 = int(plan["shares"] * 0.6)
+                                shares_2 = plan["shares"] - shares_1
                             amt_1, amt_2 = buy_price * shares_1, buy_price * shares_2
-                            if p_is_krw:
+                            if p_coin:
+                                st.caption(
+                                    f"불타기(임시 규칙): 1차 {_amt(amt_1)}({_qty(shares_1)}, 60%) · "
+                                    f"2차 {_amt(amt_2)}({_qty(shares_2)}, 40%)")
+                            elif p_is_krw:
                                 st.caption(
                                     f"불타기(임시 규칙): 1차 {amt_1:,.0f}원({shares_1}주, 60%) · "
                                     f"2차 {amt_2:,.0f}원({shares_2}주, 40%)")
@@ -3620,9 +3731,13 @@ with tab5:
                         st.caption("여기 오면 절반 매도")
 
                         st.markdown("**④ 익절 2차: 20일 이평 이탈 시 나머지 전량 매도**")
-                        st.caption(f"오늘 기준 20일 이평 {ma_str} · ⚠️ 이 값은 매일 변합니다")
-
-                        st.caption("주식 수는 소수점을 버립니다. 세금·수수료는 반영하지 않은 숫자입니다.")
+                        if p_coin:
+                            st.caption(f"20일 이평 {ma_str}(오늘 진행 중 봉 포함) · ⚠️ 이 값은 매일 변합니다")
+                            st.caption("수량은 소수 8자리 아래를 버립니다. 세금·수수료·거래소 최소 주문금액·"
+                                       "호가 단위는 반영하지 않은 숫자입니다.")
+                        else:
+                            st.caption(f"오늘 기준 20일 이평 {ma_str} · ⚠️ 이 값은 매일 변합니다")
+                            st.caption("주식 수는 소수점을 버립니다. 세금·수수료는 반영하지 않은 숫자입니다.")
 
         with sub_season:
             sdf, smeta = load_seasonality()
