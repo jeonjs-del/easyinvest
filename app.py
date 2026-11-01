@@ -4,6 +4,7 @@
 실행:  streamlit run app.py   (같은 폴더에 strategies.py 필요)
 """
 import contextlib
+import functools
 from csv import reader as csv_reader
 import hmac
 import io
@@ -188,15 +189,18 @@ def _gist_headers(token):
 
 
 @st.cache_data(ttl=300)
-def _gist_fetch_content(token, gist_id, filename):
-    """Gist 안의 특정 파일 raw 내용을 반환. 파일이 없거나 비어있으면 빈 문자열.
-    같은 Gist 하나에 watchlist.json 외에 이평 탭용 파일들도 함께 저장한다."""
+def _gist_fetch_files(token, gist_id):
+    """Gist 전체를 한 번 받아 {파일명: 내용}. 관심목록·이평 탭 2개·은퇴 파일이 한 Gist에 있어,
+    파일마다 따로 받으면 첫 로딩에 같은 요청을 네 번 기다린다."""
     r = requests.get(f"https://api.github.com/gists/{gist_id}",
                       headers=_gist_headers(token), timeout=10)
     r.raise_for_status()
-    files = r.json().get("files", {})
-    f = files.get(filename)
-    return f.get("content", "") if f else ""
+    return {n: (f or {}).get("content") or "" for n, f in (r.json().get("files") or {}).items()}
+
+
+def _gist_fetch_content(token, gist_id, filename):
+    """Gist 안의 특정 파일 raw 내용. 파일이 없거나 비어있으면 빈 문자열."""
+    return _gist_fetch_files(token, gist_id).get(filename, "")
 
 
 def _load_json_list_local(path, default):
@@ -256,7 +260,7 @@ def save_json_list(data, mode, gist_filename, local_path):
                 timeout=10,
             )
             r.raise_for_status()
-            _gist_fetch_content.clear()  # 캐시 무효화 → 다음 로드 시 최신값 반영
+            _gist_fetch_files.clear()  # 캐시 무효화 → 다음 로드 시 최신값 반영
         except Exception:
             pass  # 저장 실패는 무시 (다음 rerun에서 재시도 가능)
         return
@@ -1512,6 +1516,7 @@ def load_seasonality():
     return df, meta
 
 
+@functools.lru_cache(maxsize=4096)
 def _nearest_occurrence(month, tdom, today_ts):
     """(월, 월중n번째영업일)이 today_ts에 가장 가까이 실현되는 실제 날짜를 근사
     (공휴일은 무시하고 주말만 제외 — 매수창이 ±수일 폭이라 오차는 허용 범위)."""
@@ -1660,7 +1665,7 @@ def save_wealth(doc, mode):
                                headers=_gist_headers(token),
                                json={"files": {WEALTH_GIST_FILENAME: {"content": body}}}, timeout=15)
             r.raise_for_status()
-            _gist_fetch_content.clear()
+            _gist_fetch_files.clear()
         else:
             with open(WEALTH_FILE, "w", encoding="utf-8") as f:
                 f.write(body)
@@ -1944,7 +1949,7 @@ def _render_wealth_tab():
         if load_err:
             st.error(f"{load_err} 기존 데이터를 덮어쓰지 않도록 이 탭을 열지 않았습니다.")
             if st.button("다시 시도", key="wealth_retry"):
-                _gist_fetch_content.clear()
+                _gist_fetch_files.clear()
                 _wealth_rerun()
             return
         st.session_state.wealth_doc, st.session_state.wealth_mode = loaded, load_mode
@@ -1969,7 +1974,7 @@ def _render_wealth_tab():
     def save():
         res = save_wealth(doc, mode)
         if res == "conflict":
-            _gist_fetch_content.clear()
+            _gist_fetch_files.clear()
             del st.session_state["wealth_doc"]
             st.session_state.wealth_conflict = True
             _wealth_rerun()
@@ -1998,6 +2003,12 @@ def _render_wealth_tab():
         st.caption(f"💾 마지막 저장 {st.session_state.wealth_saved_at}"
                    + (" · Gist" if mode == "gist" else " · 이 기기(로컬 파일)"))
 
+    # 실거래가(12개월치)는 시트와 무관해 시트를 받는 동안 미리 받아 둔다(시트 3초 + 실거래가 1초를 순서대로
+    # 기다리지 않게). 시트 반영으로 재실행되더라도 결과는 캐시에 남아 다음 실행에 쓰인다.
+    _trade_ex = ThreadPoolExecutor(max_workers=1)
+    _trade_fut = _trade_ex.submit(_wealth_property_trades, dict(prop), today)
+    _trade_ex.shutdown(wait=False)
+
     # ---- Google 시트 반영 -------------------------------------------------
     # 시트가 기준이다: 조회에 성공한 항목은 저장된 값을 시트 값으로 바꾸고, 실패한 항목은
     # 마지막으로 가져온 값(저장된 문서)을 그대로 둔다.
@@ -2017,7 +2028,7 @@ def _render_wealth_tab():
 
     # ---- 시세·실거래가 ----------------------------------------------------
     quotes, quotes_changed = _wealth_quotes(doc)
-    trade_info = _wealth_property_trades(prop, today)
+    trade_info = _trade_fut.result()
     tm = trade_info["match"]
     if (tm and not trade_info["errors"]
             and W.should_apply_trade(tm["date"], prop.get("acquired_on"), prop.get("value_asof"))
@@ -2512,15 +2523,21 @@ watchlist = st.session_state.watchlist
 # 그리는 탭(동적자산배분·코인)의 필터 값은 다시 대입해 두어야 돌아왔을 때 유지된다.
 for _k in ("coin_tier", "coin_rank_n", "coin_mcap_min", "coin_col_weekrs", "coin_col_weekret",
            "coin_col_monthret", "coin_rank_period", "coin_rank_iv", "g247_cat", "coin_g247_iv",
-           "coin_dm_period", "coin_sub_tab"):
+           "coin_dm_period", "coin_sub_tab",
+           "wl_mode", "wl_period", "kp_period", "gp_period",
+           "trend_country", "trend_class", "trend_signal", "trend_cap", "trend_sort",
+           "season_country", "season_class", "season_cap", "season_sector", "season_sort",
+           "plan_krx_select", "plan_mode", "plan_loss", "plan_stop", "plan_mult", "plan_pyramid",
+           "plan_asset_krw", "plan_asset_usd", "ma_sort"):
     if _k in st.session_state:
         st.session_state[_k] = st.session_state[_k]
 
 # 듀얼모멘텀 하위탭이 직전 실행에 그려졌는지 — 아니었다면 이번이 '탭을 새로 연' 실행이라 실시간 시세를 새로 받는다.
 st.session_state._coin_dm_was_open = st.session_state.pop("_coin_dm_open_now", False)
 
-# on_change="rerun"이어야 탭의 .open이 채워진다. 동적자산배분·코인은 계산이 무거워(처음 열 때
-# 각각 10초·40초 안팎) 선택됐을 때만 실행한다 — 안 그러면 어느 탭을 보든 매번 이 계산을 기다린다.
+# on_change="rerun"이어야 탭의 .open이 채워진다. 차트 외의 탭은 전부 선택됐을 때만 실행한다 —
+# st.tabs는 안 보이는 탭 코드도 매번 돌려서, 차트만 봐도 프리미엄(시세 7종)·은퇴(시트·시세·실거래가)·
+# 매수(추세추종 카드 100개) 등을 다 기다려 첫 로딩이 40초 가까이 걸렸다(2026-11 측정).
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
     ["📊 차트", "⭐ 관심목록", "⚖️ 동적자산배분", "💰 프리미엄", "🛒 매수", "📏 이동평균", "🪙 코인", "🏖 은퇴"],
     key="main_tab", on_change="rerun")
@@ -2790,70 +2807,74 @@ with tab1:
 
 # =====================  관심목록 (순위)  ===================================
 with tab2:
-    wc1, wc2 = st.columns([1, 2])
-    with wc1:
-        mode = st.radio("모드", ["내 관심목록", "디폴트(글로벌 지수)"],
-                        horizontal=True, label_visibility="collapsed")
-    with wc2:
-        ret_period = st.radio("기간", RETURN_PERIODS, index=4,
-                              horizontal=True, label_visibility="collapsed")
+    if tab2.open:
+        wc1, wc2 = st.columns([1, 2])
+        with wc1:
+            mode = st.radio("모드", ["내 관심목록", "디폴트(글로벌 지수)"],
+                            horizontal=True, label_visibility="collapsed", key="wl_mode")
+        with wc2:
+            # 기본값은 index 대신 세션 값으로 둔다 — 탭 지연 실행 때문에 이 key를 위의 목록에서 다시 대입하는데,
+            # index도 같이 주면 매 실행 "default value + Session State" 경고가 로그에 남는다.
+            st.session_state.setdefault("wl_period", RETURN_PERIODS[4])
+            ret_period = st.radio("기간", RETURN_PERIODS,
+                                  horizontal=True, label_visibility="collapsed", key="wl_period")
 
-    # 내 관심목록 모드: 종목별 ✕ 제거 버튼
-    if mode == "내 관심목록" and st.session_state.watchlist:
-        _wl = st.session_state.watchlist
-        _rm_cols = st.columns(min(len(_wl), 8))
-        for _i, _wc in enumerate(_wl[:8]):
-            if _rm_cols[_i].button(
-                f"{name_of(_wc, names)} ✕",
-                key=f"wl_rm_{_wc}",
-                use_container_width=True,
-            ):
-                st.session_state.watchlist.remove(_wc)
-                save_watchlist(st.session_state.watchlist, st.session_state.storage_mode)
-                st.rerun()
+        # 내 관심목록 모드: 종목별 ✕ 제거 버튼
+        if mode == "내 관심목록" and st.session_state.watchlist:
+            _wl = st.session_state.watchlist
+            _rm_cols = st.columns(min(len(_wl), 8))
+            for _i, _wc in enumerate(_wl[:8]):
+                if _rm_cols[_i].button(
+                    f"{name_of(_wc, names)} ✕",
+                    key=f"wl_rm_{_wc}",
+                    use_container_width=True,
+                ):
+                    st.session_state.watchlist.remove(_wc)
+                    save_watchlist(st.session_state.watchlist, st.session_state.storage_mode)
+                    st.rerun()
 
-    universe = ([(name_of(c, names), c) for c in st.session_state.watchlist]
-                if mode == "내 관심목록" else list(DEFAULT_INDICES.items()))
-    start_hist = (datetime.today() - timedelta(days=420)).strftime("%Y-%m-%d")
+        universe = ([(name_of(c, names), c) for c in st.session_state.watchlist]
+                    if mode == "내 관심목록" else list(DEFAULT_INDICES.items()))
+        start_hist = (datetime.today() - timedelta(days=420)).strftime("%Y-%m-%d")
 
-    def _fetch_row(args):
-        disp, sym = args
-        df = get_price(sym, start_hist)
-        if df.empty:
-            return None
-        return {
-            "종목": f"{disp} ({sym})",
-            "현재가": float(df["Close"].iloc[-1]),
-            ret_period: period_return(df, ret_period),
-        }
+        def _fetch_row(args):
+            disp, sym = args
+            df = get_price(sym, start_hist)
+            if df.empty:
+                return None
+            return {
+                "종목": f"{disp} ({sym})",
+                "현재가": float(df["Close"].iloc[-1]),
+                ret_period: period_return(df, ret_period),
+            }
 
-    with st.spinner("시세 조회 중..."):
-        with ThreadPoolExecutor(max_workers=12) as exe:
-            row_results = list(exe.map(_fetch_row, universe))
+        with st.spinner("시세 조회 중..."):
+            with ThreadPoolExecutor(max_workers=12) as exe:
+                row_results = list(exe.map(_fetch_row, universe))
 
-    rows = [r for r in row_results if r is not None]
+        rows = [r for r in row_results if r is not None]
 
-    if rows:
-        rank_df = (pd.DataFrame(rows)
-                   .sort_values(ret_period, ascending=False, na_position="last")
-                   .reset_index(drop=True))
-        rank_df.insert(0, "순위", rank_df.index + 1)
-        styled_rank = rank_df.style.format(
-            {"현재가": "{:,.2f}", ret_period: "{:+.2%}"},
-            na_rep="—",
-        )
-        color_cols = [ret_period] if ret_period in rank_df.columns else []
-        for _col in color_cols:
-            _cap = _abs_cap(rank_df[_col], RET_COLOR_CAP)
-            styled_rank = _apply_bg(
-                styled_rank,
-                lambda v, cap=_cap: _color_scale_zero(v, cap),
-                subset=[_col],
+        if rows:
+            rank_df = (pd.DataFrame(rows)
+                       .sort_values(ret_period, ascending=False, na_position="last")
+                       .reset_index(drop=True))
+            rank_df.insert(0, "순위", rank_df.index + 1)
+            styled_rank = rank_df.style.format(
+                {"현재가": "{:,.2f}", ret_period: "{:+.2%}"},
+                na_rep="—",
             )
-        st.dataframe(styled_rank, use_container_width=True, hide_index=True,
-                     height=min(60 + 35 * len(rank_df), 520))
-    else:
-        st.info("표시할 데이터가 없습니다.")
+            color_cols = [ret_period] if ret_period in rank_df.columns else []
+            for _col in color_cols:
+                _cap = _abs_cap(rank_df[_col], RET_COLOR_CAP)
+                styled_rank = _apply_bg(
+                    styled_rank,
+                    lambda v, cap=_cap: _color_scale_zero(v, cap),
+                    subset=[_col],
+                )
+            st.dataframe(styled_rank, use_container_width=True, hide_index=True,
+                         height=min(60 + 35 * len(rank_df), 520))
+        else:
+            st.info("표시할 데이터가 없습니다.")
 
 # =====================  동적자산배분  ======================================
 with tab3:
@@ -3131,689 +3152,706 @@ with tab3:
 
 # =====================  프리미엄  ==========================================
 with tab4:
-    # ── 섹션 1: 김치프리미엄 ────────────────────────────────────────────
-    st.subheader("🌶️ 김치프리미엄")
-    st.caption("업비트 BTC/KRW vs 코인베이스 BTC/USD × 원달러 환율")
-    kp_period = st.radio("기간", ["1년", "2년", "전체"], index=0,
-                         horizontal=True, key="kp_period")
-    try:
-        upbit_now   = _upbit_btc_now()
-        cb_now      = _coinbase_btc_now()
-        usdkrw_now_df = _usdkrw_history()
-        usdkrw_now  = (float(usdkrw_now_df["USDKRW"].dropna().iloc[-1])
-                       if not usdkrw_now_df.empty else None)
-        if usdkrw_now:
-            cb_krw_now = cb_now * usdkrw_now
-            kimchi_now = (upbit_now / cb_krw_now - 1) * 100
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("김치프리미엄",         f"{kimchi_now:+.2f}%")
-            k2.metric("업비트 BTC",           f"₩{upbit_now:,.0f}")
-            k3.metric("코인베이스 BTC (KRW)", f"₩{cb_krw_now:,.0f}")
-            k4.metric("USD/KRW",              f"{usdkrw_now:,.1f}")
+    if tab4.open:
+        # 하나씩 받으면 7개 응답 시간을 다 더해 기다린다 — 먼저 병렬로 받아 캐시에 채운다.
+        def _prefetch(fn):
+            try:
+                fn()
+            except Exception:
+                pass   # 실패는 아래 본 호출에서 다시 시도·안내한다
+        with ThreadPoolExecutor(max_workers=7) as _ex:
+            list(_ex.map(_prefetch, (_upbit_btc_now, _coinbase_btc_now, _usdkrw_history, _upbit_btc_history,
+                                     _btcusd_history, _gld_history, _ace_gold_history)))
 
-        upbit_hist  = _upbit_btc_history()
-        btcusd_hist = _btcusd_history()
-        usdkrw_hist = _usdkrw_history()
-        if not upbit_hist.empty and not btcusd_hist.empty and not usdkrw_hist.empty:
-            km = (upbit_hist
-                  .join(btcusd_hist, how="inner")
-                  .join(usdkrw_hist, how="inner")
-                  .dropna())
-            km["premium"] = (km["KRW"] / (km["USD"] * km["USDKRW"]) - 1) * 100
-            pmin, pmax, pmean = km["premium"].min(), km["premium"].max(), km["premium"].mean()
-            st.caption(
-                f"과거 범위: 최저 {pmin:+.1f}% · 최고 {pmax:+.1f}% · 평균 {pmean:+.1f}%"
-            )
-            if kp_period == "1년":
-                km = km[km.index >= km.index[-1] - pd.DateOffset(years=1)]
-            elif kp_period == "2년":
-                km = km[km.index >= km.index[-1] - pd.DateOffset(years=2)]
-            kfig = go.Figure()
-            kfig.add_trace(go.Scatter(
-                x=km.index, y=km["premium"], mode="lines",
-                line=dict(color="#e03131", width=1.5),
-                fill="tozeroy", fillcolor="rgba(224,49,49,0.1)",
-            ))
-            kfig.add_hline(y=0, line_dash="dot", line_color="#888", line_width=1)
-            kfig.update_layout(
-                height=280, margin=dict(l=0, r=0, t=10, b=0),
-                yaxis_ticksuffix="%", showlegend=False,
-            )
-            st.plotly_chart(kfig, use_container_width=True,
-                            config={"displayModeBar": False})
-            st.caption("출처: Upbit API · Coinbase API · FinanceDataReader (USD/KRW)")
-        else:
-            st.info("히스토리 데이터 조회 실패")
-    except Exception as _ke:
-        st.error(f"김치프리미엄 오류: {_ke}")
+        # ── 섹션 1: 김치프리미엄 ────────────────────────────────────────────
+        st.subheader("🌶️ 김치프리미엄")
+        st.caption("업비트 BTC/KRW vs 코인베이스 BTC/USD × 원달러 환율")
+        kp_period = st.radio("기간", ["1년", "2년", "전체"], index=0,
+                             horizontal=True, key="kp_period")
+        try:
+            upbit_now   = _upbit_btc_now()
+            cb_now      = _coinbase_btc_now()
+            usdkrw_now_df = _usdkrw_history()
+            usdkrw_now  = (float(usdkrw_now_df["USDKRW"].dropna().iloc[-1])
+                           if not usdkrw_now_df.empty else None)
+            if usdkrw_now:
+                cb_krw_now = cb_now * usdkrw_now
+                kimchi_now = (upbit_now / cb_krw_now - 1) * 100
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("김치프리미엄",         f"{kimchi_now:+.2f}%")
+                k2.metric("업비트 BTC",           f"₩{upbit_now:,.0f}")
+                k3.metric("코인베이스 BTC (KRW)", f"₩{cb_krw_now:,.0f}")
+                k4.metric("USD/KRW",              f"{usdkrw_now:,.1f}")
 
-    st.divider()
+            upbit_hist  = _upbit_btc_history()
+            btcusd_hist = _btcusd_history()
+            usdkrw_hist = _usdkrw_history()
+            if not upbit_hist.empty and not btcusd_hist.empty and not usdkrw_hist.empty:
+                km = (upbit_hist
+                      .join(btcusd_hist, how="inner")
+                      .join(usdkrw_hist, how="inner")
+                      .dropna())
+                km["premium"] = (km["KRW"] / (km["USD"] * km["USDKRW"]) - 1) * 100
+                pmin, pmax, pmean = km["premium"].min(), km["premium"].max(), km["premium"].mean()
+                st.caption(
+                    f"과거 범위: 최저 {pmin:+.1f}% · 최고 {pmax:+.1f}% · 평균 {pmean:+.1f}%"
+                )
+                if kp_period == "1년":
+                    km = km[km.index >= km.index[-1] - pd.DateOffset(years=1)]
+                elif kp_period == "2년":
+                    km = km[km.index >= km.index[-1] - pd.DateOffset(years=2)]
+                kfig = go.Figure()
+                kfig.add_trace(go.Scatter(
+                    x=km.index, y=km["premium"], mode="lines",
+                    line=dict(color="#e03131", width=1.5),
+                    fill="tozeroy", fillcolor="rgba(224,49,49,0.1)",
+                ))
+                kfig.add_hline(y=0, line_dash="dot", line_color="#888", line_width=1)
+                kfig.update_layout(
+                    height=280, margin=dict(l=0, r=0, t=10, b=0),
+                    yaxis_ticksuffix="%", showlegend=False,
+                )
+                st.plotly_chart(kfig, use_container_width=True,
+                                config={"displayModeBar": False})
+                st.caption("출처: Upbit API · Coinbase API · FinanceDataReader (USD/KRW)")
+            else:
+                st.info("히스토리 데이터 조회 실패")
+        except Exception as _ke:
+            st.error(f"김치프리미엄 오류: {_ke}")
 
-    # ── 섹션 2: 금치프리미엄 ────────────────────────────────────────────
-    st.subheader("🥇 금치프리미엄")
-    st.caption("ACE KRX금현물 ETF(411060) vs GLD(SPDR Gold, 1주=2.876g) × 원달러 환율")
-    gp_period = st.radio("기간", ["1년", "2년", "전체"], index=0,
-                         horizontal=True, key="gp_period")
-    try:
-        ace_hist      = _ace_gold_history()
-        gld_hist      = _gld_history()
-        usdkrw_hist2  = _usdkrw_history()
-        if not ace_hist.empty and not gld_hist.empty and not usdkrw_hist2.empty:
-            GLD_G = 2.876  # 1 GLD share = 2.876 g
-            gm = (ace_hist
-                  .join(gld_hist, how="inner")
-                  .join(usdkrw_hist2, how="inner")
-                  .dropna())
-            gm["intl_g"] = gm["GLD"] / GLD_G * gm["USDKRW"]
-            calib = float((gm["ACE"] / gm["intl_g"]).median())
-            gm["premium"] = (gm["ACE"] / calib / gm["intl_g"] - 1) * 100
-            latest = gm.iloc[-1]
-            gpmin, gpmax, gpmean = gm["premium"].min(), gm["premium"].max(), gm["premium"].mean()
-            g1, g2, g3, g4 = st.columns(4)
-            g1.metric("금치프리미엄",       f"{float(latest['premium']):+.2f}%")
-            g2.metric("ACE 국내금 (원/g)",  f"₩{float(latest['ACE']) / calib:,.0f}")
-            g3.metric("GLD 국제금 (원/g)",  f"₩{float(latest['intl_g']):,.0f}")
-            g4.metric("과거범위",           f"{gpmin:+.1f}% ~ {gpmax:+.1f}%")
-            st.caption(
-                f"과거 범위: 최저 {gpmin:+.1f}% · 최고 {gpmax:+.1f}% · 평균 {gpmean:+.1f}%"
-            )
-            if gp_period == "1년":
-                gm = gm[gm.index >= gm.index[-1] - pd.DateOffset(years=1)]
-            elif gp_period == "2년":
-                gm = gm[gm.index >= gm.index[-1] - pd.DateOffset(years=2)]
-            gfig = go.Figure()
-            gfig.add_trace(go.Scatter(
-                x=gm.index, y=gm["premium"], mode="lines",
-                line=dict(color="#f4a261", width=1.5),
-                fill="tozeroy", fillcolor="rgba(244,162,97,0.15)",
-            ))
-            gfig.add_hline(y=0, line_dash="dot", line_color="#888", line_width=1)
-            gfig.update_layout(
-                height=280, margin=dict(l=0, r=0, t=10, b=0),
-                yaxis_ticksuffix="%", showlegend=False,
-            )
-            st.plotly_chart(gfig, use_container_width=True,
-                            config={"displayModeBar": False})
-            st.caption(
-                "출처: FinanceDataReader (ACE KRX금현물 411060 · USD/KRW) · Yahoo Finance (GLD)"
-            )
-        else:
-            st.info("금치프리미엄 히스토리 데이터 조회 실패")
-    except Exception as _ge:
-        st.error(f"금치프리미엄 오류: {_ge}")
+        st.divider()
+
+        # ── 섹션 2: 금치프리미엄 ────────────────────────────────────────────
+        st.subheader("🥇 금치프리미엄")
+        st.caption("ACE KRX금현물 ETF(411060) vs GLD(SPDR Gold, 1주=2.876g) × 원달러 환율")
+        gp_period = st.radio("기간", ["1년", "2년", "전체"], index=0,
+                             horizontal=True, key="gp_period")
+        try:
+            ace_hist      = _ace_gold_history()
+            gld_hist      = _gld_history()
+            usdkrw_hist2  = _usdkrw_history()
+            if not ace_hist.empty and not gld_hist.empty and not usdkrw_hist2.empty:
+                GLD_G = 2.876  # 1 GLD share = 2.876 g
+                gm = (ace_hist
+                      .join(gld_hist, how="inner")
+                      .join(usdkrw_hist2, how="inner")
+                      .dropna())
+                gm["intl_g"] = gm["GLD"] / GLD_G * gm["USDKRW"]
+                calib = float((gm["ACE"] / gm["intl_g"]).median())
+                gm["premium"] = (gm["ACE"] / calib / gm["intl_g"] - 1) * 100
+                latest = gm.iloc[-1]
+                gpmin, gpmax, gpmean = gm["premium"].min(), gm["premium"].max(), gm["premium"].mean()
+                g1, g2, g3, g4 = st.columns(4)
+                g1.metric("금치프리미엄",       f"{float(latest['premium']):+.2f}%")
+                g2.metric("ACE 국내금 (원/g)",  f"₩{float(latest['ACE']) / calib:,.0f}")
+                g3.metric("GLD 국제금 (원/g)",  f"₩{float(latest['intl_g']):,.0f}")
+                g4.metric("과거범위",           f"{gpmin:+.1f}% ~ {gpmax:+.1f}%")
+                st.caption(
+                    f"과거 범위: 최저 {gpmin:+.1f}% · 최고 {gpmax:+.1f}% · 평균 {gpmean:+.1f}%"
+                )
+                if gp_period == "1년":
+                    gm = gm[gm.index >= gm.index[-1] - pd.DateOffset(years=1)]
+                elif gp_period == "2년":
+                    gm = gm[gm.index >= gm.index[-1] - pd.DateOffset(years=2)]
+                gfig = go.Figure()
+                gfig.add_trace(go.Scatter(
+                    x=gm.index, y=gm["premium"], mode="lines",
+                    line=dict(color="#f4a261", width=1.5),
+                    fill="tozeroy", fillcolor="rgba(244,162,97,0.15)",
+                ))
+                gfig.add_hline(y=0, line_dash="dot", line_color="#888", line_width=1)
+                gfig.update_layout(
+                    height=280, margin=dict(l=0, r=0, t=10, b=0),
+                    yaxis_ticksuffix="%", showlegend=False,
+                )
+                st.plotly_chart(gfig, use_container_width=True,
+                                config={"displayModeBar": False})
+                st.caption(
+                    "출처: FinanceDataReader (ACE KRX금현물 411060 · USD/KRW) · Yahoo Finance (GLD)"
+                )
+            else:
+                st.info("금치프리미엄 히스토리 데이터 조회 실패")
+        except Exception as _ge:
+            st.error(f"금치프리미엄 오류: {_ge}")
 
 # =====================  매수  ==============================================
 with tab5:
-    sub_season, sub_trend, sub_plan = st.tabs(["🌱 계절성", "📈 추세추종", "🗓 매매계획"])
+    if tab5.open:
+        sub_season, sub_trend, sub_plan = st.tabs(["🌱 계절성", "📈 추세추종", "🗓 매매계획"])
 
-    with sub_trend:
-        tdf, tmeta = load_trend()
-        if tdf.empty:
-            st.warning(
-                "추세추종 데이터가 없습니다. 로컬에서 `python scanner/trend_scan.py`를 "
-                "먼저 실행해 `data/trend.parquet`를 생성해주세요."
-            )
-        else:
-            as_of = pd.Timestamp(tmeta.get("as_of"))
-            today_ts = pd.Timestamp(datetime.today().date())
-            days_old = (today_ts - as_of).days
-            stale = days_old > TREND_STALE_DAYS
-            status = f"신호 기준일 {as_of:%Y-%m-%d} ({days_old}일 경과)"
-            if stale:
-                st.warning(f"⚠️ {status} — 갱신이 오래되어 재실행을 권장합니다.")
+        with sub_trend:
+            tdf, tmeta = load_trend()
+            if tdf.empty:
+                st.warning(
+                    "추세추종 데이터가 없습니다. 로컬에서 `python scanner/trend_scan.py`를 "
+                    "먼저 실행해 `data/trend.parquet`를 생성해주세요."
+                )
             else:
-                st.caption(status)
+                as_of = pd.Timestamp(tmeta.get("as_of"))
+                today_ts = pd.Timestamp(datetime.today().date())
+                days_old = (today_ts - as_of).days
+                stale = days_old > TREND_STALE_DAYS
+                status = f"신호 기준일 {as_of:%Y-%m-%d} ({days_old}일 경과)"
+                if stale:
+                    st.warning(f"⚠️ {status} — 갱신이 오래되어 재실행을 권장합니다.")
+                else:
+                    st.caption(status)
 
-            # 1차: (종목,신호유형,장단기)에서 최고 변형만 남긴다(예: EMA40/EMA21/SMA20
-            # 근접이 동시에 살아있으면 그중 하나만). 이 단계에서도 종목 하나가 신호유형별로
-            # 여러 번 나올 수 있다(예: 이평눌림목+박스돌파 동시 신호) — 그래서 필터를 다
-            # 적용한 뒤 아래에서 티커 기준으로 한 번 더 최상위 1행만 남긴다. 필터 적용 후에
-            # 다시 고르는 이유: "신호=이평눌림목"으로만 볼 때도 그 조건 안에서 최고 1개를
-            # 골라야 하는데, 스캐너 단계에서 신호유형을 넘나드는 고정 1위를 미리 정해두면
-            # 필터와 결과가 어긋난다.
-            rep = tdf[tdf["is_representative"] & tdf["is_best_variant"]].copy()
+                # 1차: (종목,신호유형,장단기)에서 최고 변형만 남긴다(예: EMA40/EMA21/SMA20
+                # 근접이 동시에 살아있으면 그중 하나만). 이 단계에서도 종목 하나가 신호유형별로
+                # 여러 번 나올 수 있다(예: 이평눌림목+박스돌파 동시 신호) — 그래서 필터를 다
+                # 적용한 뒤 아래에서 티커 기준으로 한 번 더 최상위 1행만 남긴다. 필터 적용 후에
+                # 다시 고르는 이유: "신호=이평눌림목"으로만 볼 때도 그 조건 안에서 최고 1개를
+                # 골라야 하는데, 스캐너 단계에서 신호유형을 넘나드는 고정 1위를 미리 정해두면
+                # 필터와 결과가 어긋난다.
+                rep = tdf[tdf["is_representative"] & tdf["is_best_variant"]].copy()
 
-            f1, f2, f3, f4, f5 = st.columns(5)
-            countries = ["전체"] + sorted(rep["country"].dropna().unique().tolist())
-            f_country = f1.selectbox("국가", countries, key="trend_country")
-            classes = ["전체"] + sorted(rep["asset_class"].dropna().unique().tolist())
-            f_class = f2.selectbox("자산", classes, key="trend_class")
-            signals = ["전체"] + sorted(rep["signal_type"].dropna().unique().tolist())
-            f_signal = f3.selectbox("신호", signals, key="trend_signal")
-            f_cap = f4.selectbox("시총", list(TREND_CAP_BUCKETS.keys()), key="trend_cap")
-            sort_label = f5.selectbox("정렬", ["별 우선", "RS순", "승률순"], key="trend_sort")
+                f1, f2, f3, f4, f5 = st.columns(5)
+                countries = ["전체"] + sorted(rep["country"].dropna().unique().tolist())
+                f_country = f1.selectbox("국가", countries, key="trend_country")
+                classes = ["전체"] + sorted(rep["asset_class"].dropna().unique().tolist())
+                f_class = f2.selectbox("자산", classes, key="trend_class")
+                signals = ["전체"] + sorted(rep["signal_type"].dropna().unique().tolist())
+                f_signal = f3.selectbox("신호", signals, key="trend_signal")
+                f_cap = f4.selectbox("시총", list(TREND_CAP_BUCKETS.keys()), key="trend_cap")
+                sort_label = f5.selectbox("정렬", ["별 우선", "RS순", "승률순"], key="trend_sort")
 
-            if f_country != "전체":
-                rep = rep[rep["country"] == f_country]
-            if f_class != "전체":
-                rep = rep[rep["asset_class"] == f_class]
-            if f_signal != "전체":
-                rep = rep[rep["signal_type"] == f_signal]
-            if f_cap != "전체":
-                rep = rep[_market_cap_bucket_mask(rep["market_cap_usd"], f_cap, TREND_CAP_BUCKETS)]
+                if f_country != "전체":
+                    rep = rep[rep["country"] == f_country]
+                if f_class != "전체":
+                    rep = rep[rep["asset_class"] == f_class]
+                if f_signal != "전체":
+                    rep = rep[rep["signal_type"] == f_signal]
+                if f_cap != "전체":
+                    rep = rep[_market_cap_bucket_mask(rep["market_cap_usd"], f_cap, TREND_CAP_BUCKETS)]
 
-            # 2차: 티커 기준 중복 제거(별점 -> 초과수익 -> 표본수 순 최상위 1행만).
-            # 2차 기준을 손익비 대신 초과수익(벤치마크 대비 실제 아웃퍼폼 크기)으로 쓴다.
-            rep = rep.sort_values(["star_rating", "excess_return", "n_samples"],
-                                   ascending=[False, False, False])
-            rep = rep.drop_duplicates(subset="ticker", keep="first")
-
-            if sort_label == "별 우선":
-                rep = rep.sort_values(["star_rating", "rs_total", "excess_return"],
+                # 2차: 티커 기준 중복 제거(별점 -> 초과수익 -> 표본수 순 최상위 1행만).
+                # 2차 기준을 손익비 대신 초과수익(벤치마크 대비 실제 아웃퍼폼 크기)으로 쓴다.
+                rep = rep.sort_values(["star_rating", "excess_return", "n_samples"],
                                        ascending=[False, False, False])
-            elif sort_label == "RS순":
-                rep = rep.sort_values("rs_total", ascending=False)
-            else:
-                rep = rep.sort_values("win_rate", ascending=False)
-            rep = rep.reset_index(drop=True)
+                rep = rep.drop_duplicates(subset="ticker", keep="first")
 
-            total_unique = len(rep)
-            rep = rep.head(TREND_MAX_DISPLAY)
-            if total_unique > TREND_MAX_DISPLAY:
-                st.caption(f"{len(rep)}종목 표시 (조건 충족 {total_unique}종목 중 상위 {TREND_MAX_DISPLAY}) · {sort_label}")
-            else:
-                st.caption(f"{total_unique}종목 · {sort_label}")
+                if sort_label == "별 우선":
+                    rep = rep.sort_values(["star_rating", "rs_total", "excess_return"],
+                                           ascending=[False, False, False])
+                elif sort_label == "RS순":
+                    rep = rep.sort_values("rs_total", ascending=False)
+                else:
+                    rep = rep.sort_values("win_rate", ascending=False)
+                rep = rep.reset_index(drop=True)
 
-            if rep.empty:
-                st.info("조건에 맞는 후보가 없습니다.")
-            else:
-                for i, r in rep.iterrows():
-                    stars = "★" * int(r["star_rating"]) + "☆" * (3 - int(r["star_rating"]))
-                    risk_badge = " 🔺위험형" if r["risk_flag"] else ""
-                    label = (
-                        f"{i + 1}. {stars} {r['name']}({r['ticker']}) · [{r['signal_type']}] "
-                        f"{r['variant_label']} · {int(r['hold_days'])}일 보유{risk_badge}"
-                    )
-                    with st.expander(label):
-                        b1, b2, b3 = st.columns(3)
-                        sector_label = r["sector"] or "미분류"
-                        b1.metric("종합 RS", int(r["rs_total"]) if pd.notna(r["rs_total"]) else "—")
-                        b2.metric(f"{sector_label} RS",
-                                  int(r["rs_sector"]) if pd.notna(r["rs_sector"]) else "—")
-                        b3.metric("추세 구분", r["trend_term"])
+                total_unique = len(rep)
+                rep = rep.head(TREND_MAX_DISPLAY)
+                if total_unique > TREND_MAX_DISPLAY:
+                    st.caption(f"{len(rep)}종목 표시 (조건 충족 {total_unique}종목 중 상위 {TREND_MAX_DISPLAY}) · {sort_label}")
+                else:
+                    st.caption(f"{total_unique}종목 · {sort_label}")
 
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("매수구간", f"{r['buy_zone_low']:,.2f}~{r['buy_zone_high']:,.2f}")
-                        c2.metric("현재가", f"{r['close_price']:,.2f}")
-                        c3.metric("가격 위치", r["price_status"])
-
-                        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-                        m1.metric("승률(초과수익 기준)", f"{r['win_rate']:.0%}")
-                        m2.metric("평균이익", f"{r['avg_win']:+.1%}")
-                        m3.metric("평균손실", f"{r['avg_loss']:+.1%}")
-                        m4.metric("손익비", f"{r['profit_factor']:.2f}")
-                        m5.metric(r["sample_label"], f"{int(r['n_samples'])}")
-                        excess = r.get("excess_return")
-                        m6.metric("초과수익(벤치마크 대비)", f"{excess:+.1%}" if pd.notna(excess) else "—")
-                        abs_wr = r.get("abs_win_rate")
-                        m7.metric("승률(절대수익 기준)", f"{abs_wr:.0%}" if pd.notna(abs_wr) else "—")
-
-                        # 이 종목이 지금 다른 신호(유형/변형/장단기)로도 살아있는지 — 티커
-                        # 중복 제거로 위 카드엔 최상위 1개만 보이므로 나머지는 여기서 안내.
-                        others = tdf[
-                            (tdf["ticker"] == r["ticker"]) & tdf["is_representative"] & tdf["is_best_variant"]
-                            & ~((tdf["signal_type"] == r["signal_type"])
-                                & (tdf["variant_key"] == r["variant_key"])
-                                & (tdf["trend_term"] == r["trend_term"]))
-                        ].sort_values(["star_rating", "excess_return"], ascending=[False, False])
-                        if not others.empty:
-                            if st.checkbox(f"이 종목의 다른 신호 보기 ({len(others)}개)", key=f"others_{i}_{r['ticker']}"):
-                                for _, o in others.iterrows():
-                                    o_stars = "★" * int(o["star_rating"]) + "☆" * (3 - int(o["star_rating"]))
-                                    st.caption(
-                                        f"{o_stars} [{o['signal_type']}] {o['variant_label']} · "
-                                        f"{int(o['hold_days'])}일 보유 · 승률 {o['win_rate']:.0%} · "
-                                        f"손익비 {o['profit_factor']:.2f}"
-                                    )
-
-                        st.markdown("##### 보유기간별 성적표 (★ = 대표 보유기간)")
-                        sub = (tdf[(tdf["ticker"] == r["ticker"]) & (tdf["variant_key"] == r["variant_key"])
-                                   & (tdf["trend_term"] == r["trend_term"])]
-                               .sort_values("hold_days"))
-                        tbl = pd.DataFrame({
-                            "보유일": sub["hold_days"].astype(int),
-                            "승률": sub["win_rate"],
-                            "평균이익": sub["avg_win"],
-                            "평균손실": sub["avg_loss"],
-                            "손익비": sub["profit_factor"],
-                            r["sample_label"]: sub["n_samples"].astype(int),
-                            "대표": sub["is_representative"].map(lambda v: "★" if v else ""),
-                        })
-                        st.dataframe(
-                            tbl.style.format({"승률": "{:.0%}", "평균이익": "{:+.1%}",
-                                              "평균손실": "{:+.1%}", "손익비": "{:.2f}"}),
-                            use_container_width=True, hide_index=True,
+                if rep.empty:
+                    st.info("조건에 맞는 후보가 없습니다.")
+                else:
+                    for i, r in rep.iterrows():
+                        stars = "★" * int(r["star_rating"]) + "☆" * (3 - int(r["star_rating"]))
+                        risk_badge = " 🔺위험형" if r["risk_flag"] else ""
+                        label = (
+                            f"{i + 1}. {stars} {r['name']}({r['ticker']}) · [{r['signal_type']}] "
+                            f"{r['variant_label']} · {int(r['hold_days'])}일 보유{risk_badge}"
                         )
+                        _exp = st.expander(label, key=f"trend_exp_{r['ticker']}_{r['variant_key']}_{r['trend_term']}",
+                                           on_change="rerun")
+                        with _exp:
+                            if not _exp.open:
+                                continue
+                            b1, b2, b3 = st.columns(3)
+                            sector_label = r["sector"] or "미분류"
+                            b1.metric("종합 RS", int(r["rs_total"]) if pd.notna(r["rs_total"]) else "—")
+                            b2.metric(f"{sector_label} RS",
+                                      int(r["rs_sector"]) if pd.notna(r["rs_sector"]) else "—")
+                            b3.metric("추세 구분", r["trend_term"])
 
-    with sub_plan:
-        if "plan_ticker" not in st.session_state:
-            st.session_state.plan_ticker = st.session_state.chart_ticker
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric("매수구간", f"{r['buy_zone_low']:,.2f}~{r['buy_zone_high']:,.2f}")
+                            c2.metric("현재가", f"{r['close_price']:,.2f}")
+                            c3.metric("가격 위치", r["price_status"])
 
-        pc1, pc2 = st.columns([3, 2])
-        with pc1:
-            _psel = st.selectbox(
-                "종목 검색",
-                options=search_options, index=None,
-                placeholder="종목명·코드 검색 (한국 상장 종목/ETF)",
-                label_visibility="collapsed", key="plan_krx_select",
-            )
-            if _psel is not None:
-                _psel_code = normalize(_psel.rsplit("(", 1)[-1].rstrip(")"))
-                if _psel_code != st.session_state.plan_ticker:
-                    st.session_state.plan_ticker = _psel_code
+                            m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+                            m1.metric("승률(초과수익 기준)", f"{r['win_rate']:.0%}")
+                            m2.metric("평균이익", f"{r['avg_win']:+.1%}")
+                            m3.metric("평균손실", f"{r['avg_loss']:+.1%}")
+                            m4.metric("손익비", f"{r['profit_factor']:.2f}")
+                            m5.metric(r["sample_label"], f"{int(r['n_samples'])}")
+                            excess = r.get("excess_return")
+                            m6.metric("초과수익(벤치마크 대비)", f"{excess:+.1%}" if pd.notna(excess) else "—")
+                            abs_wr = r.get("abs_win_rate")
+                            m7.metric("승률(절대수익 기준)", f"{abs_wr:.0%}" if pd.notna(abs_wr) else "—")
+
+                            # 이 종목이 지금 다른 신호(유형/변형/장단기)로도 살아있는지 — 티커
+                            # 중복 제거로 위 카드엔 최상위 1개만 보이므로 나머지는 여기서 안내.
+                            others = tdf[
+                                (tdf["ticker"] == r["ticker"]) & tdf["is_representative"] & tdf["is_best_variant"]
+                                & ~((tdf["signal_type"] == r["signal_type"])
+                                    & (tdf["variant_key"] == r["variant_key"])
+                                    & (tdf["trend_term"] == r["trend_term"]))
+                            ].sort_values(["star_rating", "excess_return"], ascending=[False, False])
+                            if not others.empty:
+                                if st.checkbox(f"이 종목의 다른 신호 보기 ({len(others)}개)", key=f"others_{i}_{r['ticker']}"):
+                                    for _, o in others.iterrows():
+                                        o_stars = "★" * int(o["star_rating"]) + "☆" * (3 - int(o["star_rating"]))
+                                        st.caption(
+                                            f"{o_stars} [{o['signal_type']}] {o['variant_label']} · "
+                                            f"{int(o['hold_days'])}일 보유 · 승률 {o['win_rate']:.0%} · "
+                                            f"손익비 {o['profit_factor']:.2f}"
+                                        )
+
+                            st.markdown("##### 보유기간별 성적표 (★ = 대표 보유기간)")
+                            sub = (tdf[(tdf["ticker"] == r["ticker"]) & (tdf["variant_key"] == r["variant_key"])
+                                       & (tdf["trend_term"] == r["trend_term"])]
+                                   .sort_values("hold_days"))
+                            tbl = pd.DataFrame({
+                                "보유일": sub["hold_days"].astype(int),
+                                "승률": sub["win_rate"],
+                                "평균이익": sub["avg_win"],
+                                "평균손실": sub["avg_loss"],
+                                "손익비": sub["profit_factor"],
+                                r["sample_label"]: sub["n_samples"].astype(int),
+                                "대표": sub["is_representative"].map(lambda v: "★" if v else ""),
+                            })
+                            st.dataframe(
+                                tbl.style.format({"승률": "{:.0%}", "평균이익": "{:+.1%}",
+                                                  "평균손실": "{:+.1%}", "손익비": "{:.2f}"}),
+                                use_container_width=True, hide_index=True,
+                            )
+
+        with sub_plan:
+            if "plan_ticker" not in st.session_state:
+                st.session_state.plan_ticker = st.session_state.chart_ticker
+
+            pc1, pc2 = st.columns([3, 2])
+            with pc1:
+                _psel = st.selectbox(
+                    "종목 검색",
+                    options=search_options, index=None,
+                    placeholder="종목명·코드 검색 (한국 상장 종목/ETF)",
+                    label_visibility="collapsed", key="plan_krx_select",
+                )
+                if _psel is not None:
+                    _psel_code = normalize(_psel.rsplit("(", 1)[-1].rstrip(")"))
+                    if _psel_code != st.session_state.plan_ticker:
+                        st.session_state.plan_ticker = _psel_code
+                        st.session_state.pop("plan_computed", None)
+                        st.rerun()
+            with pc2:
+                with st.form("_plan_fs", clear_on_submit=True, border=False):
+                    _pfc, _pbc = st.columns([4, 1])
+                    _pft = _pfc.text_input(
+                        "직접 입력", placeholder="티커 직접 입력 (예: AAPL)",
+                        label_visibility="collapsed",
+                    )
+                    _psub = _pbc.form_submit_button("조회", use_container_width=True)
+                if _psub and _pft.strip():
+                    st.session_state.plan_ticker = normalize(_pft.strip())
+                    st.session_state.pop("plan_krx_select", None)
                     st.session_state.pop("plan_computed", None)
                     st.rerun()
-        with pc2:
-            with st.form("_plan_fs", clear_on_submit=True, border=False):
-                _pfc, _pbc = st.columns([4, 1])
-                _pft = _pfc.text_input(
-                    "직접 입력", placeholder="티커 직접 입력 (예: AAPL)",
-                    label_visibility="collapsed",
-                )
-                _psub = _pbc.form_submit_button("조회", use_container_width=True)
-            if _psub and _pft.strip():
-                st.session_state.plan_ticker = normalize(_pft.strip())
-                st.session_state.pop("plan_krx_select", None)
-                st.session_state.pop("plan_computed", None)
-                st.rerun()
 
-        p_ticker = normalize(st.session_state.plan_ticker)
-        p_is_krw = p_ticker.isdigit()
-        p_start = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
-        p_df = get_price(p_ticker, p_start)
+            p_ticker = normalize(st.session_state.plan_ticker)
+            p_is_krw = p_ticker.isdigit()
+            p_start = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+            p_df = get_price(p_ticker, p_start)
 
-        if p_df.empty:
-            st.warning(f"'{p_ticker}' 가격 데이터를 불러오지 못했습니다.")
-        else:
-            p_close = p_df["Close"].dropna()
-            latest_price = float(p_close.iloc[-1])
-            latest_date = p_close.index[-1]
-            ma20 = float(p_close.iloc[-20:].mean()) if len(p_close) >= 20 else None
-            cur_label = f"{name_of(p_ticker, names)} ({p_ticker})"
-
-            st.markdown(f"**{cur_label}**")
-            if p_is_krw:
-                st.caption(f"현재가 {latest_price:,.0f}원 ({latest_date:%Y-%m-%d} 종가)")
+            if p_df.empty:
+                st.warning(f"'{p_ticker}' 가격 데이터를 불러오지 못했습니다.")
             else:
-                st.caption(f"현재가 ${latest_price:,.2f} ({latest_date:%Y-%m-%d} 종가)")
+                p_close = p_df["Close"].dropna()
+                latest_price = float(p_close.iloc[-1])
+                latest_date = p_close.index[-1]
+                ma20 = float(p_close.iloc[-20:].mean()) if len(p_close) >= 20 else None
+                cur_label = f"{name_of(p_ticker, names)} ({p_ticker})"
 
-            buy_price = st.number_input(
-                "매수가", min_value=0.0,
-                value=round(latest_price, 0) if p_is_krw else round(latest_price, 2),
-                step=(100.0 if p_is_krw else 0.5), key=f"plan_price_{p_ticker}",
-            )
-
-            # 투자자산: 원화/달러 종목을 오가도 서로 다른 통화의 숫자가 섞이지 않도록
-            # 통화별로 세션에 값을 따로 유지한다(관심목록처럼 Gist에 영구 저장하진
-            # 않고, 세션이 유지되는 동안만 — 다시 열 때마다 남아있길 원하면 알려달라).
-            asset_key = "plan_asset_krw" if p_is_krw else "plan_asset_usd"
-            if asset_key not in st.session_state:
-                st.session_state[asset_key] = 100_000_000.0 if p_is_krw else 100_000.0
-
-            ac1, ac2 = st.columns([3, 2])
-            with ac1:
-                asset = st.number_input(
-                    f"투자자산 ({'원' if p_is_krw else 'USD'})", min_value=0.0,
-                    step=(1_000_000.0 if p_is_krw else 1_000.0),
-                    format="%.0f" if p_is_krw else "%.2f", key=asset_key,
-                )
-            with ac2:
-                st.markdown("<div style='height:1.8em'></div>", unsafe_allow_html=True)
-                if asset > 0:
-                    st.caption(f"= {_krw_abbrev(asset)}" if p_is_krw else f"= ${asset:,.2f}")
-            asset_valid = asset > 0
-            if not asset_valid:
-                st.error("투자자산은 0보다 큰 값을 입력해주세요.")
-
-            mode = st.radio("방식", ["디폴트", "직접 입력"], horizontal=True, key="plan_mode")
-            # 디폴트: 1%/7%/3배 고정, 투자자산만 입력. 직접 입력: 네 값 모두 조정 가능.
-            if mode == "직접 입력":
-                q1, q2, q3 = st.columns(3)
-                loss_pct = q1.number_input(
-                    "최대손실(%)", min_value=0.1, value=1.0, step=0.1, key="plan_loss") / 100
-                stop_pct = q2.number_input(
-                    "손절폭(%)", min_value=0.1, value=7.0, step=0.5, key="plan_stop") / 100
-                tp_mult = q3.number_input(
-                    "익절배수", min_value=0.1, value=3.0, step=0.5, key="plan_mult")
-            else:
-                loss_pct, stop_pct, tp_mult = 0.01, 0.07, 3.0
-
-            # 불타기(분할 추가매수): 원 사이트의 정확한 규칙이 확인되지 않아, 우선
-            # 총 매수금액을 1차 60% / 2차 40%로 나누는 임시 규칙으로 구현했다.
-            # 규칙이 확인되면 아래 pyramiding 분기만 교체하면 된다.
-            pyramiding = st.radio("불타기", ["안 함", "함"], horizontal=True, key="plan_pyramid")
-
-            if asset_valid and st.button("계획 보기", type="primary"):
-                st.session_state.plan_computed = True
-
-            if asset_valid and st.session_state.get("plan_computed"):
-                plan = _position_sizing_plan(buy_price, asset, loss_pct, stop_pct, tp_mult)
-                if plan is None or plan["shares"] <= 0:
-                    st.warning("손절폭·매수가 조합상 매수 가능 주식 수가 0입니다. 파라미터를 확인해주세요.")
+                st.markdown(f"**{cur_label}**")
+                if p_is_krw:
+                    st.caption(f"현재가 {latest_price:,.0f}원 ({latest_date:%Y-%m-%d} 종가)")
                 else:
-                    if p_is_krw:
-                        header_price = f"{buy_price:,.0f}원"
-                        amt_str = f"{_round_half_up(plan['buy_amount']):,}원 ({_krw_abbrev(plan['buy_amount'])})"
-                        loss_str = f"{_round_half_up(plan['worst_loss']):,}원"
-                        stop_str = f"{math.floor(plan['stop_price']):,}원"  # 손절가는 원 단위 버림
-                        tp1_str = f"{_round_half_up(plan['tp1_price']):,}원"
-                        ma_str = f"{ma20:,.0f}원" if ma20 is not None else "—"
+                    st.caption(f"현재가 ${latest_price:,.2f} ({latest_date:%Y-%m-%d} 종가)")
+
+                buy_price = st.number_input(
+                    "매수가", min_value=0.0,
+                    value=round(latest_price, 0) if p_is_krw else round(latest_price, 2),
+                    step=(100.0 if p_is_krw else 0.5), key=f"plan_price_{p_ticker}",
+                )
+
+                # 투자자산: 원화/달러 종목을 오가도 서로 다른 통화의 숫자가 섞이지 않도록
+                # 통화별로 세션에 값을 따로 유지한다(관심목록처럼 Gist에 영구 저장하진
+                # 않고, 세션이 유지되는 동안만 — 다시 열 때마다 남아있길 원하면 알려달라).
+                asset_key = "plan_asset_krw" if p_is_krw else "plan_asset_usd"
+                if asset_key not in st.session_state:
+                    st.session_state[asset_key] = 100_000_000.0 if p_is_krw else 100_000.0
+
+                ac1, ac2 = st.columns([3, 2])
+                with ac1:
+                    asset = st.number_input(
+                        f"투자자산 ({'원' if p_is_krw else 'USD'})", min_value=0.0,
+                        step=(1_000_000.0 if p_is_krw else 1_000.0),
+                        format="%.0f" if p_is_krw else "%.2f", key=asset_key,
+                    )
+                with ac2:
+                    st.markdown("<div style='height:1.8em'></div>", unsafe_allow_html=True)
+                    if asset > 0:
+                        st.caption(f"= {_krw_abbrev(asset)}" if p_is_krw else f"= ${asset:,.2f}")
+                asset_valid = asset > 0
+                if not asset_valid:
+                    st.error("투자자산은 0보다 큰 값을 입력해주세요.")
+
+                mode = st.radio("방식", ["디폴트", "직접 입력"], horizontal=True, key="plan_mode")
+                # 디폴트: 1%/7%/3배 고정, 투자자산만 입력. 직접 입력: 네 값 모두 조정 가능.
+                if mode == "직접 입력":
+                    q1, q2, q3 = st.columns(3)
+                    loss_pct = q1.number_input(
+                        "최대손실(%)", min_value=0.1, value=1.0, step=0.1, key="plan_loss") / 100
+                    stop_pct = q2.number_input(
+                        "손절폭(%)", min_value=0.1, value=7.0, step=0.5, key="plan_stop") / 100
+                    tp_mult = q3.number_input(
+                        "익절배수", min_value=0.1, value=3.0, step=0.5, key="plan_mult")
+                else:
+                    loss_pct, stop_pct, tp_mult = 0.01, 0.07, 3.0
+
+                # 불타기(분할 추가매수): 원 사이트의 정확한 규칙이 확인되지 않아, 우선
+                # 총 매수금액을 1차 60% / 2차 40%로 나누는 임시 규칙으로 구현했다.
+                # 규칙이 확인되면 아래 pyramiding 분기만 교체하면 된다.
+                pyramiding = st.radio("불타기", ["안 함", "함"], horizontal=True, key="plan_pyramid")
+
+                if asset_valid and st.button("계획 보기", type="primary"):
+                    st.session_state.plan_computed = True
+
+                if asset_valid and st.session_state.get("plan_computed"):
+                    plan = _position_sizing_plan(buy_price, asset, loss_pct, stop_pct, tp_mult)
+                    if plan is None or plan["shares"] <= 0:
+                        st.warning("손절폭·매수가 조합상 매수 가능 주식 수가 0입니다. 파라미터를 확인해주세요.")
                     else:
-                        header_price = f"${buy_price:,.2f}"
-                        amt_str = f"${plan['buy_amount']:,.2f}"
-                        loss_str = f"${plan['worst_loss']:,.2f}"
-                        stop_str = f"${plan['stop_price']:,.2f}"
-                        tp1_str = f"${plan['tp1_price']:,.2f}"
-                        ma_str = f"${ma20:,.2f}" if ma20 is not None else "—"
-
-                    st.markdown(f"##### {name_of(p_ticker, names)} · 매수가 {header_price} 기준 계획입니다")
-
-                    st.markdown(f"**① 매수 {amt_str} · {plan['shares']}주**")
-                    st.caption(f"최악의 경우 손실 {loss_str} (자산의 {plan['worst_loss_pct']:.1%})")
-
-                    if pyramiding == "함":
-                        shares_1 = int(plan["shares"] * 0.6)
-                        shares_2 = plan["shares"] - shares_1
-                        amt_1, amt_2 = buy_price * shares_1, buy_price * shares_2
                         if p_is_krw:
-                            st.caption(
-                                f"불타기(임시 규칙): 1차 {amt_1:,.0f}원({shares_1}주, 60%) · "
-                                f"2차 {amt_2:,.0f}원({shares_2}주, 40%)")
+                            header_price = f"{buy_price:,.0f}원"
+                            amt_str = f"{_round_half_up(plan['buy_amount']):,}원 ({_krw_abbrev(plan['buy_amount'])})"
+                            loss_str = f"{_round_half_up(plan['worst_loss']):,}원"
+                            stop_str = f"{math.floor(plan['stop_price']):,}원"  # 손절가는 원 단위 버림
+                            tp1_str = f"{_round_half_up(plan['tp1_price']):,}원"
+                            ma_str = f"{ma20:,.0f}원" if ma20 is not None else "—"
                         else:
-                            st.caption(
-                                f"불타기(임시 규칙): 1차 ${amt_1:,.2f}({shares_1}주, 60%) · "
-                                f"2차 ${amt_2:,.2f}({shares_2}주, 40%)")
+                            header_price = f"${buy_price:,.2f}"
+                            amt_str = f"${plan['buy_amount']:,.2f}"
+                            loss_str = f"${plan['worst_loss']:,.2f}"
+                            stop_str = f"${plan['stop_price']:,.2f}"
+                            tp1_str = f"${plan['tp1_price']:,.2f}"
+                            ma_str = f"${ma20:,.2f}" if ma20 is not None else "—"
 
-                    st.markdown(f"**② 손절 (-{stop_pct:.0%}) {stop_str}**")
-                    st.caption("여기 오면 무조건 전량 매도")
+                        st.markdown(f"##### {name_of(p_ticker, names)} · 매수가 {header_price} 기준 계획입니다")
 
-                    st.markdown(f"**③ 익절 1차 (+{stop_pct * tp_mult:.0%}) {tp1_str}**")
-                    st.caption("여기 오면 절반 매도")
+                        st.markdown(f"**① 매수 {amt_str} · {plan['shares']}주**")
+                        st.caption(f"최악의 경우 손실 {loss_str} (자산의 {plan['worst_loss_pct']:.1%})")
 
-                    st.markdown("**④ 익절 2차: 20일 이평 이탈 시 나머지 전량 매도**")
-                    st.caption(f"오늘 기준 20일 이평 {ma_str} · ⚠️ 이 값은 매일 변합니다")
+                        if pyramiding == "함":
+                            shares_1 = int(plan["shares"] * 0.6)
+                            shares_2 = plan["shares"] - shares_1
+                            amt_1, amt_2 = buy_price * shares_1, buy_price * shares_2
+                            if p_is_krw:
+                                st.caption(
+                                    f"불타기(임시 규칙): 1차 {amt_1:,.0f}원({shares_1}주, 60%) · "
+                                    f"2차 {amt_2:,.0f}원({shares_2}주, 40%)")
+                            else:
+                                st.caption(
+                                    f"불타기(임시 규칙): 1차 ${amt_1:,.2f}({shares_1}주, 60%) · "
+                                    f"2차 ${amt_2:,.2f}({shares_2}주, 40%)")
 
-                    st.caption("주식 수는 소수점을 버립니다. 세금·수수료는 반영하지 않은 숫자입니다.")
+                        st.markdown(f"**② 손절 (-{stop_pct:.0%}) {stop_str}**")
+                        st.caption("여기 오면 무조건 전량 매도")
 
-    with sub_season:
-        sdf, smeta = load_seasonality()
-        if sdf.empty:
-            st.warning(
-                "계절성 데이터가 없습니다. 로컬에서 `python scanner/seasonality_scan.py`를 "
-                "먼저 실행해 `data/seasonality.parquet`를 생성해주세요."
-            )
-        else:
-            as_of = pd.Timestamp(smeta.get("as_of"))
-            today_ts = pd.Timestamp(datetime.today().date())
-            days_old = (today_ts - as_of).days
-            stale = days_old > SEASONALITY_STALE_DAYS
-            win_thr = smeta.get("win_rate_threshold", 0.9)
-            date_label = f"{as_of:%Y-%m-%d} ({days_old}일 경과)"
-            status = (
-                f"계절성 데이터 기준일 {date_label} · 월간 갱신 · "
-                f"오늘 기준 매수창(-{BUY_WINDOW_BEFORE}~+{BUY_WINDOW_AFTER}일) · 승률≥{win_thr:.0%}"
-            )
-            if stale:
-                st.warning(f"⚠️ {status} — 갱신이 오래되어 재실행을 권장합니다.")
-            else:
-                st.caption(status)
+                        st.markdown(f"**③ 익절 1차 (+{stop_pct * tp_mult:.0%}) {tp1_str}**")
+                        st.caption("여기 오면 절반 매도")
 
-            work = sdf.copy()
-            # (월, 월중n번째영업일) 조합 수는 최대 12*23=276개로 한정되므로
-            # 조합별로 한 번만 계산해 매핑한다(행 단위 apply보다 훨씬 빠름).
-            pairs = work[["month", "tdom"]].drop_duplicates()
-            occ_map = {
-                (m, d): _nearest_occurrence(m, d, today_ts)
-                for m, d in pairs.itertuples(index=False)
-            }
-            work["entry_date"] = [occ_map[(m, d)] for m, d in zip(work["month"], work["tdom"])]
-            work = work.dropna(subset=["entry_date"])
-            # 매수창은 "오늘"을 기준으로 잡는다(스캔 기준일 as_of가 아니라 앱을 보는
-            # 시점) — entry_date가 [오늘-BUY_WINDOW_BEFORE, 오늘+BUY_WINDOW_AFTER]
-            # 안에 들어오는 종목만 남긴다. 예전엔 반대로 entry_date를 기준으로 창을
-            # 잡아(entry-2~entry+5 안에 오늘이 들어오는지) 사실상 [오늘-5~오늘+2]를
-            # 보는 것과 같아져, 앞뒤가 뒤집힌 채로 필터링되고 있었다.
-            window_start = today_ts - pd.Timedelta(days=BUY_WINDOW_BEFORE)
-            window_end = today_ts + pd.Timedelta(days=BUY_WINDOW_AFTER)
-            work = work[(work["entry_date"] >= window_start) & (work["entry_date"] <= window_end)].copy()
-            work["exit_date"] = work.apply(
-                lambda r: r["entry_date"] + pd.tseries.offsets.BDay(int(r["hold_days"])), axis=1)
+                        st.markdown("**④ 익절 2차: 20일 이평 이탈 시 나머지 전량 매도**")
+                        st.caption(f"오늘 기준 20일 이평 {ma_str} · ⚠️ 이 값은 매일 변합니다")
 
-            # 필터 옵션은 실제 존재하는 값만 구성 (데이터 없는 필터는 만들지 않음)
-            f1, f2, f3, f4 = st.columns(4)
-            countries = ["전체"] + sorted(work["country"].dropna().unique().tolist())
-            f_country = f1.selectbox("국가", countries, key="season_country")
-            classes = ["전체"] + sorted(work["asset_class"].dropna().unique().tolist())
-            f_class = f2.selectbox("자산군", classes, key="season_class")
-            f_cap = f3.selectbox("시총", list(MARKET_CAP_BUCKETS.keys()), key="season_cap")
+                        st.caption("주식 수는 소수점을 버립니다. 세금·수수료는 반영하지 않은 숫자입니다.")
 
-            if f_country != "전체":
-                work = work[work["country"] == f_country]
-            if f_class != "전체":
-                work = work[work["asset_class"] == f_class]
-            if f_cap != "전체":
-                work = work[_market_cap_bucket_mask(work["market_cap_usd"], f_cap)]
-
-            # 섹터는 국가별로 서로 다른 원 체계를 그대로 쓴다(한국 KSIC 업종 / 미국 GICS).
-            # "전체" 국가에서는 두 체계가 섞이므로 "[국가] 섹터명"으로 구분해 보여준다.
-            sec_df = work.dropna(subset=["sector"])
-            if f_country == "전체":
-                sector_options = ["전체"] + sorted(
-                    f"[{c}] {s}" for c, s in
-                    sec_df[["country", "sector"]].drop_duplicates().itertuples(index=False))
-            else:
-                sector_options = ["전체"] + sorted(sec_df["sector"].dropna().unique().tolist())
-            f_sector = f4.selectbox("섹터", sector_options, key="season_sector",
-                                     disabled=(len(sector_options) == 1))
-            if f_sector != "전체":
-                if f_country == "전체":
-                    sel_country, sel_sector = f_sector[1:].split("] ", 1)
-                    work = work[(work["country"] == sel_country) & (work["sector"] == sel_sector)]
-                else:
-                    work = work[work["sector"] == f_sector]
-
-            # 티커 기준 중복 제거(승률 -> 평균수익률 -> 표본연수 순 최상위 1행만) —
-            # 같은 종목이 진입일만 다른 여러 (월,월중n번째거래일,보유기간) 조합으로
-            # 동시에 매수창에 들어오면(예: Ares Management, Gartner) 한 번만 보여준다.
-            work = work.sort_values(["win_rate", "avg_return", "n_years"], ascending=[False, False, False])
-            work = work.drop_duplicates(subset="ticker", keep="first")
-
-            sort_label = st.selectbox(
-                "정렬", ["승률 높은순", "평균수익률 높은순", "진입 임박순"], key="season_sort")
-            if sort_label == "승률 높은순":
-                work = work.sort_values(["win_rate", "avg_return"], ascending=[False, False])
-            elif sort_label == "평균수익률 높은순":
-                work = work.sort_values("avg_return", ascending=False)
-            else:
-                work["_days_away"] = (work["entry_date"] - today_ts).abs()
-                work = work.sort_values("_days_away")
-
-            work = work.reset_index(drop=True)
-            st.caption(f"{len(work)}종목 · {sort_label}")
-
-            if work.empty:
-                st.info("현재 매수창에 들어온 종목이 없습니다.")
-            else:
-                rows = []
-                for i, r in work.iterrows():
-                    rows.append({
-                        "순위": i + 1,
-                        "종목": f"{r['name']} ({r['ticker']})",
-                        "국가": r["country"],
-                        "섹터": r["sector"] or "미분류",
-                        "매수 시기": (
-                            f"{r['entry_date']:%m/%d}~{r['exit_date']:%m/%d} "
-                            f"({int(r['hold_days'])}일 보유)"
-                        ),
-                        "승률": r["win_rate"],
-                        "평균수익률": r["avg_return"],
-                        "표본": f"{int(r['n_years'])}/{smeta.get('lookback_years', 10)}년",
-                    })
-                disp = pd.DataFrame(rows)
-                st.dataframe(
-                    disp.style.format({"승률": "{:.0%}", "평균수익률": "{:+.1%}"}),
-                    use_container_width=True, hide_index=True,
-                    height=min(60 + 35 * len(disp), 700),
+        with sub_season:
+            sdf, smeta = load_seasonality()
+            if sdf.empty:
+                st.warning(
+                    "계절성 데이터가 없습니다. 로컬에서 `python scanner/seasonality_scan.py`를 "
+                    "먼저 실행해 `data/seasonality.parquet`를 생성해주세요."
                 )
+            else:
+                as_of = pd.Timestamp(smeta.get("as_of"))
+                today_ts = pd.Timestamp(datetime.today().date())
+                days_old = (today_ts - as_of).days
+                stale = days_old > SEASONALITY_STALE_DAYS
+                win_thr = smeta.get("win_rate_threshold", 0.9)
+                date_label = f"{as_of:%Y-%m-%d} ({days_old}일 경과)"
+                status = (
+                    f"계절성 데이터 기준일 {date_label} · 월간 갱신 · "
+                    f"오늘 기준 매수창(-{BUY_WINDOW_BEFORE}~+{BUY_WINDOW_AFTER}일) · 승률≥{win_thr:.0%}"
+                )
+                if stale:
+                    st.warning(f"⚠️ {status} — 갱신이 오래되어 재실행을 권장합니다.")
+                else:
+                    st.caption(status)
+
+                work = sdf.copy()
+                # (월, 월중n번째영업일) 조합 수는 최대 12*23=276개로 한정되므로
+                # 조합별로 한 번만 계산해 매핑한다(행 단위 apply보다 훨씬 빠름).
+                pairs = work[["month", "tdom"]].drop_duplicates()
+                occ_map = {
+                    (m, d): _nearest_occurrence(m, d, today_ts)
+                    for m, d in pairs.itertuples(index=False)
+                }
+                work["entry_date"] = [occ_map[(m, d)] for m, d in zip(work["month"], work["tdom"])]
+                work = work.dropna(subset=["entry_date"])
+                # 매수창은 "오늘"을 기준으로 잡는다(스캔 기준일 as_of가 아니라 앱을 보는
+                # 시점) — entry_date가 [오늘-BUY_WINDOW_BEFORE, 오늘+BUY_WINDOW_AFTER]
+                # 안에 들어오는 종목만 남긴다. 예전엔 반대로 entry_date를 기준으로 창을
+                # 잡아(entry-2~entry+5 안에 오늘이 들어오는지) 사실상 [오늘-5~오늘+2]를
+                # 보는 것과 같아져, 앞뒤가 뒤집힌 채로 필터링되고 있었다.
+                window_start = today_ts - pd.Timedelta(days=BUY_WINDOW_BEFORE)
+                window_end = today_ts + pd.Timedelta(days=BUY_WINDOW_AFTER)
+                work = work[(work["entry_date"] >= window_start) & (work["entry_date"] <= window_end)].copy()
+                work["exit_date"] = work.apply(
+                    lambda r: r["entry_date"] + pd.tseries.offsets.BDay(int(r["hold_days"])), axis=1)
+
+                # 필터 옵션은 실제 존재하는 값만 구성 (데이터 없는 필터는 만들지 않음)
+                f1, f2, f3, f4 = st.columns(4)
+                countries = ["전체"] + sorted(work["country"].dropna().unique().tolist())
+                f_country = f1.selectbox("국가", countries, key="season_country")
+                classes = ["전체"] + sorted(work["asset_class"].dropna().unique().tolist())
+                f_class = f2.selectbox("자산군", classes, key="season_class")
+                f_cap = f3.selectbox("시총", list(MARKET_CAP_BUCKETS.keys()), key="season_cap")
+
+                if f_country != "전체":
+                    work = work[work["country"] == f_country]
+                if f_class != "전체":
+                    work = work[work["asset_class"] == f_class]
+                if f_cap != "전체":
+                    work = work[_market_cap_bucket_mask(work["market_cap_usd"], f_cap)]
+
+                # 섹터는 국가별로 서로 다른 원 체계를 그대로 쓴다(한국 KSIC 업종 / 미국 GICS).
+                # "전체" 국가에서는 두 체계가 섞이므로 "[국가] 섹터명"으로 구분해 보여준다.
+                sec_df = work.dropna(subset=["sector"])
+                if f_country == "전체":
+                    sector_options = ["전체"] + sorted(
+                        f"[{c}] {s}" for c, s in
+                        sec_df[["country", "sector"]].drop_duplicates().itertuples(index=False))
+                else:
+                    sector_options = ["전체"] + sorted(sec_df["sector"].dropna().unique().tolist())
+                f_sector = f4.selectbox("섹터", sector_options, key="season_sector",
+                                         disabled=(len(sector_options) == 1))
+                if f_sector != "전체":
+                    if f_country == "전체":
+                        sel_country, sel_sector = f_sector[1:].split("] ", 1)
+                        work = work[(work["country"] == sel_country) & (work["sector"] == sel_sector)]
+                    else:
+                        work = work[work["sector"] == f_sector]
+
+                # 티커 기준 중복 제거(승률 -> 평균수익률 -> 표본연수 순 최상위 1행만) —
+                # 같은 종목이 진입일만 다른 여러 (월,월중n번째거래일,보유기간) 조합으로
+                # 동시에 매수창에 들어오면(예: Ares Management, Gartner) 한 번만 보여준다.
+                work = work.sort_values(["win_rate", "avg_return", "n_years"], ascending=[False, False, False])
+                work = work.drop_duplicates(subset="ticker", keep="first")
+
+                sort_label = st.selectbox(
+                    "정렬", ["승률 높은순", "평균수익률 높은순", "진입 임박순"], key="season_sort")
+                if sort_label == "승률 높은순":
+                    work = work.sort_values(["win_rate", "avg_return"], ascending=[False, False])
+                elif sort_label == "평균수익률 높은순":
+                    work = work.sort_values("avg_return", ascending=False)
+                else:
+                    work["_days_away"] = (work["entry_date"] - today_ts).abs()
+                    work = work.sort_values("_days_away")
+
+                work = work.reset_index(drop=True)
+                st.caption(f"{len(work)}종목 · {sort_label}")
+
+                if work.empty:
+                    st.info("현재 매수창에 들어온 종목이 없습니다.")
+                else:
+                    rows = []
+                    for i, r in work.iterrows():
+                        rows.append({
+                            "순위": i + 1,
+                            "종목": f"{r['name']} ({r['ticker']})",
+                            "국가": r["country"],
+                            "섹터": r["sector"] or "미분류",
+                            "매수 시기": (
+                                f"{r['entry_date']:%m/%d}~{r['exit_date']:%m/%d} "
+                                f"({int(r['hold_days'])}일 보유)"
+                            ),
+                            "승률": r["win_rate"],
+                            "평균수익률": r["avg_return"],
+                            "표본": f"{int(r['n_years'])}/{smeta.get('lookback_years', 10)}년",
+                        })
+                    disp = pd.DataFrame(rows)
+                    st.dataframe(
+                        disp.style.format({"승률": "{:.0%}", "평균수익률": "{:+.1%}"}),
+                        use_container_width=True, hide_index=True,
+                        height=min(60 + 35 * len(disp), 700),
+                    )
 
 # =====================  이동평균  ===========================================
 with tab6:
-    st.subheader("📏 이동평균 대비 위치")
-    st.caption("등록한 지수·종목의 현재가가 각 이동평균선 위/아래 어디에 있는지 한눈에 봅니다.")
+    if tab6.open:
+        st.subheader("📏 이동평균 대비 위치")
+        st.caption("등록한 지수·종목의 현재가가 각 이동평균선 위/아래 어디에 있는지 한눈에 봅니다.")
 
-    with st.expander("⚙️ 지수·이동평균 목록 관리"):
-        mc1, mc2 = st.columns(2)
-        with mc1:
-            st.markdown("**지수·종목 목록**")
-            cur_items = st.session_state.ma_indices
-            if cur_items:
-                idx_labels = [f"{it['label']} ({it['symbol']})" for it in cur_items]
-                idx_remove = st.multiselect("삭제할 항목", idx_labels, key="ma_idx_remove_sel")
-                if st.button("선택 삭제", key="ma_idx_remove_btn") and idx_remove:
-                    remove_syms = {s.rsplit("(", 1)[-1].rstrip(")") for s in idx_remove}
-                    st.session_state.ma_indices = [
-                        it for it in cur_items if it["symbol"] not in remove_syms]
-                    save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
-                    st.rerun()
-            else:
-                st.caption("등록된 지수·종목이 없습니다.")
-            with st.form("ma_idx_add_form", clear_on_submit=True):
-                new_sym = st.text_input("심볼 (예: KS11, AAPL, 005930)")
-                new_label = st.text_input("표시 이름 (비우면 자동)")
-                idx_add_sub = st.form_submit_button("추가")
-            if idx_add_sub and new_sym.strip():
-                sym = normalize(new_sym.strip())
-                if sym in {it["symbol"] for it in st.session_state.ma_indices}:
-                    st.warning(f"이미 등록된 심볼입니다: {sym}")
-                elif not _validate_ma_symbol(sym):
-                    st.error(f"'{sym}' 데이터를 조회할 수 없습니다 — 심볼을 확인해주세요.")
+        with st.expander("⚙️ 지수·이동평균 목록 관리"):
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                st.markdown("**지수·종목 목록**")
+                cur_items = st.session_state.ma_indices
+                if cur_items:
+                    idx_labels = [f"{it['label']} ({it['symbol']})" for it in cur_items]
+                    idx_remove = st.multiselect("삭제할 항목", idx_labels, key="ma_idx_remove_sel")
+                    if st.button("선택 삭제", key="ma_idx_remove_btn") and idx_remove:
+                        remove_syms = {s.rsplit("(", 1)[-1].rstrip(")") for s in idx_remove}
+                        st.session_state.ma_indices = [
+                            it for it in cur_items if it["symbol"] not in remove_syms]
+                        save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
+                        st.rerun()
                 else:
-                    label = new_label.strip() or names.get(sym) or sym
-                    st.session_state.ma_indices = st.session_state.ma_indices + [
-                        {"symbol": sym, "label": label}]
-                    save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
-                    st.success(f"'{label}({sym})' 추가됨")
-                    st.rerun()
-        with mc2:
-            st.markdown("**이동평균 기간(일)**")
-            cur_periods_mgmt = st.session_state.ma_periods
-            if cur_periods_mgmt:
-                period_remove = st.multiselect(
-                    "삭제할 기간", sorted(cur_periods_mgmt), key="ma_period_remove_sel")
-                if st.button("선택 삭제", key="ma_period_remove_btn") and period_remove:
-                    st.session_state.ma_periods = [
-                        p for p in cur_periods_mgmt if p not in period_remove]
-                    save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
-                    st.rerun()
-            else:
-                st.caption("등록된 이동평균이 없습니다.")
-            with st.form("ma_period_add_form", clear_on_submit=True):
-                new_period = st.number_input(
-                    "기간(일)", min_value=MA_PERIOD_MIN, max_value=MA_PERIOD_MAX, value=20, step=1)
-                period_add_sub = st.form_submit_button("추가")
-            if period_add_sub:
-                np_ = int(new_period)
-                if np_ in st.session_state.ma_periods:
-                    st.warning(f"이미 등록된 기간입니다: {np_}일")
+                    st.caption("등록된 지수·종목이 없습니다.")
+                with st.form("ma_idx_add_form", clear_on_submit=True):
+                    new_sym = st.text_input("심볼 (예: KS11, AAPL, 005930)")
+                    new_label = st.text_input("표시 이름 (비우면 자동)")
+                    idx_add_sub = st.form_submit_button("추가")
+                if idx_add_sub and new_sym.strip():
+                    sym = normalize(new_sym.strip())
+                    if sym in {it["symbol"] for it in st.session_state.ma_indices}:
+                        st.warning(f"이미 등록된 심볼입니다: {sym}")
+                    elif not _validate_ma_symbol(sym):
+                        st.error(f"'{sym}' 데이터를 조회할 수 없습니다 — 심볼을 확인해주세요.")
+                    else:
+                        label = new_label.strip() or names.get(sym) or sym
+                        st.session_state.ma_indices = st.session_state.ma_indices + [
+                            {"symbol": sym, "label": label}]
+                        save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
+                        st.success(f"'{label}({sym})' 추가됨")
+                        st.rerun()
+            with mc2:
+                st.markdown("**이동평균 기간(일)**")
+                cur_periods_mgmt = st.session_state.ma_periods
+                if cur_periods_mgmt:
+                    period_remove = st.multiselect(
+                        "삭제할 기간", sorted(cur_periods_mgmt), key="ma_period_remove_sel")
+                    if st.button("선택 삭제", key="ma_period_remove_btn") and period_remove:
+                        st.session_state.ma_periods = [
+                            p for p in cur_periods_mgmt if p not in period_remove]
+                        save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
+                        st.rerun()
                 else:
-                    st.session_state.ma_periods = sorted(st.session_state.ma_periods + [np_])
-                    save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
-                    st.rerun()
+                    st.caption("등록된 이동평균이 없습니다.")
+                with st.form("ma_period_add_form", clear_on_submit=True):
+                    new_period = st.number_input(
+                        "기간(일)", min_value=MA_PERIOD_MIN, max_value=MA_PERIOD_MAX, value=20, step=1)
+                    period_add_sub = st.form_submit_button("추가")
+                if period_add_sub:
+                    np_ = int(new_period)
+                    if np_ in st.session_state.ma_periods:
+                        st.warning(f"이미 등록된 기간입니다: {np_}일")
+                    else:
+                        st.session_state.ma_periods = sorted(st.session_state.ma_periods + [np_])
+                        save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
+                        st.rerun()
 
-        if st.button("🔄 기본값으로 초기화", key="ma_reset_btn"):
-            st.session_state.ma_indices = DEFAULT_MA_INDICES.copy()
-            st.session_state.ma_periods = DEFAULT_MA_PERIODS.copy()
-            save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
-            save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
-            st.rerun()
+            if st.button("🔄 기본값으로 초기화", key="ma_reset_btn"):
+                st.session_state.ma_indices = DEFAULT_MA_INDICES.copy()
+                st.session_state.ma_periods = DEFAULT_MA_PERIODS.copy()
+                save_ma_indices(st.session_state.ma_indices, st.session_state.ma_indices_mode)
+                save_ma_periods(st.session_state.ma_periods, st.session_state.ma_periods_mode)
+                st.rerun()
 
-    ma_indices = st.session_state.ma_indices
-    ma_periods = sorted(st.session_state.ma_periods)
+        ma_indices = st.session_state.ma_indices
+        ma_periods = sorted(st.session_state.ma_periods)
 
-    if not ma_indices:
-        st.info("등록된 지수·종목이 없습니다. 위 '지수·이동평균 목록 관리'에서 추가해주세요.")
-    elif not ma_periods:
-        st.info("등록된 이동평균 기간이 없습니다. 위 '지수·이동평균 목록 관리'에서 추가해주세요.")
-    else:
-        with st.spinner("시세 조회 중..."):
-            with ThreadPoolExecutor(max_workers=8) as exe:
-                fetch_results = list(exe.map(
-                    lambda it: (it, _fetch_ma_row(it["symbol"], tuple(ma_periods))), ma_indices))
-
-        period_cols = [f"{p}일선" for p in ma_periods]
-        rows, failed = [], []
-        for it, data in fetch_results:
-            if data is None:
-                failed.append(it["label"])
-                continue
-            gaps, above, valid = {}, 0, 0
-            for p in ma_periods:
-                g = data["gaps"].get(p)
-                gaps[f"{p}일선"] = g
-                if g is not None:
-                    valid += 1
-                    if g > 0:
-                        above += 1
-            if valid == 0:
-                failed.append(it["label"])
-                continue
-            rows.append({
-                "지수": it["label"], "현재가": data["price"], "1일등락률": data["day_ret"],
-                **gaps, "요약": f"{valid}개 중 {above}개 위",
-                "_above": above, "_valid": valid, "_last_date": data["last_date"],
-            })
-
-        if failed:
-            st.warning("조회 실패로 표에서 제외됨: " + ", ".join(failed))
-
-        if not rows:
-            st.info("표시할 데이터가 없습니다.")
+        if not ma_indices:
+            st.info("등록된 지수·종목이 없습니다. 위 '지수·이동평균 목록 관리'에서 추가해주세요.")
+        elif not ma_periods:
+            st.info("등록된 이동평균 기간이 없습니다. 위 '지수·이동평균 목록 관리'에서 추가해주세요.")
         else:
-            df_ma = pd.DataFrame(rows)
-            as_of = df_ma["_last_date"].max()
-            st.caption(f"데이터 기준일: {as_of:%Y-%m-%d}")
+            with st.spinner("시세 조회 중..."):
+                with ThreadPoolExecutor(max_workers=8) as exe:
+                    fetch_results = list(exe.map(
+                        lambda it: (it, _fetch_ma_row(it["symbol"], tuple(ma_periods))), ma_indices))
 
-            sort_label = st.selectbox("정렬", ["강한 순", "약한 순", "이름순"], key="ma_sort")
-            if sort_label == "강한 순":
-                df_ma = df_ma.sort_values(["_above", "_valid"], ascending=[False, False])
-            elif sort_label == "약한 순":
-                df_ma = df_ma.sort_values(["_above", "_valid"], ascending=[True, False])
+            period_cols = [f"{p}일선" for p in ma_periods]
+            rows, failed = [], []
+            for it, data in fetch_results:
+                if data is None:
+                    failed.append(it["label"])
+                    continue
+                gaps, above, valid = {}, 0, 0
+                for p in ma_periods:
+                    g = data["gaps"].get(p)
+                    gaps[f"{p}일선"] = g
+                    if g is not None:
+                        valid += 1
+                        if g > 0:
+                            above += 1
+                if valid == 0:
+                    failed.append(it["label"])
+                    continue
+                rows.append({
+                    "지수": it["label"], "현재가": data["price"], "1일등락률": data["day_ret"],
+                    **gaps, "요약": f"{valid}개 중 {above}개 위",
+                    "_above": above, "_valid": valid, "_last_date": data["last_date"],
+                })
+
+            if failed:
+                st.warning("조회 실패로 표에서 제외됨: " + ", ".join(failed))
+
+            if not rows:
+                st.info("표시할 데이터가 없습니다.")
             else:
-                df_ma = df_ma.sort_values("지수")
-            df_ma = df_ma.reset_index(drop=True)
+                df_ma = pd.DataFrame(rows)
+                as_of = df_ma["_last_date"].max()
+                st.caption(f"데이터 기준일: {as_of:%Y-%m-%d}")
 
-            display_cols = ["지수", "현재가", "1일등락률"] + period_cols + ["요약"]
-            disp = df_ma[display_cols]
+                sort_label = st.selectbox("정렬", ["강한 순", "약한 순", "이름순"], key="ma_sort")
+                if sort_label == "강한 순":
+                    df_ma = df_ma.sort_values(["_above", "_valid"], ascending=[False, False])
+                elif sort_label == "약한 순":
+                    df_ma = df_ma.sort_values(["_above", "_valid"], ascending=[True, False])
+                else:
+                    df_ma = df_ma.sort_values("지수")
+                df_ma = df_ma.reset_index(drop=True)
 
-            def _fmt_gap(v):
-                if pd.isna(v):
-                    return "—"
-                return f"{'▲' if v >= 0 else '▼'} {v:+.1%}"
+                display_cols = ["지수", "현재가", "1일등락률"] + period_cols + ["요약"]
+                disp = df_ma[display_cols]
 
-            styled = disp.style.format(
-                {"현재가": "{:,.2f}", "1일등락률": "{:+.2%}", **{c: _fmt_gap for c in period_cols}},
-                na_rep="—",
-            )
-            # 이평 칸들은 전부 같은 단위(이격도 %)라 컬럼별이 아니라 표 전체에서
-            # 공통 진하기 상한을 써야 "5일선 -15%"와 "200일선 -15%"가 똑같이 진하게
-            # 보인다(관심목록 수익률 표는 색칠 대상 컬럼이 하나뿐이라 컬럼별 상한이면
-            # 충분했지만, 여기는 컬럼이 여러 개라 다르게 처리).
-            all_gaps = pd.concat([df_ma[c] for c in period_cols]) if period_cols else pd.Series(dtype=float)
-            gap_cap = _abs_cap(all_gaps, MA_GAP_COLOR_CAP)
-            for c in period_cols:
-                styled = _apply_bg(styled, lambda v, cap=gap_cap: _color_scale_zero(v, cap), subset=[c])
-            ret_cap = _abs_cap(df_ma["1일등락률"], RET_COLOR_CAP)
-            styled = _apply_bg(styled, lambda v, cap=ret_cap: _color_scale_zero(v, cap), subset=["1일등락률"])
+                def _fmt_gap(v):
+                    if pd.isna(v):
+                        return "—"
+                    return f"{'▲' if v >= 0 else '▼'} {v:+.1%}"
 
-            # use_container_width라 열이 많아지면 표 자체가 가로 스크롤됨(모바일 포함).
-            st.dataframe(styled, use_container_width=True, hide_index=True,
-                         height=min(60 + 35 * len(disp), 600))
+                styled = disp.style.format(
+                    {"현재가": "{:,.2f}", "1일등락률": "{:+.2%}", **{c: _fmt_gap for c in period_cols}},
+                    na_rep="—",
+                )
+                # 이평 칸들은 전부 같은 단위(이격도 %)라 컬럼별이 아니라 표 전체에서
+                # 공통 진하기 상한을 써야 "5일선 -15%"와 "200일선 -15%"가 똑같이 진하게
+                # 보인다(관심목록 수익률 표는 색칠 대상 컬럼이 하나뿐이라 컬럼별 상한이면
+                # 충분했지만, 여기는 컬럼이 여러 개라 다르게 처리).
+                all_gaps = pd.concat([df_ma[c] for c in period_cols]) if period_cols else pd.Series(dtype=float)
+                gap_cap = _abs_cap(all_gaps, MA_GAP_COLOR_CAP)
+                for c in period_cols:
+                    styled = _apply_bg(styled, lambda v, cap=gap_cap: _color_scale_zero(v, cap), subset=[c])
+                ret_cap = _abs_cap(df_ma["1일등락률"], RET_COLOR_CAP)
+                styled = _apply_bg(styled, lambda v, cap=ret_cap: _color_scale_zero(v, cap), subset=["1일등락률"])
+
+                # use_container_width라 열이 많아지면 표 자체가 가로 스크롤됨(모바일 포함).
+                st.dataframe(styled, use_container_width=True, hide_index=True,
+                             height=min(60 + 35 * len(disp), 600))
 
 # =====================  코인  ================================================
 with tab7:
     if tab7.open:
         # 듀얼모멘텀은 탭을 누르는 순간 실시간 시세를 받아야 해서 하위탭도 on_change="rerun"으로 .open을
-        # 받는다. 랭킹도 열었을 때만 그린다. 코인 탭의 기본 화면은 듀얼모멘텀(맨 앞).
+        # 받는다. 랭킹·글로벌 24-7도 열었을 때만 그린다. 코인 탭의 기본 화면은 듀얼모멘텀(맨 앞).
         sub_dm, sub_rank, sub_g247, sub_onchain = st.tabs(
             ["🚀 듀얼모멘텀", "🏆 랭킹", "🌐 글로벌 24-7", "⛓️ 온체인"], key="coin_sub_tab", on_change="rerun")
 
@@ -3951,86 +3989,88 @@ with tab7:
 
         # ---- 글로벌 24-7 ----------------------------------------------------------
         with sub_g247:
-            st.info("ℹ️ 이 가격은 코인거래소(Hyperliquid)에서 형성되는 시세이며, 정규 거래소의 "
-                    "공식 가격이 아닌 참고용입니다. 유동성이 낮아 실제 거래소 가격과 괴리가 있을 수 있습니다.")
-            st.caption("데이터: Hyperliquid 공개 API(xyz 퍼프 DEX — 주식·지수·원자재·환율 등 전통자산을 "
-                       "24시간 거래). 5분 캐시.")
+            # Hyperliquid 캔들 140여 개를 받느라 첫 로딩 15초가량 걸려 열었을 때만 그린다.
+            if sub_g247.open:
+                st.info("ℹ️ 이 가격은 코인거래소(Hyperliquid)에서 형성되는 시세이며, 정규 거래소의 "
+                        "공식 가격이 아닌 참고용입니다. 유동성이 낮아 실제 거래소 가격과 괴리가 있을 수 있습니다.")
+                st.caption("데이터: Hyperliquid 공개 API(xyz 퍼프 DEX — 주식·지수·원자재·환율 등 전통자산을 "
+                           "24시간 거래). 5분 캐시.")
 
-            cat_filter = st.selectbox("카테고리", HL_CATEGORIES, index=0, key="g247_cat")
+                cat_filter = st.selectbox("카테고리", HL_CATEGORIES, index=0, key="g247_cat")
 
-            with st.spinner("Hyperliquid 시세 조회 중..."):
-                g247_df, g247_status = build_global247()
+                with st.spinner("Hyperliquid 시세 조회 중..."):
+                    g247_df, g247_status = build_global247()
 
-            _g247_errors = {
-                "hl_fail": "Hyperliquid 유니버스 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
-                "no_data": "표시할 데이터가 없습니다(전 종목 캔들 조회 실패).",
-            }
-            if g247_status in _g247_errors:
-                st.warning(f"⚠️ {_g247_errors[g247_status]}")
-            elif g247_df.empty:
-                st.info("표시할 데이터가 없습니다.")
-            else:
-                work247 = g247_df.copy()
-                if cat_filter != "전체":
-                    work247 = work247[work247["category"] == cat_filter]
-                work247 = work247.reset_index(drop=True)
-
-                if work247.empty:
-                    st.info("이 카테고리에 해당하는 자산이 없습니다.")
+                _g247_errors = {
+                    "hl_fail": "Hyperliquid 유니버스 조회에 실패했습니다. 잠시 후 다시 시도해주세요.",
+                    "no_data": "표시할 데이터가 없습니다(전 종목 캔들 조회 실패).",
+                }
+                if g247_status in _g247_errors:
+                    st.warning(f"⚠️ {_g247_errors[g247_status]}")
+                elif g247_df.empty:
+                    st.info("표시할 데이터가 없습니다.")
                 else:
-                    st.caption(f"{len(work247)}개 자산 · 24h 변동률 기준 정렬(표 헤더 클릭으로 재정렬 가능)")
+                    work247 = g247_df.copy()
+                    if cat_filter != "전체":
+                        work247 = work247[work247["category"] == cat_filter]
+                    work247 = work247.reset_index(drop=True)
 
-                    kr_name = work247["symbol"].map(lambda s: HL_SYMBOL_KOREAN_NAME.get(s))
-                    disp247 = pd.DataFrame({
-                        "이름": [f"{s} · {k}" if k else s for s, k in zip(work247["symbol"], kr_name)],
-                        "현재가": work247["price"], "1h": work247["chg_1h"], "24h": work247["chg_24h"],
-                        "7일": work247["chg_7d"], "30일": work247["chg_30d"], "카테고리": work247["category"],
-                    })
-                    styled247 = disp247.style
-                    for c in ["1h", "24h", "7일", "30일"]:
-                        _cap = _abs_cap(disp247[c], COIN_RET_COLOR_CAP)
-                        styled247 = _apply_bg(styled247, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
-
-                    g247_ev = st.dataframe(
-                        styled247, use_container_width=True, hide_index=True,
-                        column_config={
-                            "현재가": st.column_config.NumberColumn(format="$%.6g"),
-                            "1h": st.column_config.NumberColumn(format="percent"),
-                            "24h": st.column_config.NumberColumn(format="percent"),
-                            "7일": st.column_config.NumberColumn(format="percent"),
-                            "30일": st.column_config.NumberColumn(format="percent"),
-                        },
-                        height=min(60 + 35 * len(disp247), 600),
-                        on_select="rerun", selection_mode="single-row", key="coin_g247_table",
-                    )
-                    _sel247 = g247_ev.selection.rows if g247_ev and g247_ev.selection else []
-                    if _sel247:
-                        _sel_hl = work247.iloc[_sel247[0]]["hl_symbol"]
-                        if _sel_hl != st.session_state.coin_g247_symbol:
-                            st.session_state.coin_g247_symbol = _sel_hl
-                            st.rerun()
-
-                    g247_sym = st.session_state.coin_g247_symbol or work247.iloc[0]["hl_symbol"]
-                    g247_row = work247[work247["hl_symbol"] == g247_sym]
-                    g247_sym_short = g247_row.iloc[0]["symbol"] if not g247_row.empty else g247_sym
-                    g247_kr = HL_SYMBOL_KOREAN_NAME.get(g247_sym_short)
-                    st.markdown(f"#### {g247_sym_short}" + (f" · {g247_kr}" if g247_kr else ""))
-
-                    iv_label = st.radio("인터벌", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3,
-                                         horizontal=True, key="coin_g247_iv")
-                    _lookback_ms = {
-                        "1m": 6 * 3600 * 1000, "5m": 24 * 3600 * 1000, "15m": 3 * 24 * 3600 * 1000,
-                        "1h": 14 * 24 * 3600 * 1000, "4h": 45 * 24 * 3600 * 1000,
-                        "1d": 365 * 24 * 3600 * 1000,
-                    }[iv_label]
-                    g247_candles = _fetch_hl_candles(g247_sym, iv_label, _lookback_ms)
-                    if not g247_candles:
-                        st.warning("차트 데이터를 불러오지 못했습니다.")
+                    if work247.empty:
+                        st.info("이 카테고리에 해당하는 자산이 없습니다.")
                     else:
-                        _closed_mask = _us_market_closed_mask([c["time"] for c in g247_candles])
-                        _render_price_chart(g247_candles, key=f"lwc_g247_{g247_sym}_{iv_label}",
-                                             intraday=True, closed_mask=_closed_mask)
-                        st.caption("회색 배경 = 미국 정규장(09:30~16:00 ET, 평일) 휴장 구간(공휴일 미반영 근사치)")
+                        st.caption(f"{len(work247)}개 자산 · 24h 변동률 기준 정렬(표 헤더 클릭으로 재정렬 가능)")
+
+                        kr_name = work247["symbol"].map(lambda s: HL_SYMBOL_KOREAN_NAME.get(s))
+                        disp247 = pd.DataFrame({
+                            "이름": [f"{s} · {k}" if k else s for s, k in zip(work247["symbol"], kr_name)],
+                            "현재가": work247["price"], "1h": work247["chg_1h"], "24h": work247["chg_24h"],
+                            "7일": work247["chg_7d"], "30일": work247["chg_30d"], "카테고리": work247["category"],
+                        })
+                        styled247 = disp247.style
+                        for c in ["1h", "24h", "7일", "30일"]:
+                            _cap = _abs_cap(disp247[c], COIN_RET_COLOR_CAP)
+                            styled247 = _apply_bg(styled247, lambda v, cap=_cap: _color_scale_zero(v, cap), subset=[c])
+
+                        g247_ev = st.dataframe(
+                            styled247, use_container_width=True, hide_index=True,
+                            column_config={
+                                "현재가": st.column_config.NumberColumn(format="$%.6g"),
+                                "1h": st.column_config.NumberColumn(format="percent"),
+                                "24h": st.column_config.NumberColumn(format="percent"),
+                                "7일": st.column_config.NumberColumn(format="percent"),
+                                "30일": st.column_config.NumberColumn(format="percent"),
+                            },
+                            height=min(60 + 35 * len(disp247), 600),
+                            on_select="rerun", selection_mode="single-row", key="coin_g247_table",
+                        )
+                        _sel247 = g247_ev.selection.rows if g247_ev and g247_ev.selection else []
+                        if _sel247:
+                            _sel_hl = work247.iloc[_sel247[0]]["hl_symbol"]
+                            if _sel_hl != st.session_state.coin_g247_symbol:
+                                st.session_state.coin_g247_symbol = _sel_hl
+                                st.rerun()
+
+                        g247_sym = st.session_state.coin_g247_symbol or work247.iloc[0]["hl_symbol"]
+                        g247_row = work247[work247["hl_symbol"] == g247_sym]
+                        g247_sym_short = g247_row.iloc[0]["symbol"] if not g247_row.empty else g247_sym
+                        g247_kr = HL_SYMBOL_KOREAN_NAME.get(g247_sym_short)
+                        st.markdown(f"#### {g247_sym_short}" + (f" · {g247_kr}" if g247_kr else ""))
+
+                        iv_label = st.radio("인터벌", ["1m", "5m", "15m", "1h", "4h", "1d"], index=3,
+                                             horizontal=True, key="coin_g247_iv")
+                        _lookback_ms = {
+                            "1m": 6 * 3600 * 1000, "5m": 24 * 3600 * 1000, "15m": 3 * 24 * 3600 * 1000,
+                            "1h": 14 * 24 * 3600 * 1000, "4h": 45 * 24 * 3600 * 1000,
+                            "1d": 365 * 24 * 3600 * 1000,
+                        }[iv_label]
+                        g247_candles = _fetch_hl_candles(g247_sym, iv_label, _lookback_ms)
+                        if not g247_candles:
+                            st.warning("차트 데이터를 불러오지 못했습니다.")
+                        else:
+                            _closed_mask = _us_market_closed_mask([c["time"] for c in g247_candles])
+                            _render_price_chart(g247_candles, key=f"lwc_g247_{g247_sym}_{iv_label}",
+                                                 intraday=True, closed_mask=_closed_mask)
+                            st.caption("회색 배경 = 미국 정규장(09:30~16:00 ET, 평일) 휴장 구간(공휴일 미반영 근사치)")
 
         # ---- 온체인 ---------------------------------------------------------------
         with sub_onchain:
@@ -4072,4 +4112,5 @@ with tab7:
 
 # =====================  은퇴 (총자산 · 경제적 자유)  ========================
 with tab8:
-    _render_wealth_tab()
+    if tab8.open:
+        _render_wealth_tab()

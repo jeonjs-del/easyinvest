@@ -325,8 +325,10 @@ python -m unittest tests.test_coin_momentum -v # 오프라인
   대비 절대값 비율.
 - 외부 API 호출은 `@st.cache_data(ttl=...)`로 캐시하고, 여러 종목/코인 조회는
   `ThreadPoolExecutor`로 병렬화한다.
-- **탭 지연 실행**: 최상위 `st.tabs`는 `key="main_tab", on_change="rerun"`이고, 무거운 탭
-  (동적자산배분·코인)은 `if tabN.open:` 안에서만 그린다(첫 로딩 65초→15초). 이런 탭에 값이
+- **탭 지연 실행**: 최상위 `st.tabs`는 `key="main_tab", on_change="rerun"`이고, 차트(기본 탭) 외의 탭은
+  전부 `if tabN.open:` 안에서만 그린다(2026-11: 차트만 봐도 프리미엄·매수·이동평균·은퇴를 다 돌려 첫 로딩
+  37초 → 5초). 코인 하위탭(듀얼모멘텀·랭킹·글로벌 24-7)과 추세추종 카드 100개(`st.expander(...,
+  on_change="rerun")`의 `.open`)도 펼친 것만 그린다. 이런 탭에 값이
   유지돼야 하는 위젯을 추가하면 `st.tabs` 바로 위의 key 목록에도 넣을 것 — 탭을 떠나 있는
   동안 그려지지 않은 위젯 값은 Streamlit이 지운다. `AppTest`는 탭 선택 상태를 다음 실행에
   넘기지 않으므로 탭 전환 검증은 매 실행 전에 `session_state["main_tab"]`을 직접 넣어야 한다.
@@ -335,6 +337,12 @@ python -m unittest tests.test_coin_momentum -v # 오프라인
   진단 가능하게 한다.
 - `.streamlit/secrets.toml`은 **절대 커밋 금지**(이미 `.gitignore`에 있음, `git add -f`로
   강제 추가하지 말 것).
+- **로딩 속도 관련 구조(되돌리지 말 것)**: Gist는 `_gist_fetch_files`로 한 번만 받아 파일별로 꺼낸다(파일마다
+  받으면 같은 요청을 4번 기다림). 프리미엄 탭은 시세 7종을 먼저 병렬로 받아 캐시를 채운다. 은퇴 탭은 실거래가를
+  시트 조회와 동시에 받는다. `strategies.ret`/`sma_score`는 패널 열을 numpy 배열로 캐시한 `_col`을 쓴다(전략
+  출력이 이전과 전 시점 동일함을 확인, 17개 전략 계산 3.8초→0.8초) — 패널 값을 전략 실행 중에 바꾸지 말 것.
+  위젯 key가 있는 기본값은 `index=` 대신 `st.session_state.setdefault`로 줄 것(지연 실행 탭의 key 재대입과
+  겹치면 매 실행 경고 로그가 남는다).
 - 주석은 "왜"만 남긴다 — 코드가 이미 설명하는 당연한 내용은 쓰지 않는다.
 
 ## 7. 동적자산배분 전략 추가/수정

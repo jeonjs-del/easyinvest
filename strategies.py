@@ -157,10 +157,27 @@ def augment_panel(mp):
     return mp
 
 # ---- 모멘텀 유틸 ----------------------------------------------------------
+# 백테스트 한 번에 ret/sma_score가 7만 번 가까이 불리는데, 매번 mp[sym].iloc[t]로 열을 꺼내면 그것만
+# 8초가 걸렸다 — 패널별로 열을 numpy 배열로 한 번만 꺼내 둔다. 패널은 augment_panel까지 끝난 뒤
+# 값이 바뀌지 않는다는 전제(열 추가는 괜찮다 — 처음 꺼낼 때 담는다).
+_COL_CACHE = {"mp": None, "cols": {}}
+
+
+def _col(mp, sym):
+    if _COL_CACHE["mp"] is not mp:
+        _COL_CACHE["mp"], _COL_CACHE["cols"] = mp, {}
+    cols = _COL_CACHE["cols"]
+    arr = cols.get(sym)
+    if arr is None:
+        arr = cols[sym] = mp[sym].to_numpy()
+    return arr
+
+
 def ret(mp, sym, t, k):
     if sym not in mp.columns or t - k < 0:
         return None
-    a, b = mp[sym].iloc[t], mp[sym].iloc[t - k]
+    s = _col(mp, sym)
+    a, b = s[t], s[t - k]
     if pd.isna(a) or pd.isna(b) or b == 0:
         return None
     return a / b - 1.0
@@ -180,10 +197,10 @@ def sma_score(mp, sym, t, window):
     """현재가 / 최근 window개 월말 종가 평균 - 1 (window개 = 현재 포함)."""
     if sym not in mp.columns or t - window + 1 < 0:
         return None
-    seg = mp[sym].iloc[t - window + 1:t + 1]
+    seg = pd.Series(_col(mp, sym)[t - window + 1:t + 1])
     if seg.isna().any() or seg.mean() == 0:
         return None
-    return mp[sym].iloc[t] / seg.mean() - 1.0
+    return seg.iloc[-1] / seg.mean() - 1.0
 
 
 def top_keys(scores, n):
