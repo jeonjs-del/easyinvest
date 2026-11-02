@@ -22,6 +22,9 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
 - `coin_momentum.py` — 코인 탭 듀얼모멘텀 하위탭의 순수 계산 로직(유니버스 제외 목록
   `DM_EXCLUDED`, 거래 어려움 판정 `hard_to_trade_symbols` — 둘 다 유니버스에서 빼고 다음 순위로 채움, BTC SMA120 필터 `ma_filter`, 순위). Streamlit·네트워크
   비의존 — 조회·화면은 `app.py`의 `_render_coin_dual_momentum`. 테스트는 `tests/test_coin_momentum.py`.
+- `trade_plan.py` — 매수 탭 매매계획 하위탭의 순수 계산(R 기반 첫 매수 수량, 불타기 차수별 매수가·수량,
+  매도선·매도선 도달 시 손익). Streamlit·네트워크 비의존 — 시세·환율·화면은 `app.py`. 테스트는
+  `tests/test_trade_plan.py`.
 - `lwc_local.py` — `streamlit-lightweight-charts-ntf` 패치 래퍼(줌 상태 복원 + dblclick
   지원). 건드릴 일 거의 없음.
 - `scanner/` — 오프라인 배치 스캐너(로컬에서만 수동 실행, Cloud에서는 실행 안 됨):
@@ -38,6 +41,7 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
   캘리브레이션 테스트(unittest, 실가격 네트워크 조회 필요, 로컬 전용, CI에는 없음).
 - `tests/test_wealth.py` — 은퇴 탭 계산 로직 검증(unittest, 오프라인, 수 ms).
 - `tests/test_coin_momentum.py` — 코인 듀얼모멘텀 계산 로직 검증(unittest, 오프라인).
+- `tests/test_trade_plan.py` — 매매계획 불타기 계산 검증(unittest, 오프라인).
 - `wealth.json` — 은퇴 탭 자산 데이터의 로컬 폴백. **개인 자산 정보라 `.gitignore`에 등록돼
   있고 커밋 금지**(이 저장소는 공개 저장소다). 주소·금액 같은 개인 값을 소스·테스트·문서에
   하드코딩하지 말 것.
@@ -67,6 +71,7 @@ python scanner/seasonality_scan.py
 python -m unittest tests.test_calibration -v   # 네트워크 필요
 python -m unittest tests.test_wealth -v        # 오프라인
 python -m unittest tests.test_coin_momentum -v # 오프라인
+python -m unittest tests.test_trade_plan -v    # 오프라인
 ```
 
 ## 4. 탭 구성
@@ -75,7 +80,14 @@ python -m unittest tests.test_coin_momentum -v # 오프라인
 3. **동적자산배분** — `strategies.py`의 17개 전략, 현재 포지션·CAGR·MDD·Sharpe.
 4. **프리미엄** — 김치프리미엄(업비트 vs Coinbase BTC), 금치프리미엄(KRX금현물 ETF vs GLD).
 5. **매수** — 하위탭 3개: 계절성(`seasonality_scan.py` 결과, 매수창 필터) · 추세추종
-   (`trend_scan.py` 결과, 신호유형별 백분위 별점) · 매매계획(포지션 사이징·손절/익절 계산기).
+   (`trend_scan.py` 결과, 신호유형별 백분위 별점) · 매매계획(R 기반 첫 매수·불타기 계획).
+   - 매매계획: 1R = 매수가 × 손절폭(손절 가격을 넣으면 매수가 − 손절가), 첫 매수 수량 = floor(투자자산 ×
+     최대손실 ÷ 1R), n차 불타기가 = 매수가 × (1 + 간격 × n), 수량 = 첫 매수 × 비율(100%·50%·줄여가기
+     100→50→25%·직접). 매도선은 1차는 손절가, 이후 계단식(마지막 매수가 − 1R)·최고 종가 − 1R(계획상 최소값)·
+     20일 이평(손익 계산 불가)·직접 가격. 계산은 `trade_plan.build_plan`. 방식=직접 입력이면 최대손실·손절폭·
+     손절 가격, 불타기=함이면 간격·횟수·금액·매도선을 노출(기본 1%·7%·2R·3회·100%·계단식).
+   - 투자자산은 언제나 원화로 입력받고, 달러 종목(미국 주식·달러 코인)은 최신 USD/KRW(`_usdkrw_history`)로
+     나눠 달러로 계산한 뒤 금액 옆에 원화 환산을 붙인다. 환율 조회 실패 시 달러 종목은 계산하지 않는다.
    - 매매계획은 코인도 받는다: 직접 입력에 `BTCUSD`·`BTCKRW`·`BTC-USDT`·`ETH/KRW` 형태(`_PLAN_COIN_RE`,
      USDT·USDC는 달러). 원화는 업비트 일봉(없으면 Yahoo `BTC/KRW` — 달러 환산값), 달러는 Coinbase→OKX→Bybit→
      Yahoo(Binance 제외). 진행 중 일봉의 마지막 값을 현재가로 쓰고 1분 캐시(`_plan_coin_closes`). 수량은
