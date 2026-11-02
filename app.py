@@ -268,6 +268,31 @@ def save_json_list(data, mode, gist_filename, local_path):
     _save_json_list_local(local_path, data)
 
 
+def load_json_doc(gist_filename, local_path):
+    """(dict, storage_mode). load_json_list의 dict 버전 — 없거나 깨졌으면 빈 dict."""
+    def _parse(text):
+        try:
+            data = json.loads(text)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    if _gist_configured():
+        token, gist_id = st.secrets["gist"]["token"], st.secrets["gist"]["id"]
+        try:
+            content = _gist_fetch_content(token, gist_id, gist_filename)
+            return (_parse(content) if content and content.strip() else {}), "gist"
+        except Exception as e:
+            print(f"[gist] {gist_filename} 조회 실패 → 로컬 폴백: {type(e).__name__}")
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, encoding="utf-8") as f:
+                return _parse(f.read()), "local"
+        except Exception:
+            pass
+    return {}, "local"
+
+
 def load_watchlist():
     return load_json_list(GIST_FILENAME, WATCHLIST_FILE, DEFAULT_WATCHLIST,
                            item_fn=lambda c: normalize(str(c)))
@@ -1616,6 +1641,50 @@ def _plan_coin_closes(base, quote):
     if not df.empty:
         return df["Close"].dropna(), "Yahoo", pd.Timestamp.now(tz="Asia/Seoul")
     return pd.Series(dtype=float), None, None
+
+
+# 매매계획 마지막 입력값. 투자자산 금액이 들어 있어 로컬 폴백 파일은 .gitignore에 등록(커밋 금지).
+PLAN_SETTINGS_FILE = "plan_settings.json"
+PLAN_SETTINGS_GIST_FILENAME = "plan_settings.json"
+_PLAN_SETTING_CHOICES = {
+    "plan_mode": ("디폴트", "직접 입력"), "plan_pyramid": ("안 함", "함"),
+    "plan_loss_opt": (0.5, 1.0, 2.0, "직접"), "plan_stop_opt": (3.0, 5.0, 7.0, 8.0, 10.0, "직접"),
+    "plan_step_opt": (2, 3, "직접"), "plan_adds": (1, 2, 3),
+    "plan_ratio_opt": ("100", "50", "taper", "custom"), "plan_sell_opt": TP.SELL_MODES,
+}
+# 숫자 입력칸의 (최솟값, 최댓값) — 저장값이 범위를 벗어나면 number_input이 오류를 내서 버린다.
+_PLAN_SETTING_NUMBERS = {
+    "plan_asset_krw": (0.0, None), "plan_loss_custom": (0.01, 100.0), "plan_stop_custom": (0.1, 99.0),
+    "plan_step_custom": (0.1, None), "plan_ratio_custom": (1.0, None),
+}
+
+
+def _plan_num_ok(v, lo=0.0, hi=None):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            and v >= lo and (hi is None or v <= hi))
+
+
+def _plan_clean_settings(raw):
+    """저장소에서 읽은 값 중 지금 화면 옵션에 맞는 것만 남긴다(옵션이 바뀌어도 radio가 깨지지 않게)."""
+    out = {}
+    for k, choices in _PLAN_SETTING_CHOICES.items():
+        v = raw.get(k)
+        for o in choices:
+            if o == v and isinstance(o, str) == isinstance(v, str) and not isinstance(v, bool):
+                out[k] = o
+    for k, (lo, hi) in _PLAN_SETTING_NUMBERS.items():
+        if _plan_num_ok(raw.get(k), lo, hi):
+            out[k] = float(raw[k])
+    if isinstance(raw.get("plan_ticker"), str) and raw["plan_ticker"].strip():
+        out["plan_ticker"] = normalize(raw["plan_ticker"])
+    if isinstance(raw.get("plan_computed"), bool):
+        out["plan_computed"] = raw["plan_computed"]
+    tick = raw.get("tick")
+    if isinstance(tick, dict) and isinstance(tick.get("ticker"), str):
+        out["tick"] = {"ticker": tick["ticker"],
+                       **{f: float(tick[f]) for f in ("buy", "stop", "sell")
+                          if _plan_num_ok(tick.get(f)) and tick[f] > 0}}
+    return out
 
 
 def _plan_price_decimals(price, is_krw):
@@ -3524,8 +3593,18 @@ with tab5:
                             )
 
         with sub_plan:
-            if "plan_ticker" not in st.session_state:
-                st.session_state.plan_ticker = st.session_state.chart_ticker
+            # 마지막 입력값 복원: 세션에서 처음 열 때 저장소에서 한 번 읽고, 이후엔 세션에 든 마지막 저장본으로
+            # 비어 있는 key만 채운다(화면에 안 그려진 위젯 값을 Streamlit이 지워도 되살아나게).
+            if "_plan_saved" not in st.session_state:
+                _raw, st.session_state._plan_store_mode = load_json_doc(
+                    PLAN_SETTINGS_GIST_FILENAME, PLAN_SETTINGS_FILE)
+                st.session_state._plan_saved = _plan_clean_settings(_raw)
+            _ps = st.session_state._plan_saved
+            for _k in (*_PLAN_SETTING_CHOICES, *_PLAN_SETTING_NUMBERS, "plan_computed"):
+                if _k in _ps:
+                    st.session_state.setdefault(_k, _ps[_k])
+            st.session_state.setdefault("plan_ticker", _ps.get("plan_ticker") or st.session_state.chart_ticker)
+            _plan_tick_now = None
 
             pc1, pc2 = st.columns([3, 2])
             with pc1:
@@ -3539,7 +3618,7 @@ with tab5:
                     _psel_code = normalize(_psel.rsplit("(", 1)[-1].rstrip(")"))
                     if _psel_code != st.session_state.plan_ticker:
                         st.session_state.plan_ticker = _psel_code
-                        st.session_state.pop("plan_computed", None)
+                        st.session_state.plan_computed = False
                         st.rerun()
             with pc2:
                 with st.form("_plan_fs", clear_on_submit=True, border=False):
@@ -3552,7 +3631,7 @@ with tab5:
                 if _psub and _pft.strip():
                     st.session_state.plan_ticker = normalize(_pft.strip())
                     st.session_state.pop("plan_krx_select", None)
-                    st.session_state.pop("plan_computed", None)
+                    st.session_state.plan_computed = False
                     st.rerun()
 
             p_ticker = normalize(st.session_state.plan_ticker)
@@ -3624,18 +3703,27 @@ with tab5:
                 else:
                     st.caption(f"현재가 {_px(latest_price)} ({latest_date:%Y-%m-%d} 종가){fx_note}")
 
+                # 매수가·손절 가격·매도선 가격은 마지막으로 본 종목 것만 저장한다. 매수가는 현재가와 다르게
+                # 고친 경우에만 저장해, 손대지 않았으면 다음에 열 때도 그날 현재가가 들어온다.
+                _tv = _ps.get("tick") if (_ps.get("tick") or {}).get("ticker") == p_ticker else {}
+                _auto_price = round(latest_price, p_dec)
+                _price_key = f"plan_price_{p_ticker}"
+                st.session_state.setdefault(_price_key, _tv.get("buy", _auto_price))
+                st.session_state.setdefault(f"plan_stopprice_{p_ticker}", _tv.get("stop"))
                 if p_coin:
                     buy_price = st.number_input(
-                        "매수가", min_value=0.0, value=round(latest_price, p_dec),
+                        "매수가", min_value=0.0,
                         step=float(10 ** max(-p_dec, int(math.log10(latest_price)) - 3)) if latest_price > 0 else 1.0,
-                        format=f"%.{p_dec}f", key=f"plan_price_{p_ticker}",
+                        format=f"%.{p_dec}f", key=_price_key,
                     )
                 else:
                     buy_price = st.number_input(
-                        "매수가", min_value=0.0,
-                        value=round(latest_price, 0) if p_is_krw else round(latest_price, 2),
-                        step=(100.0 if p_is_krw else 0.5), key=f"plan_price_{p_ticker}",
+                        "매수가", min_value=0.0, step=(100.0 if p_is_krw else 0.5),
+                        format=f"%.{p_dec}f", key=_price_key,
                     )
+                if abs(buy_price - _auto_price) > 10 ** -(p_dec + 1):
+                    st.button(f"↺ 현재가({_px(latest_price)})로", key="plan_price_reset",
+                              on_click=lambda k=_price_key, v=_auto_price: st.session_state.update({k: v}))
 
                 st.session_state.setdefault("plan_mode", "디폴트")
                 st.session_state.setdefault("plan_pyramid", "안 함")
@@ -3660,12 +3748,14 @@ with tab5:
                 if mode == "직접 입력":
                     st.session_state.setdefault("plan_loss_opt", 1.0)
                     st.session_state.setdefault("plan_stop_opt", 7.0)
+                    for _k, _v in (("plan_loss_custom", 1.0), ("plan_stop_custom", 7.0)):
+                        st.session_state.setdefault(_k, _v)
                     lc1, lc2 = st.columns([3, 1])
                     _lo = lc1.radio("한 종목 최대 손실", [0.5, 1.0, 2.0, "직접"], horizontal=True,
                                     format_func=lambda v: "직접 입력" if v == "직접" else _pct_label(v / 100),
                                     key="plan_loss_opt")
                     if _lo == "직접":
-                        _lo = lc2.number_input("최대 손실(%)", min_value=0.01, max_value=100.0, value=1.0,
+                        _lo = lc2.number_input("최대 손실(%)", min_value=0.01, max_value=100.0,
                                                step=0.1, key="plan_loss_custom")
                     loss_pct = _lo / 100
                     sc1, sc2 = st.columns([3, 1])
@@ -3673,12 +3763,12 @@ with tab5:
                                     format_func=lambda v: "직접 입력" if v == "직접" else _pct_label(v / 100),
                                     key="plan_stop_opt")
                     if _so == "직접":
-                        _so = sc2.number_input("손절폭(%)", min_value=0.1, max_value=99.0, value=7.0,
+                        _so = sc2.number_input("손절폭(%)", min_value=0.1, max_value=99.0,
                                                step=0.5, key="plan_stop_custom")
                     stop_pct = _so / 100
                     stop_price_in = st.number_input(
                         f"손절 가격 (선택 — 넣으면 손절폭 대신 이 가격 기준, {'원' if p_is_krw else 'USD'})",
-                        min_value=0.0, value=None, placeholder="비워두면 손절폭 적용",
+                        min_value=0.0, placeholder="비워두면 손절폭 적용",
                         format=f"%.{p_dec}f", key=f"plan_stopprice_{p_ticker}")
 
                 stop_err = None
@@ -3694,14 +3784,15 @@ with tab5:
                 step_pct, ratios, sell_mode, sell_price, ratio_desc = 0.0, [], "step", None, ""
                 if pyramiding:
                     for _k, _v in (("plan_step_opt", 2), ("plan_adds", 3), ("plan_ratio_opt", "100"),
-                                   ("plan_sell_opt", "step")):
+                                   ("plan_sell_opt", "step"), ("plan_step_custom", 14.0),
+                                   ("plan_ratio_custom", 100.0)):
                         st.session_state.setdefault(_k, _v)
                     gc1, gc2 = st.columns([3, 1])
                     _step = gc1.radio(
                         "불타기 간격", [2, 3, "직접"], horizontal=True, key="plan_step_opt",
                         format_func=lambda v: "직접 입력 %" if v == "직접" else f"{v}R(+{_pct_label(v * r_pct)})")
                     if _step == "직접":
-                        step_pct = gc2.number_input("간격(%)", min_value=0.1, value=14.0, step=1.0,
+                        step_pct = gc2.number_input("간격(%)", min_value=0.1, step=1.0,
                                                     key="plan_step_custom") / 100
                     else:
                         step_pct = _step * r_pct
@@ -3715,7 +3806,7 @@ with tab5:
                                                "custom": "직접 입력"}[v])
                     _rc = None
                     if _ro == "custom":
-                        _rc = rc2.number_input("비율(%)", min_value=1.0, value=100.0, step=10.0,
+                        _rc = rc2.number_input("비율(%)", min_value=1.0, step=10.0,
                                                key="plan_ratio_custom") / 100
                     ratios = TP.add_ratios(_ro, adds, _rc)
                     ratio_desc = ("→".join(_pct_label(x) for x in ratios) if _ro == "taper"
@@ -3726,8 +3817,18 @@ with tab5:
                         format_func=lambda v: {"step": "계단식", "trail": "최고 종가 −1R", "ma20": "20일 이평",
                                                "price": "직접 가격 입력"}[v])
                     if sell_mode == "price":
-                        sell_price = xc2.number_input("매도선 가격", min_value=0.0, value=round(buy_price, p_dec),
+                        st.session_state.setdefault(f"plan_sellprice_{p_ticker}",
+                                                    _tv.get("sell", round(buy_price, p_dec)))
+                        sell_price = xc2.number_input("매도선 가격", min_value=0.0,
                                                       format=f"%.{p_dec}f", key=f"plan_sellprice_{p_ticker}")
+
+                _plan_tick_now = {"ticker": p_ticker}
+                if abs(buy_price - _auto_price) > 10 ** -(p_dec + 1):
+                    _plan_tick_now["buy"] = buy_price
+                for _f, _key in (("stop", f"plan_stopprice_{p_ticker}"), ("sell", f"plan_sellprice_{p_ticker}")):
+                    _v = st.session_state.get(_key, _tv.get(_f))
+                    if _v:
+                        _plan_tick_now[_f] = _v
 
                 if p_is_krw:
                     asset_ccy = asset_krw
@@ -3817,6 +3918,24 @@ with tab5:
                         st.caption(f"{lot_note} 불타기·매도선 가격에 정확히 체결된다고 가정했고(갭·슬리피지 미반영), "
                                    "세금·수수료·호가 단위·거래소 최소 주문금액은 반영하지 않은 숫자입니다."
                                    + (f" 원화 금액은 {fx_str}({p_fx_date:%Y-%m-%d}) 환산값입니다." if p_fx else ""))
+
+            # 마지막 입력값 저장. 지금 안 그려진 입력(예: 불타기 '안 함'일 때의 불타기 설정)은 직전 저장값을 유지한다.
+            _plan_now = dict(_ps)
+            for _k in (*_PLAN_SETTING_CHOICES, *_PLAN_SETTING_NUMBERS):
+                if _k in st.session_state:
+                    _plan_now[_k] = st.session_state[_k]
+            _plan_now["plan_ticker"] = normalize(st.session_state.plan_ticker)
+            _plan_now["plan_computed"] = bool(st.session_state.get("plan_computed"))
+            if _plan_tick_now is not None:
+                _plan_now["tick"] = _plan_tick_now
+            _plan_now = _plan_clean_settings(_plan_now)
+            if _plan_now != _ps:
+                save_json_list(_plan_now, st.session_state._plan_store_mode,
+                               PLAN_SETTINGS_GIST_FILENAME, PLAN_SETTINGS_FILE)
+                st.session_state._plan_saved = _plan_now
+            st.caption("입력값은 자동 저장되어 다음에 열 때 그대로 나옵니다"
+                       + (" (Gist)." if st.session_state._plan_store_mode == "gist"
+                          else " (이 기기 로컬 파일 — Gist 미설정이라 Cloud 재시작 시 사라질 수 있음)."))
 
         with sub_season:
             sdf, smeta = load_seasonality()

@@ -45,7 +45,7 @@ easyinvest 저장소에서 작업하는 AI 코딩 에이전트(Claude Code, Open
 - `wealth.json` — 은퇴 탭 자산 데이터의 로컬 폴백. **개인 자산 정보라 `.gitignore`에 등록돼
   있고 커밋 금지**(이 저장소는 공개 저장소다). 주소·금액 같은 개인 값을 소스·테스트·문서에
   하드코딩하지 말 것.
-- `watchlist.json`, `ma_tab_indices.json`, `ma_tab_periods.json` — Gist 미설정 시 로컬
+- `watchlist.json`, `ma_tab_indices.json`, `ma_tab_periods.json`, `plan_settings.json` — Gist 미설정 시 로컬
   폴백 저장 파일. Cloud는 재시작마다 파일시스템이 초기화되므로 이것만으로는 영구저장 안 됨.
 - `.streamlit/secrets.toml` — Gist 토큰 등 비밀값(`.gitignore`에 등록, 커밋 금지).
   `.streamlit/secrets.toml.example`이 템플릿.
@@ -88,6 +88,10 @@ python -m unittest tests.test_trade_plan -v    # 오프라인
      손절 가격, 불타기=함이면 간격·횟수·금액·매도선을 노출(기본 1%·7%·2R·3회·100%·계단식).
    - 투자자산은 언제나 원화로 입력받고, 달러 종목(미국 주식·달러 코인)은 최신 USD/KRW(`_usdkrw_history`)로
      나눠 달러로 계산한 뒤 금액 옆에 원화 환산을 붙인다. 환율 조회 실패 시 달러 종목은 계산하지 않는다.
+   - 마지막 입력값(종목·방식·불타기 설정·투자자산·'계획 보기' 상태, 마지막 종목의 손절/매도선 가격과 현재가와
+     다르게 고친 매수가)은 Gist `plan_settings.json`(+ 로컬 폴백, `.gitignore` 등록 — 투자자산 금액이 들어 있어
+     커밋 금지)에 값이 바뀔 때마다 저장하고, 세션에서 탭을 처음 열 때 읽어 `setdefault`로 채운다. 저장값은
+     `_plan_clean_settings`가 현재 옵션 목록·입력 범위에 맞는 것만 남긴다 — 옵션을 바꾸면 `_PLAN_SETTING_*`도 고칠 것.
    - 매매계획은 코인도 받는다: 직접 입력에 `BTCUSD`·`BTCKRW`·`BTC-USDT`·`ETH/KRW` 형태(`_PLAN_COIN_RE`,
      USDT·USDC는 달러). 원화는 업비트 일봉(없으면 Yahoo `BTC/KRW` — 달러 환산값), 달러는 Coinbase→OKX→Bybit→
      Yahoo(Binance 제외). 진행 중 일봉의 마지막 값을 현재가로 쓰고 1분 캐시(`_plan_coin_closes`). 수량은
