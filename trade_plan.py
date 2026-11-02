@@ -5,7 +5,7 @@ Streamlit·네트워크 비의존. 화면·시세·환율 조회는 app.py의 �
 """
 import math
 
-# 줄여가기: 첫 매수 수량 대비 2차 100% → 3차 50% → 4차 25%
+# 줄여가기: 첫 매수 금액 대비 2차 100% → 3차 50% → 4차 25%
 TAPER_RATIOS = (1.0, 0.5, 0.25)
 
 SELL_MODES = ("step", "trail", "ma20", "price")
@@ -23,7 +23,7 @@ def floor_lot(x, lot=1):
 
 
 def add_ratios(mode, adds, custom=None):
-    """불타기 n회 각각의 '첫 매수 수량 대비' 비율 목록."""
+    """불타기 n회 각각의 '첫 매수 금액 대비' 비율 목록."""
     if adds <= 0:
         return []
     if mode == "taper":
@@ -40,7 +40,8 @@ def build_plan(price, asset, loss_pct, r, step_pct=0.0, ratios=(), sell_mode="st
 
     price: 첫 매수가, asset: 투자자산(종목 통화), loss_pct: 한 종목 최대 손실(0.01=1%),
     r: 1R = 매수가 − 손절가(주당 금액), step_pct: 불타기 간격(매수가 대비, 0.14=+14%),
-    ratios: 불타기 차수별 첫 매수 대비 수량 비율, sell_mode: 첫 추가매수 이후 매도선 방식
+    ratios: 불타기 차수별 첫 매수 대비 금액 비율 — 금액을 고정하므로 수량은 그 차수 매수가로 나눈 값
+      (주가가 오른 만큼 수량이 줄어든다), sell_mode: 첫 추가매수 이후 매도선 방식
       step  = 마지막 매수가 − 1R(계단식)
       trail = 최고 종가 − 1R — 계획 시점엔 최고 종가를 그 차수 매수가로 본 최소값(계단식과 같음)
       ma20  = 20일 이평(미래 값을 알 수 없어 손익은 None)
@@ -57,12 +58,13 @@ def build_plan(price, asset, loss_pct, r, step_pct=0.0, ratios=(), sell_mode="st
         return {"r": r, "stop": stop, "q1": q1, "rows": [], "worst_loss": 0.0, "worst_loss_pct": 0.0,
                 "total_cost": 0.0}
 
+    first_amount = price * q1
     entries = [(price, 1.0)] + [(price * (1 + step_pct * (i + 1)), ratio)
                                 for i, ratio in enumerate(ratios)]
     rows = []
     cum_q, cum_cost = 0, 0.0
     for n, (p, ratio) in enumerate(entries, start=1):
-        q = q1 if n == 1 else floor_lot(q1 * ratio, lot)
+        q = q1 if n == 1 else floor_lot(first_amount * ratio / p, lot)
         cum_q = cum_q + q if lot == 1 else round(cum_q + q, 10)
         cum_cost += p * q
         if n == 1:

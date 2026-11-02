@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit.errors import StreamlitAPIException
 import requests
 import FinanceDataReader as fdr
@@ -1723,6 +1724,59 @@ def _krw_abbrev(x):
     if man:
         parts.append(f"{man:,}만")
     return sign + "".join(parts) + "원"
+
+
+_LIVE_KRW_JS = """
+<div id="o" style="font:15px 'Source Sans Pro','Source Sans 3',sans-serif;padding-top:36px;opacity:.8"></div>
+<script>
+const LABEL = __LABEL__, FX = __FX__;
+const nf = n => n.toLocaleString('ko-KR');
+function fmt(x) {
+  if (!isFinite(x) || x <= 0) return '';
+  let s;
+  if (x < 10000) s = nf(Math.round(x)) + '원';
+  else {
+    let m = Math.round(x / 10000);
+    const jo = Math.floor(m / 1e8); m -= jo * 1e8;
+    const eok = Math.floor(m / 1e4), man = m - eok * 1e4;
+    s = (jo ? nf(jo) + '조' : '') + (eok ? nf(eok) + '억' : '') + (man ? nf(man) + '만' : '') + '원';
+  }
+  if (FX) s += ' ≈ $' + Math.round(x / FX).toLocaleString('en-US');
+  return '= ' + s;
+}
+const out = document.getElementById('o');
+let last = null;
+function findInput() {
+  const d = window.parent.document;
+  for (const c of d.querySelectorAll('[data-testid="stNumberInput"]')) {
+    const lb = c.querySelector('label');
+    if (lb && lb.textContent.trim() === LABEL) return c.querySelector('input');
+  }
+  return null;
+}
+function tick() {
+  try {
+    const el = findInput();
+    if (!el) return;
+    const v = el.value;
+    if (v === last) return;
+    last = v;
+    out.textContent = fmt(parseFloat(v));
+    out.style.color = getComputedStyle(el).color;
+  } catch (e) {}
+}
+setInterval(tick, 150);
+tick();
+</script>
+"""
+
+
+def _live_krw_readout(input_label, fx=None):
+    """number_input은 Enter·포커스 이동 때만 값이 서버로 넘어와, 서버에서 그린 표기는 타이핑 중엔 안 바뀐다.
+    components.html iframe은 앱과 같은 출처라 부모 문서의 입력칸을 직접 읽어 칠 때마다 억·만원으로 보여 준다."""
+    html = (_LIVE_KRW_JS.replace("__LABEL__", json.dumps(input_label))
+            .replace("__FX__", json.dumps(fx)))
+    components.html(html, height=70)
 
 
 def _pct_label(x):
@@ -3738,10 +3792,7 @@ with tab5:
                     asset_krw = st.number_input(
                         "투자자산 (원)", min_value=0.0, step=10_000_000.0, format="%.0f", key="plan_asset_krw")
                 with ac2:
-                    st.markdown("<div style='height:1.8em'></div>", unsafe_allow_html=True)
-                    if asset_krw > 0:
-                        st.caption(f"= {_krw_abbrev(asset_krw)}"
-                                   + (f" ≈ ${asset_krw / p_fx:,.0f}" if p_fx else ""))
+                    _live_krw_readout("투자자산 (원)", round(p_fx, 4) if p_fx else None)
 
                 # ── 리스크 파라미터(디폴트: 최대손실 1%, 손절폭 7%, 손절가 미지정) ──
                 loss_pct, stop_pct, stop_price_in = 0.01, 0.07, None
@@ -3800,7 +3851,7 @@ with tab5:
                                     format_func=lambda v: f"{v}회")
                     rc1, rc2 = st.columns([3, 1])
                     _ro = rc1.radio(
-                        "불타기 금액 (첫 매수 수량 대비)", ["100", "50", "taper", "custom"], horizontal=True,
+                        "불타기 금액 (첫 매수 금액 대비 — 금액 고정, 수량은 가격만큼 줄어듦)", ["100", "50", "taper", "custom"], horizontal=True,
                         key="plan_ratio_opt",
                         format_func=lambda v: {"100": "100%", "50": "50%", "taper": "줄여가기(100→50→25%)",
                                                "custom": "직접 입력"}[v])
@@ -3869,7 +3920,8 @@ with tab5:
                             }[sell_mode]
                             st.markdown(
                                 f"{head} 주가가 {_px(buy_price * step_pct)}(+{_pct_label(step_pct)}) 오를 때마다 "
-                                f"첫 매수의 {ratio_desc} 추가(최대 {len(ratios)}회), {sell_desc}.")
+                                f"첫 매수 금액의 {ratio_desc}만큼 추가(최대 {len(ratios)}회, 금액 고정이라 수량은 오른 가격만큼 "
+                                f"줄어듦), {sell_desc}.")
 
                         tbl_rows = []
                         for row in plan["rows"]:

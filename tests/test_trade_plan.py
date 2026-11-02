@@ -49,11 +49,16 @@ class TestBtcExample(unittest.TestCase):
         self.assertAlmostEqual(self.plan["stop"], 72947.35, places=2)
 
     def test_second_buy_price_and_line(self):
-        row2 = self.plan["rows"][1]
+        row1, row2 = self.plan["rows"][:2]
         self.assertAlmostEqual(row2["price"], 89419.33, places=2)
         self.assertAlmostEqual(row2["line"], 83928.67, places=2)
-        self.assertAlmostEqual(row2["avg"], 83928.67, places=2)
-        self.assertLess(abs(row2["pnl"]), 0.01)  # 본전
+        # 금액 고정: 2차 금액 = 1차 금액, 수량은 1/1.14
+        self.assertAlmostEqual(row2["amount"], row1["amount"], delta=row2["price"] * 1e-8)
+        self.assertAlmostEqual(row2["qty"], row1["qty"] / 1.14, places=7)
+        # 매도선 도달 시 = 1차 금액 × (1.07 × (1 + 1/1.14) − 2) ≈ +0.86% — 본전보다 약간 위
+        expect = row1["amount"] * (1.07 * (1 + 1 / 1.14) - 2)
+        self.assertAlmostEqual(row2["pnl"], expect, delta=1.0)
+        self.assertGreater(row2["pnl"], 0)
 
     def test_first_buy_about_10b_krw(self):
         krw = self.plan["rows"][0]["amount"] * self.fx
@@ -72,22 +77,23 @@ class TestPyramidPnl(unittest.TestCase):
     def test_taper_step(self):
         p = TP.build_plan(100, 100_000, 0.01, 10, step_pct=0.2,
                           ratios=TP.add_ratios("taper", 3), sell_mode="step")
-        self.assertEqual([r["qty"] for r in p["rows"]], [100, 100, 50, 25])
+        # 금액 10000 → 10000·5000·2500을 120·140·160에 산다(정수 주 버림)
+        self.assertEqual([r["qty"] for r in p["rows"]], [100, 83, 35, 15])
         self.assertEqual([r["line"] for r in p["rows"]], [90, 110, 130, 150])
-        self.assertEqual([round(r["pnl"], 6) for r in p["rows"]], [-1000, 0, 3500, 8250])
-        self.assertAlmostEqual(p["total_cost"], 33000)
+        self.assertEqual([round(r["pnl"], 6) for r in p["rows"]], [-1000, 170, 3480, 7690])
+        self.assertAlmostEqual(p["total_cost"], 27260)
 
     def test_half_ratio_changes_pnl(self):
         p = TP.build_plan(100, 100_000, 0.01, 10, step_pct=0.2,
                           ratios=TP.add_ratios("50", 1), sell_mode="step")
-        self.assertEqual([r["qty"] for r in p["rows"]], [100, 50])
-        self.assertAlmostEqual(p["rows"][1]["pnl"], 500)
+        self.assertEqual([r["qty"] for r in p["rows"]], [100, 41])
+        self.assertAlmostEqual(p["rows"][1]["pnl"], 110 * 141 - 14920)
 
     def test_fixed_price_and_ma20(self):
         p = TP.build_plan(100, 100_000, 0.01, 10, step_pct=0.2,
                           ratios=[1.0], sell_mode="price", sell_price=105)
         self.assertEqual(p["rows"][0]["line"], 90)
-        self.assertAlmostEqual(p["rows"][1]["pnl"], 105 * 200 - 22000)
+        self.assertAlmostEqual(p["rows"][1]["pnl"], 105 * 183 - 19960)
         p = TP.build_plan(100, 100_000, 0.01, 10, step_pct=0.2, ratios=[1.0], sell_mode="ma20")
         self.assertIsNone(p["rows"][1]["pnl"])
         self.assertAlmostEqual(p["rows"][0]["pnl"], -1000)
