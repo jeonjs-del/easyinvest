@@ -56,8 +56,14 @@ VOLDM_FX_TICKER = "USD/KRW"
 # 상장 전 backfill에 쓸 (실거래 ETF 컬럼, 벤치마크 지수 컬럼) 쌍.
 # SP500_KR_BF: KODEX 미국S&P500(379800, 환노출, 2021-04-09 상장) 이전을 SPY(Adj Close)×USD/KRW로 소급 —
 # 한국형 변형 듀얼모멘텀의 공격자산. USD/KRW가 2003-12부터라 합성 시리즈도 그때부터다.
-VOLDM_BACKFILL = {"KOSPI_BF": ("278530", "KS200"), "SP500_KR_BF": ("379800", "SPY_KRW")}
+# K200_BF: FDR이 KODEX 200(069500, 2002 상장)을 2014-08부터만 줘서 그 전을 KS200(코스피200 가격지수)으로
+# 소급 — 둘 다 배당이 빠진 가격이라 기준이 같다.
+VOLDM_BACKFILL = {"KOSPI_BF": ("278530", "KS200"), "SP500_KR_BF": ("379800", "SPY_KRW"),
+                  "K200_BF": ("069500", "KS200")}
 KRDM_SP500 = "SP500_KR_BF"
+KRDM_K200 = "K200_BF"
+KRDM_ATTACK_MONTHS = 12   # 시장 판단·S&P500 vs KODEX200 비교 (2026-11 사용자 지시로 6→12)
+KRDM_DEFENSE_MONTHS = 6   # 방어 채권 선택
 # 안전자산 동률 시 우선순위(높은 순). config처럼 여기서만 바꾸면 됨.
 VOLDM_SAFE_PRIORITY = ["KR_BOND_SHORT", "KR_BOND_MID", "KR_BOND_LONG",
                         "US_BOND_SHORT", "US_BOND_MID", "US_BOND_LONG"]
@@ -466,18 +472,19 @@ def strat_novell(mp, t, ctx):
 
 
 def strat_kr_mod_dm(mp, t, ctx):
-    """공격자산은 원화로 사는 KODEX 미국S&P500(상장 전 SPY×환율 소급)과 KODEX 200. 절대모멘텀 판단도
-    같은 원화 S&P500 6개월 수익률로 해서, 공격자산 두 개를 같은 통화로 비교한다."""
-    sp = KRDM_SP500
-    sp6 = ret(mp, sp, t, 6)
-    if sp6 is None:
+    """공격자산은 원화로 사는 KODEX 미국S&P500(상장 전 SPY×환율 소급)과 KODEX 200(데이터 전 KS200 소급).
+    절대모멘텀 판단도 같은 원화 S&P500 수익률로 해서, 공격자산 두 개를 같은 통화로 비교한다.
+    공격 판단 12개월, 방어 채권 선택 6개월(원래 변형 듀얼모멘텀과 같은 구성)."""
+    sp, k2 = KRDM_SP500, KRDM_K200
+    sp_r = ret(mp, sp, t, KRDM_ATTACK_MONTHS)
+    if sp_r is None:
         return None
-    if sp6 > 0:
-        k200 = ret(mp, "069500", t, 6)
+    if sp_r > 0:
+        k200 = ret(mp, k2, t, KRDM_ATTACK_MONTHS)
         if k200 is None:
             return {sp: 1.0}
-        return {sp: 1.0} if sp6 >= k200 else {"069500": 1.0}
-    sc = {s: ret(mp, s, t, 6) for s in MODDM_DEF}
+        return {sp: 1.0} if sp_r >= k200 else {k2: 1.0}
+    sc = {s: ret(mp, s, t, KRDM_DEFENSE_MONTHS) for s in MODDM_DEF}
     if len([v for v in sc.values() if v is not None]) < 3:
         return None
     w = {}
