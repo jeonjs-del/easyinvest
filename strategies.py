@@ -28,7 +28,7 @@ TAA_TICKERS = ["SPY", "IEFA", "IEMG", "AGG", "BND", "QQQ", "IWM", "VGK", "EWJ",
                "VNQ", "PDBC", "GLD", "TLT", "HYG", "LQD", "IEF", "TIP", "BIL",
                "SHY", "VTV", "VBR", "SCZ", "REM", "EMB", "BWX", "069500",
                "278530", "363580", "114260", "148070", "439870", "USD/KRW",
-               "KS200"]
+               "KS200", "379800"]
 
 # ---- 변동성 변형 듀얼모멘텀 종목 매핑 (교체 가능하도록 dict로 관리) ---------
 # KOSPI는 278530을 KS200(코스피200 지수)으로 상장 전 구간을 소급 연결한 합성 컬럼
@@ -53,8 +53,11 @@ VOLDM_FX_SOURCE = {
     "US_BOND_LONG_KRW": "TLT",
 }
 VOLDM_FX_TICKER = "USD/KRW"
-# KOSPI 상장 전 backfill에 쓸 (실거래 ETF 컬럼, 벤치마크 지수 컬럼) 쌍.
-VOLDM_BACKFILL = {"KOSPI_BF": ("278530", "KS200")}
+# 상장 전 backfill에 쓸 (실거래 ETF 컬럼, 벤치마크 지수 컬럼) 쌍.
+# SP500_KR_BF: KODEX 미국S&P500(379800, 환노출, 2021-04-09 상장) 이전을 SPY(Adj Close)×USD/KRW로 소급 —
+# 한국형 변형 듀얼모멘텀의 공격자산. USD/KRW가 2003-12부터라 합성 시리즈도 그때부터다.
+VOLDM_BACKFILL = {"KOSPI_BF": ("278530", "KS200"), "SP500_KR_BF": ("379800", "SPY_KRW")}
+KRDM_SP500 = "SP500_KR_BF"
 # 안전자산 동률 시 우선순위(높은 순). config처럼 여기서만 바꾸면 됨.
 VOLDM_SAFE_PRIORITY = ["KR_BOND_SHORT", "KR_BOND_MID", "KR_BOND_LONG",
                         "US_BOND_SHORT", "US_BOND_MID", "US_BOND_LONG"]
@@ -150,6 +153,8 @@ def augment_panel(mp):
         mp[f"{krw_col}_SRC"] = pd.Series(
             ["proxy" if pd.notna(v) else pd.NA for v in idx], index=mp.index, dtype="object")
 
+    if "SPY" in mp.columns:
+        mp["SPY_KRW"] = mp["SPY"] * fx
     for composite_col, (etf_col, index_col) in VOLDM_BACKFILL.items():
         composite, src = _backfill_with_index(mp, etf_col, index_col)
         if composite is not None:
@@ -461,14 +466,17 @@ def strat_novell(mp, t, ctx):
 
 
 def strat_kr_mod_dm(mp, t, ctx):
-    spy6 = ret(mp, "SPY", t, 6)
-    if spy6 is None:
+    """공격자산은 원화로 사는 KODEX 미국S&P500(상장 전 SPY×환율 소급)과 KODEX 200. 절대모멘텀 판단도
+    같은 원화 S&P500 6개월 수익률로 해서, 공격자산 두 개를 같은 통화로 비교한다."""
+    sp = KRDM_SP500
+    sp6 = ret(mp, sp, t, 6)
+    if sp6 is None:
         return None
-    if spy6 > 0:
+    if sp6 > 0:
         k200 = ret(mp, "069500", t, 6)
         if k200 is None:
-            return {"SPY": 1.0}
-        return {"SPY": 1.0} if spy6 >= k200 else {"069500": 1.0}
+            return {sp: 1.0}
+        return {sp: 1.0} if sp6 >= k200 else {"069500": 1.0}
     sc = {s: ret(mp, s, t, 6) for s in MODDM_DEF}
     if len([v for v in sc.values() if v is not None]) < 3:
         return None

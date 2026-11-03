@@ -373,6 +373,12 @@ python -m unittest tests.test_trade_plan -v    # 오프라인
 - 주석은 "왜"만 남긴다 — 코드가 이미 설명하는 당연한 내용은 쓰지 않는다.
 
 ## 7. 동적자산배분 전략 추가/수정
+- **한국형 변형 듀얼모멘텀**(`strat_kr_mod_dm`, 2026-11 사용자 지시로 SPY → KODEX 미국S&P500): 절대모멘텀 판단과
+  공격자산 모두 `SP500_KR_BF` — 379800(KODEX 미국S&P500, 환노출, 2021-04-09 상장) 실거래 + 상장 전 `SPY_KRW`
+  (SPY Adj Close × USD/KRW) 소급(`VOLDM_BACKFILL`, KOSPI_BF와 같은 방식). 이음매 2021-04 월수익률은 SPY×환율과
+  같고, 상장 후 월수익률 차이 평균 −0.02%p(KRX 마감 시차로 월별 표준편차 1.5%p). USD/KRW가 2003-12부터라
+  백테스트는 2004-07부터(이전엔 SPY로 1993-08부터). 379800은 Close라 분배금 미반영. 방어자산(미국 채권 ETF)은
+  그대로 달러 수익률.
 - `strategies.py`의 `STRATEGIES` dict에 표시명→함수로 등록.
 - 함수 시그니처: `strat_XXX(mp, t, ctx) -> {티커: 비중}` (mp=월간 가격 패널 DataFrame,
   t=현재 시점 인덱스, ctx=`build_ctx`가 만든 시장상태 컨텍스트).
