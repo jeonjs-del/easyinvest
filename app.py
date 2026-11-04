@@ -3106,9 +3106,12 @@ with tab3:
                    "현재 포지션은 전월 말 종가로 확정되며 다음 달 1일까지 바뀌지 않습니다.")
 
         # [1] 버튼 없이 자동 계산. 미계산 상태면 spinner 표시 후 실행 (캐시 있으면 즉시)
-        if st.session_state.taa_results is None:
+        # 세션에 든 결과는 배포로 코드가 바뀌어도 그대로 남는다 — 전략 구성(버전·이름 목록)이 다르면 다시 계산.
+        _taa_sig = (TAA_RESULTS_VERSION, tuple(STRATEGIES))
+        if st.session_state.taa_results is None or st.session_state.get("taa_results_sig") != _taa_sig:
             with st.spinner("미국 ETF 25종 병렬 로딩 및 전략 계산 중 (최초 1~2분)..."):
                 st.session_state.taa_results = run_all_strategies()
+                st.session_state.taa_results_sig = _taa_sig
 
         results, mp, ue_ok = st.session_state.taa_results
 
