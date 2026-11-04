@@ -34,8 +34,7 @@ from lwc_local import renderLightweightCharts
 import coin_momentum as CM
 import trade_plan as TP
 import wealth as W
-from strategies import (STRATEGIES, TAA_TICKERS, augment_panel,
-                         VOLDM_TICKERS, VOLDM_ASSET_META, voldm_source_type)
+from strategies import STRATEGIES, TAA_TICKERS, augment_panel
 
 st.set_page_config(page_title="나의 투자 대시보드", layout="wide")
 
@@ -1421,7 +1420,7 @@ def backtest(fn, mp, ctx):
 
 # 결과 딕셔너리 구조(backtest()의 반환 키)가 바뀌면 이 값을 올려서
 # st.cache_data에 남아있는 구버전 캐시를 무효화한다.
-TAA_RESULTS_VERSION = 5
+TAA_RESULTS_VERSION = 6
 
 
 @st.cache_data(ttl=60 * 60 * 4)
@@ -3120,36 +3119,15 @@ with tab3:
                 st.caption("⚠️ FRED 실업률 미조회 → LAA/RAA는 시장신호만으로 계산되었습니다.")
 
             _KR_ETF_LABEL = {
-                "069500": "KODEX200(069500)",
-                "K200_BF": "KODEX200(069500, 2014-08~ / KS200 소급)",
                 "278530": "KODEX200TR(278530)",
                 "KOSPI_BF": "KOSPI200(278530, 2017-11~ / KS200 소급)",
-                "379800": "KODEX 미국S&P500(379800)",
-                "SP500_KR_BF": "KODEX 미국S&P500(379800, 2021-04~ / SPY×환율 소급)",
-                "363580": "KODEX200IT TR(363580)",
-                "114260": "국고채3년(114260)",
-                "148070": "국고채10년(148070)",
-                "439870": "국고채30년(439870)",
-                "US_BOND_SHORT_KRW": "미국단기국채환노출(SHY합성)",
-                "US_BOND_MID_KRW": "미국10년국채환노출(IEF합성)",
-                "US_BOND_LONG_KRW": "미국장기국채환노출(TLT합성)",
-                "CASH": "현금",
             }
 
             _STRAT_DATA_NOTES = {
-                "변동성 변형 듀얼모멘텀":
-                    "안전자산 6종 중 국고채3/10/30년(114260/148070/439870)은 Close 가격만 사용 — "
-                    "연 1회(12월) 분배금을 지급하는데 총수익 반영이 안 돼 있어 미국채(환노출 합성,"
-                    " 총수익)와의 1개월 모멘텀 비교가 구조적으로 유리/불리할 수 있음. "
-                    "KOSPI200은 2017-11-21 이전을 KS200 가격지수로 소급(배당 미반영). "
-                    "KOSPI200 IT 오버레이는 2020-09-25 이후만 적용(그 전엔 KOSPI200 100%). "
-                    "국고채30년은 2022-08-23 이전엔 안전자산 후보에서 제외.",
                 "한국형 변형 듀얼모멘텀":
-                    "공격자산 KODEX 미국S&P500(379800, 환노출)은 2021-04-09 상장 전을 SPY(배당 포함)×USD/KRW로 소급. "
-                    "USD/KRW가 2003-12부터라 백테스트도 그 무렵부터 시작. KODEX200(069500)은 FDR이 2014-08부터만 "
-                    "줘서 그 전을 KS200(코스피200 가격지수)으로 소급. 공격 판단 12개월·방어 채권 6개월. "
-                    "379800은 Close라 "
-                    "분배금 미반영. 방어자산(미국 채권 ETF·BIL)은 원화 환산 없이 달러 수익률 그대로.",
+                    "공격자산은 SPY(Adj Close, 달러)와 KOSPI200(KODEX 200TR 278530, 원화). 278530 상장(2017-11-21) "
+                    "전은 KS200(코스피200 가격지수)으로 소급해 배당 미반영. 공격 판단 12개월·방어 채권 6개월. "
+                    "SPY·KOSPI200 비교는 환율을 반영하지 않은 각 통화 수익률 기준.",
             }
 
             def pos_str(w):
@@ -3266,48 +3244,6 @@ with tab3:
                     note = _STRAT_DATA_NOTES.get(pick)
                     st.caption(f"백테스트 구간: {bt_start} ~ {bt_end}"
                                + (f" · ⚠️ {note}" if note else ""))
-
-                if pick == "변동성 변형 듀얼모멘텀":
-                    with _detail_section("데이터 출처 상세"):
-                        with st.expander("데이터 출처 상세 (총수익 여부 · backfill/proxy 구간)"):
-                            meta_rows = []
-                            for key, ticker in VOLDM_TICKERS.items():
-                                meta = VOLDM_ASSET_META.get(key, {})
-                                meta_rows.append({
-                                    "자산": key, "사용 컬럼": ticker,
-                                    "총수익 반영": "O" if meta.get("total_return") else "X(가격 기준)",
-                                    "비고": meta.get("note", ""),
-                                })
-                            st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
-
-                            fn = STRATEGIES[pick]
-                            # run_all_strategies는 ctx를 반환하지 않는다 — 캐시된 build_ctx로 다시 얻는다.
-                            ctx = build_ctx(list(mp.index))
-                            n_months = n_proxy_months = 0
-                            proxy_by_key = {}
-                            for t in range(len(mp) - 1):
-                                w = fn(mp, t, ctx)
-                                if not w:
-                                    continue
-                                n_months += 1
-                                flagged = False
-                                for key, ticker in VOLDM_TICKERS.items():
-                                    if ticker not in w:
-                                        continue
-                                    st_type = voldm_source_type(mp, key, t)
-                                    if st_type in ("benchmark_index", "proxy"):
-                                        flagged = True
-                                        proxy_by_key[key] = proxy_by_key.get(key, 0) + 1
-                                if flagged:
-                                    n_proxy_months += 1
-                            pct = (n_proxy_months / n_months * 100) if n_months else 0.0
-                            st.caption(
-                                f"전체 {n_months}개월 중 benchmark_index/proxy 자산이 선택된 달: "
-                                f"{n_proxy_months}개월({pct:.0f}%)"
-                            )
-                            if proxy_by_key:
-                                breakdown = " · ".join(f"{k}: {v}개월" for k, v in proxy_by_key.items())
-                                st.caption(f"자산별 내역 — {breakdown}")
 
                 with _detail_section("최근 3개월 포지션"):
                     # 신호는 월말에 확정되고 그 비중을 다음 달에 보유한다 — 히트맵 툴팁(보유월 기준)과

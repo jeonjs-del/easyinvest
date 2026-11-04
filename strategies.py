@@ -1,97 +1,24 @@
 """
-동적자산배분 16개 전략 (snowball72/강환국식 규칙 + 변동성 변형 듀얼모멘텀).
+동적자산배분 전략 (snowball72/강환국식 규칙).
 각 전략: fn(mp, t, ctx) -> {ticker: weight} 또는 None(데이터 부족).
 mp: 월말 종가 패널(DataFrame, 컬럼=티커), t: 정수 인덱스, ctx: {'gt_bear','ue_up12','ue_ok'}.
 ETF 치환: EFA→IEFA, VWO/EEM→IEMG, DBC→PDBC, IWD→VTV, IWN→VBR, 현금→BIL.
-"CASH" 티커는 mp에 없는 심볼이라 backtest()가 수익률 0으로 처리한다(변동성 변형 듀얼모멘텀에서 사용).
 
-[변동성 변형 듀얼모멘텀 데이터 한계 — 2026-09-20 조사, AGENTS.md 데이터소스 섹션과 동기화]
-- 국고채 3/10/30년 ETF(114260/148070/439870)는 전부 연 1회(12월) 분배금을 지급하는 실측
-  확인됨(각 최근 1년 분배율 1.31%/3.62%/1.96%, funetf.co.kr 공시 기준). 그런데 이 세 종목은
-  mp에 Close 가격만 들어있어 총수익이 아니다 — SPY/미국채(Adj Close)나 KOSPI200·IT
-  TR(무분배 재투자형)와 섞으면 안전자산 6종 1개월 모멘텀 비교가 구조적으로 왜곡된다
-  (스펙 9항 위배). 국고채 TR형 ETF가 국내에 없어 티커 교체로는 해결 불가 — 최소한
-  VOLDM_ASSET_META로 어떤 자산이 가격 기준인지 명시해 화면/문서에 노출한다.
-- KOSPI200(278530, 2017-11-21 상장)은 augment_panel()이 KS200(FDR 무료 캐시, 1990~ 제공,
-  코스피200 가격지수·배당 미반영) 수익률로 상장 이전 구간을 소급 연결한 합성 컬럼
-  "KOSPI_BF"를 사용한다(가격 레벨 단순접합이 아니라 상장일 기준 수익률 체이닝).
-- KOSPI200 IT(363580, 2020-09-25 상장)와 국고채30년(439870, 2022-08-23 상장)은 상장 이전
-  구간을 메울 무료·비로그인 데이터원이 없어(KRX data.krx.co.kr의 지수/ETF 조회 API는
-  로그인 필요 — pykrx도 동일 이유로 실패, FDR의 무료 GitHub 캐시엔 KS11/KQ11/KS200만
-  있고 업종지수·TR지수는 없음) backfill을 적용하지 않는다. 상장 전에는 각각 IT 오버레이
-  생략(KOSPI200 100%로 대체) / 안전자산 후보 제외로 기존 동작을 유지한다.
+KOSPI_BF: KODEX 200TR(278530, 2017-11-21 상장) 이전 구간을 KS200(코스피200 가격지수, FDR 무료 캐시 1990~)
+수익률로 소급 연결한 합성 컬럼(한국형 변형 듀얼모멘텀의 공격자산). 소급 구간은 배당 미반영.
 """
 import numpy as np
 import pandas as pd
 
 TAA_TICKERS = ["SPY", "IEFA", "IEMG", "AGG", "BND", "QQQ", "IWM", "VGK", "EWJ",
                "VNQ", "PDBC", "GLD", "TLT", "HYG", "LQD", "IEF", "TIP", "BIL",
-               "SHY", "VTV", "VBR", "SCZ", "REM", "EMB", "BWX", "069500",
-               "278530", "363580", "114260", "148070", "439870", "USD/KRW",
-               "KS200", "379800"]
+               "SHY", "VTV", "VBR", "SCZ", "REM", "EMB", "BWX", "278530", "KS200"]
 
-# ---- 변동성 변형 듀얼모멘텀 종목 매핑 (교체 가능하도록 dict로 관리) ---------
-# KOSPI는 278530을 KS200(코스피200 지수)으로 상장 전 구간을 소급 연결한 합성 컬럼
-# "KOSPI_BF"를 가리킨다(augment_panel 참고). KOSPI_IT는 신호·실행 동일 TR ETF 그대로 사용
-# (backfill 없음). 미국채 3종은 mp에 직접 없고 augment_panel()이 USD 자산 x USD/KRW로
-# 합성한 파생 컬럼(*_KRW)을 가리킨다.
-VOLDM_TICKERS = {
-    "KOSPI": "KOSPI_BF",        # 278530(KODEX 200TR) + KS200 소급합성
-    "KOSPI_IT": "363580",       # KODEX 200IT TR
-    "SPY": "SPY",
-    "KR_BOND_SHORT": "114260",  # KODEX 국고채3년
-    "KR_BOND_MID": "148070",    # KIWOOM 국고채10년
-    "KR_BOND_LONG": "439870",   # KODEX 국고채30년액티브
-    "US_BOND_SHORT": "US_BOND_SHORT_KRW",  # SHY(1-3Y) x USD/KRW 합성
-    "US_BOND_MID": "US_BOND_MID_KRW",      # IEF(7-10Y) x USD/KRW 합성
-    "US_BOND_LONG": "US_BOND_LONG_KRW",    # TLT(20Y+) x USD/KRW 합성
-}
-# 합성 파생컬럼명 -> 원본 USD ETF 티커
-VOLDM_FX_SOURCE = {
-    "US_BOND_SHORT_KRW": "SHY",
-    "US_BOND_MID_KRW": "IEF",
-    "US_BOND_LONG_KRW": "TLT",
-}
-VOLDM_FX_TICKER = "USD/KRW"
 # 상장 전 backfill에 쓸 (실거래 ETF 컬럼, 벤치마크 지수 컬럼) 쌍.
-# SP500_KR_BF: KODEX 미국S&P500(379800, 환노출, 2021-04-09 상장) 이전을 SPY(Adj Close)×USD/KRW로 소급 —
-# 한국형 변형 듀얼모멘텀의 공격자산. USD/KRW가 2003-12부터라 합성 시리즈도 그때부터다.
-# K200_BF: FDR이 KODEX 200(069500, 2002 상장)을 2014-08부터만 줘서 그 전을 KS200(코스피200 가격지수)으로
-# 소급 — 둘 다 배당이 빠진 가격이라 기준이 같다.
-VOLDM_BACKFILL = {"KOSPI_BF": ("278530", "KS200"), "SP500_KR_BF": ("379800", "SPY_KRW"),
-                  "K200_BF": ("069500", "KS200")}
-KRDM_SP500 = "SP500_KR_BF"
-KRDM_K200 = "K200_BF"
-KRDM_ATTACK_MONTHS = 12   # 시장 판단·S&P500 vs KODEX200 비교 (2026-11 사용자 지시로 6→12)
+BACKFILL = {"KOSPI_BF": ("278530", "KS200")}
+KRDM_KOSPI = "KOSPI_BF"
+KRDM_ATTACK_MONTHS = 12   # 시장 판단·SPY vs KOSPI200 비교 (2026-11 사용자 지시로 6→12)
 KRDM_DEFENSE_MONTHS = 6   # 방어 채권 선택
-# 안전자산 동률 시 우선순위(높은 순). config처럼 여기서만 바꾸면 됨.
-VOLDM_SAFE_PRIORITY = ["KR_BOND_SHORT", "KR_BOND_MID", "KR_BOND_LONG",
-                        "US_BOND_SHORT", "US_BOND_MID", "US_BOND_LONG"]
-VOLDM_VOL_THRESHOLD = 0.35
-VOLDM_IT_WEIGHT = 0.25
-
-# 자산별 데이터 성격 메타(화면/보고용). source_type: actual_etf(실거래 ETF, 상장 이후) /
-# benchmark_index(상장 전 벤치마크 지수로 소급) / proxy(해외자산 환노출 합성).
-# total_return: 배당/이자 분배가 가격에 재투자되어 있는지(True) 여부. 국고채 3종은 연 1회
-# 분배금을 지급하는데 Close 가격만 쓰므로 False(가격지수 기준, 총수익 아님).
-VOLDM_ASSET_META = {
-    "KOSPI": {"total_return": False,
-              "note": "278530은 TR(무분배 재투자)이라 상장 후 구간은 총수익이지만, "
-                      "2017-11-21 이전은 KS200 가격지수로 소급해 배당 미반영 구간이 섞여있음"},
-    "KOSPI_IT": {"total_return": True,
-                 "note": "363580 TR(무분배 재투자), 2020-09-25 이전 데이터 없음(backfill 안 함)"},
-    "SPY": {"total_return": True, "note": "Adj Close(배당 재투자) 사용"},
-    "KR_BOND_SHORT": {"total_return": False,
-                       "note": "114260, 연 1회(12월) 분배금 지급(최근 1년 분배율 1.31%) — Close만 사용, 총수익 아님"},
-    "KR_BOND_MID": {"total_return": False,
-                     "note": "148070, 연 1회(12월) 분배금 지급(최근 1년 분배율 3.62%) — Close만 사용, 총수익 아님"},
-    "KR_BOND_LONG": {"total_return": False,
-                      "note": "439870, 연 1회(12월) 분배금 지급(최근 1년 분배율 1.96%) — Close만 사용, 총수익 아님. "
-                              "2022-08-23 이전 데이터 없음(backfill 안 함)"},
-    "US_BOND_SHORT": {"total_return": True, "note": "SHY Adj Close × USD/KRW 합성(proxy)"},
-    "US_BOND_MID": {"total_return": True, "note": "IEF Adj Close × USD/KRW 합성(proxy)"},
-    "US_BOND_LONG": {"total_return": True, "note": "TLT Adj Close × USD/KRW 합성(proxy)"},
-}
 
 
 def _backfill_with_index(mp, etf_col, index_col):
@@ -118,55 +45,16 @@ def _backfill_with_index(mp, etf_col, index_col):
     return composite, src
 
 
-def voldm_source_type(mp, key, t):
-    """VOLDM_TICKERS[key] 컬럼이 시점 t에서 actual_etf/benchmark_index/proxy 중 무엇인지."""
-    col = VOLDM_TICKERS.get(key)
-    if col is None:
-        return None
-    src_col = f"{col}_SRC"
-    if src_col in mp.columns:
-        v = mp[src_col].iloc[t]
-        return v if pd.notna(v) else None
-    if col not in mp.columns or pd.isna(mp[col].iloc[t]):
-        return None
-    return "proxy" if col in VOLDM_FX_SOURCE else "actual_etf"
-
-
 def augment_panel(mp):
-    """SHY/IEF/TLT(USD 총수익) x USD/KRW로 미국채 원화환노출 합성 시리즈를 패널에 추가.
-    KRW_return = (1+USD_bond_return) * (1+USDKRW_return) - 1 을 월말 지수(기준값 1.0)로 누적."""
+    """상장 전 구간을 지수로 소급한 합성 컬럼(BACKFILL)을 패널에 추가."""
     mp = mp.copy()
-    if VOLDM_FX_TICKER not in mp.columns:
-        return mp
-    fx = mp[VOLDM_FX_TICKER]
-    fx_start = fx.first_valid_index()
-    for krw_col, usd_col in VOLDM_FX_SOURCE.items():
-        if usd_col not in mp.columns or fx_start is None:
-            continue
-        usd = mp[usd_col]
-        usd_start = usd.first_valid_index()
-        if usd_start is None:
-            continue
-        start = max(usd_start, fx_start)
-        usd_ret = usd.pct_change()
-        fx_ret = fx.pct_change()
-        krw_ret = (1 + usd_ret) * (1 + fx_ret) - 1
-        idx = pd.Series(index=mp.index, dtype="float64")
-        idx.loc[start] = 1.0
-        after = mp.index[mp.index > start]
-        idx.loc[after] = (1 + krw_ret.loc[after]).cumprod()
-        mp[krw_col] = idx
-        mp[f"{krw_col}_SRC"] = pd.Series(
-            ["proxy" if pd.notna(v) else pd.NA for v in idx], index=mp.index, dtype="object")
-
-    if "SPY" in mp.columns:
-        mp["SPY_KRW"] = mp["SPY"] * fx
-    for composite_col, (etf_col, index_col) in VOLDM_BACKFILL.items():
+    for composite_col, (etf_col, index_col) in BACKFILL.items():
         composite, src = _backfill_with_index(mp, etf_col, index_col)
         if composite is not None:
             mp[composite_col] = composite
             mp[f"{composite_col}_SRC"] = src
     return mp
+
 
 # ---- 모멘텀 유틸 ----------------------------------------------------------
 # 백테스트 한 번에 ret/sma_score가 7만 번 가까이 불리는데, 매번 mp[sym].iloc[t]로 열을 꺼내면 그것만
@@ -472,18 +360,17 @@ def strat_novell(mp, t, ctx):
 
 
 def strat_kr_mod_dm(mp, t, ctx):
-    """공격자산은 원화로 사는 KODEX 미국S&P500(상장 전 SPY×환율 소급)과 KODEX 200(데이터 전 KS200 소급).
-    절대모멘텀 판단도 같은 원화 S&P500 수익률로 해서, 공격자산 두 개를 같은 통화로 비교한다.
-    공격 판단 12개월, 방어 채권 선택 6개월(원래 변형 듀얼모멘텀과 같은 구성)."""
-    sp, k2 = KRDM_SP500, KRDM_K200
-    sp_r = ret(mp, sp, t, KRDM_ATTACK_MONTHS)
+    """SPY 12개월 수익률 > 0이면 SPY와 KOSPI200(278530 TR, 상장 전 KS200 소급) 중 12개월 수익률이 높은 쪽 100%,
+    아니면 방어 채권 8종 중 6개월 수익률 상위 3개(음수는 BIL)를 1/3씩."""
+    k2 = KRDM_KOSPI
+    sp_r = ret(mp, "SPY", t, KRDM_ATTACK_MONTHS)
     if sp_r is None:
         return None
     if sp_r > 0:
         k200 = ret(mp, k2, t, KRDM_ATTACK_MONTHS)
         if k200 is None:
-            return {sp: 1.0}
-        return {sp: 1.0} if sp_r >= k200 else {k2: 1.0}
+            return {"SPY": 1.0}
+        return {"SPY": 1.0} if sp_r >= k200 else {k2: 1.0}
     sc = {s: ret(mp, s, t, KRDM_DEFENSE_MONTHS) for s in MODDM_DEF}
     if len([v for v in sc.values() if v is not None]) < 3:
         return None
@@ -494,63 +381,10 @@ def strat_kr_mod_dm(mp, t, ctx):
     return w
 
 
-def _kospi_vol_12m(mp, sym, t):
-    """최근 12개 월간수익률의 표본표준편차(ddof=1) x sqrt(12)."""
-    if sym not in mp.columns or t - 12 < 0:
-        return None
-    prices = mp[sym].iloc[t - 12:t + 1]
-    if prices.isna().any():
-        return None
-    rets = prices.pct_change().dropna()
-    if len(rets) < 12:
-        return None
-    return rets.std(ddof=1) * (12 ** 0.5)
-
-
-def _voldm_safe_asset(mp, t):
-    K = VOLDM_TICKERS
-    best_key, best_val = None, None
-    for key in VOLDM_SAFE_PRIORITY:
-        v = ret(mp, K[key], t, 1)
-        if v is None:
-            continue
-        if best_val is None or v > best_val:
-            best_key, best_val = key, v
-    if best_key is None or best_val <= 0:
-        return {"CASH": 1.0}
-    return {K[best_key]: 1.0}
-
-
-def strat_vol_dm(mp, t, ctx):
-    """변동성 변형 듀얼모멘텀: KOSPI/SPY 3개월 모멘텀으로 위험자산 선택 후,
-    KOSPI 선택 시 12개월 변동성(35% 임계)로 IT 슬리브 비중 조정, 둘 다 약세면 6개 안전자산 1개월 모멘텀 1위 선택."""
-    K = VOLDM_TICKERS
-    kospi_3m = ret(mp, K["KOSPI"], t, 3)
-    spy_3m = ret(mp, K["SPY"], t, 3)
-    if kospi_3m is None or spy_3m is None:
-        return None
-    if kospi_3m > spy_3m and kospi_3m > 0:
-        vol = _kospi_vol_12m(mp, K["KOSPI"], t)
-        if vol is None:
-            return None
-        if vol < VOLDM_VOL_THRESHOLD:
-            it_col = K["KOSPI_IT"]
-            it_ok = it_col in mp.columns and pd.notna(mp[it_col].iloc[t])
-            if it_ok:
-                return {K["KOSPI"]: 1.0 - VOLDM_IT_WEIGHT, it_col: VOLDM_IT_WEIGHT}
-            # KOSPI200 IT ETF 상장 전(2020-09-25 이전)에는 오버레이 불가 → KOSPI200 100%로 대체
-            return {K["KOSPI"]: 1.0}
-        return {K["KOSPI"]: 1.0}
-    if spy_3m >= kospi_3m and spy_3m > 0:
-        return {K["SPY"]: 1.0}
-    return _voldm_safe_asset(mp, t)
-
-
 STRATEGIES = {
     "BAA 공격형": strat_baa_agg,
     "변형 듀얼모멘텀": strat_mod_dm,
     "한국형 변형 듀얼모멘텀": strat_kr_mod_dm,
-    "변동성 변형 듀얼모멘텀": strat_vol_dm,
     "VAA": strat_vaa,
     "가속 듀얼모멘텀": strat_adm,
     "HAA": strat_haa,

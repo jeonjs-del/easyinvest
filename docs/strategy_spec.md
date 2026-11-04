@@ -1,3 +1,5 @@
+> **2026-11: 이 전략은 앱에서 삭제했다.** 참고용 원 명세로만 남겨 둔다.
+
 Python으로 다음 자산배분 전략을 구현해줘.
 
 전략 이름은 **"변동성 변형 듀얼모멘텀(Volatility-Adjusted Modified Dual Momentum)"** 이다.
